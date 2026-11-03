@@ -57,9 +57,9 @@ use sha2::Sha256;
 use x25519_dalek::StaticSecret;
 
 /// wire 消息头魔数。
-const MAGIC: &[u8; 4] = b"PRR4";
+const MAGIC: &[u8; 4] = b"PRR5";
 /// 状态 / 消息版本。
-const VERSION: u8 = 6;
+const VERSION: u8 = 7;
 /// 消息固定前缀长度。
 const HEADER_LEN: usize = 93;
 /// 每条消息末尾的 Ed25519 签名长度。
@@ -69,7 +69,7 @@ const MAX_SKIP: u32 = 200;
 /// skipped 池容量上限（防 DoS）。
 const SKIPPED_MAX: usize = 1000;
 
-const INFO_ROOT: &[u8] = b"privchat/ratchet/root/v1";
+const INFO_ROOT: &[u8] = b"privchat/session/root/v1";
 const INFO_RK: &[u8] = b"privchat/ratchet/rk/v1";
 const INFO_CK: &[u8] = b"privchat/ratchet/ck/v1";
 const INFO_CHAIN_LOW: &[u8] = b"privchat/ratchet/chain/low";
@@ -107,8 +107,9 @@ pub struct Ratchet {
     recv_n: u32,
     /// 上一代发送条数：刷新后作为后续消息头 `pn`（接收方据此快进旧链）。
     prev_send_n: u32,
-    /// gen0 接收链是否已绑定到对方临时 eph（X3DH 式绑定，只做一次）。
-    recv_bound: bool,
+    /// 响应方待派生状态：本端 SPK 私钥。收到发起方首条消息（含 EK）后
+    /// 用它还原 root₀，随后清空。为 `Some` 时表示会话尚未建立、不能发送。
+    pending_spk: Option<[u8; 32]>,
     /// 滑动窗口池：`(gen, n) -> 消息密钥`，取用后删除。
     skipped: HashMap<(u32, u32), [u8; 32]>,
     /// 待提交的发送推进：`encrypt` 只在试算副本上推进并暂存于此，
@@ -128,12 +129,20 @@ struct Header {
 }
 
 impl Ratchet {
-    /// 新建（或从零开始）一个与 `peer_id` 的会话。root₀ 由静态 ECDH 派生，
-    /// 双方各自计算得到同一值；gen=0 的消息双方均可直接解密。
-    pub fn new(own: &iroh::SecretKey, peer_id: &str) -> Result<Self> {
+    /// 发起方建会话：已知对端 SPK 公钥，立即生成会话 EK 并派生 root₀。
+    ///
+    /// `peer_spk` 是 X25519 公钥（Montgomery 形式），由邀请串携带并用
+    /// 对端 IK 签名保护。root₀ 由三组 DH 混合：
+    ///   DH(IK_own, SPK_peer) || DH(EK, IK_peer) || DH(EK, SPK_peer)
+    pub fn new_initiator(
+        own: &iroh::SecretKey,
+        peer_id: &str,
+        peer_spk: &[u8; 32],
+    ) -> Result<Self> {
         let peer_pub = decode_peer_pub(peer_id)?;
         let own_pub = own.public().as_bytes().to_owned();
-        let root = root0(own, &peer_pub)?;
+        let (ek_priv, ek_pub) = new_eph();
+        let root = x3dh_root_initiator(own, &peer_pub, peer_spk, &ek_priv)?;
         let (send_ck, recv_ck) = derive_chains(&root, &own_pub, &peer_pub);
         Ok(Self {
             own: own.clone(),
@@ -142,8 +151,8 @@ impl Ratchet {
             peer_pub,
             gen: 0,
             root,
-            our_eph_priv: None,
-            our_eph_pub: None,
+            our_eph_priv: Some(ek_priv),
+            our_eph_pub: Some(ek_pub),
             their_eph: None,
             prev_eph: [0u8; 32],
             send_ck,
@@ -151,10 +160,46 @@ impl Ratchet {
             recv_ck,
             recv_n: 0,
             prev_send_n: 0,
-            recv_bound: false,
+            pending_spk: None,
             skipped: HashMap::new(),
             pending: None,
         })
+    }
+
+    /// 响应方建会话：只知道自己的 SPK 私钥，root₀ 要等对方首条消息
+    /// （header 里带会话 EK）才能派生。在此之前 `encrypt` 会报错。
+    pub fn new_responder(
+        own: &iroh::SecretKey,
+        peer_id: &str,
+        own_spk_sk: &[u8; 32],
+    ) -> Result<Self> {
+        let peer_pub = decode_peer_pub(peer_id)?;
+        let own_pub = own.public().as_bytes().to_owned();
+        Ok(Self {
+            own: own.clone(),
+            own_pub,
+            peer_id: peer_id.to_string(),
+            peer_pub,
+            gen: 0,
+            root: [0u8; 32],
+            our_eph_priv: None,
+            our_eph_pub: None,
+            their_eph: None,
+            prev_eph: [0u8; 32],
+            send_ck: [0u8; 32],
+            send_n: 0,
+            recv_ck: [0u8; 32],
+            recv_n: 0,
+            prev_send_n: 0,
+            pending_spk: Some(*own_spk_sk),
+            skipped: HashMap::new(),
+            pending: None,
+        })
+    }
+
+    /// 会话是否已建立（响应方收到发起方首条消息前为 false）。
+    pub fn is_established(&self) -> bool {
+        self.pending_spk.is_none()
     }
 
     /// 加密一段明文，返回带头的密文 blob。推进在试算副本上完成后暂存
@@ -163,6 +208,11 @@ impl Ratchet {
     ///
     /// [`next`]: Ratchet::next
     pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>> {
+        if self.pending_spk.is_some() {
+            return Err(anyhow!(
+                "session not established: waiting for initiator's first message"
+            ));
+        }
         // 本代 eph 一旦生成就固定下来：失败重试必须复用同一个 eph，否则
         // gen0 的绑定链会在「已送达但未提交」和重试之间漂移，对端解不开。
         if self.our_eph_priv.is_none() {
@@ -213,6 +263,8 @@ impl Ratchet {
             // 否则 next 提交会回退。同代时保留 pending 的发送侧推进。
             p.recv_ck = self.recv_ck;
             p.recv_n = self.recv_n;
+            p.root = self.root;
+            p.pending_spk = self.pending_spk;
             p.skipped = self.skipped.clone();
             p.their_eph = self.their_eph;
             if p.gen != self.gen {
@@ -247,8 +299,9 @@ impl Ratchet {
         out.push(VERSION);
         out.extend_from_slice(&self.gen.to_le_bytes());
         out.extend_from_slice(&self.root);
-        let flags =
-            u8::from(self.our_eph_priv.is_some()) | (u8::from(self.their_eph.is_some()) << 1);
+        let flags = u8::from(self.our_eph_priv.is_some())
+            | (u8::from(self.their_eph.is_some()) << 1)
+            | (u8::from(self.pending_spk.is_some()) << 2);
         out.push(flags);
         if let Some(priv_bytes) = self.our_eph_priv {
             out.extend_from_slice(&priv_bytes);
@@ -258,13 +311,15 @@ impl Ratchet {
             out.extend_from_slice(&g.to_le_bytes());
             out.extend_from_slice(&pub_bytes);
         }
+        if let Some(spk_sk) = self.pending_spk {
+            out.extend_from_slice(&spk_sk);
+        }
         out.extend_from_slice(&self.prev_eph);
         out.extend_from_slice(&self.send_ck);
         out.extend_from_slice(&self.send_n.to_le_bytes());
         out.extend_from_slice(&self.recv_ck);
         out.extend_from_slice(&self.recv_n.to_le_bytes());
         out.extend_from_slice(&self.prev_send_n.to_le_bytes());
-        out.push(u8::from(self.recv_bound));
         out.extend_from_slice(&(self.skipped.len() as u32).to_le_bytes());
         for ((g, n), mk) in &self.skipped {
             out.extend_from_slice(&g.to_le_bytes());
@@ -285,6 +340,7 @@ impl Ratchet {
         let flags = read_u8(bytes, &mut pos)?;
         let has_eph = flags & 1 == 1;
         let has_their = flags & 2 == 2;
+        let has_pending_spk = flags & 4 == 4;
         let (our_eph_priv, our_eph_pub) = if has_eph {
             (
                 Some(read_fixed::<32>(bytes, &mut pos)?),
@@ -299,13 +355,17 @@ impl Ratchet {
         } else {
             None
         };
+        let pending_spk = if has_pending_spk {
+            Some(read_fixed::<32>(bytes, &mut pos)?)
+        } else {
+            None
+        };
         let prev_eph = read_fixed::<32>(bytes, &mut pos)?;
         let send_ck = read_fixed::<32>(bytes, &mut pos)?;
         let send_n = read_u32(bytes, &mut pos)?;
         let recv_ck = read_fixed::<32>(bytes, &mut pos)?;
         let recv_n = read_u32(bytes, &mut pos)?;
         let prev_send_n = read_u32(bytes, &mut pos)?;
-        let recv_bound = read_u8(bytes, &mut pos)? != 0;
         let skipped_count = read_u32(bytes, &mut pos)? as usize;
         if skipped_count > SKIPPED_MAX {
             return Err(anyhow!("skipped pool too large"));
@@ -338,7 +398,7 @@ impl Ratchet {
             recv_ck,
             recv_n,
             prev_send_n,
-            recv_bound,
+            pending_spk,
             skipped,
             pending: None,
         })
@@ -350,21 +410,6 @@ impl Ratchet {
             let (priv_bytes, pub_bytes) = new_eph();
             self.our_eph_priv = Some(priv_bytes);
             self.our_eph_pub = Some(pub_bytes);
-        }
-        // gen0 首条：把发送链绑定到本端临时 eph（X3DH 式）。
-        // 只由静态-静态 root0 派生链的话，长期私钥一泄漏，全部 gen0 消息
-        // 都能被离线解开；混入 DH(eph_own, pk_peer) 后，攻击者还需要本端
-        // 临时 eph 私钥。幂等：同一 eph 重复加密得到同一条链。
-        if self.gen == 0 && self.send_n == 0 {
-            let dh = x25519_shared(
-                self.our_eph_priv.as_ref().unwrap(),
-                &peer_montgomery(&self.peer_pub)?,
-            )?;
-            self.send_ck = bind_chain(
-                &self.root,
-                &dh,
-                chain_info(&self.own_pub, &self.peer_pub, true),
-            );
         }
         // 收敛性发送刷新：已在本代发送过（send_n>0）且已收到对方本代 eph。
         if let Some((their_gen, their_pub)) = self.their_eph {
@@ -432,18 +477,29 @@ impl Ratchet {
         let body_end = blob.len() - SIG_LEN;
         verify_body(&self.peer_pub, &blob[..body_end], &blob[body_end..])?;
 
-        // gen0 接收链绑定：与发送端 encrypt_inner 的绑定对称。
-        // 用对方 header 里的 dh_pub 做 DH(sk_own, eph_peer)，只绑一次。
-        if hdr.gen == 0 && self.gen == 0 && !self.recv_bound {
-            let own_secret = own_x25519_secret(&self.own);
-            let dh = x25519_shared(&own_secret, &hdr.dh_pub)?;
-            self.recv_ck = bind_chain(
-                &self.root,
-                &dh,
-                chain_info(&self.own_pub, &self.peer_pub, false),
-            );
+        // 响应方首条消息：用 header 里的会话 EK 完成 X3DH，派生 root₀。
+        // gen0 消息的 EK 在 dh_pub；若漏收了 gen0、直接收到 gen1，
+        // 发起方刷新前用的 EK 在 prev_eph 里。
+        if let Some(spk_sk) = self.pending_spk {
+            let ek_pub = if hdr.gen == 0 {
+                hdr.dh_pub
+            } else if hdr.gen == 1 {
+                hdr.prev_eph
+            } else {
+                return Err(anyhow!("cannot derive session: message from gen {}", hdr.gen));
+            };
+            let root = x3dh_root_responder(&self.own, &self.peer_pub, &spk_sk, &ek_pub)?;
+            let (send_ck, recv_ck) = derive_chains(&root, &self.own_pub, &self.peer_pub);
+            self.root = root;
+            self.gen = 0;
+            self.send_ck = send_ck;
+            self.send_n = 0;
+            self.recv_ck = recv_ck;
             self.recv_n = 0;
-            self.recv_bound = true;
+            self.prev_send_n = 0;
+            self.their_eph = None;
+            self.prev_eph = [0u8; 32];
+            self.pending_spk = None;
         }
 
         // 对方领先一代：收敛性接收刷新。
@@ -462,20 +518,6 @@ impl Ratchet {
             // 而不是本地记录的 their_eph：即使漏收对方旧代消息也能还原 root。
             // X25519 对称性保证与发送方 DH(my_eph_old, their_eph) 相同。
             // 快进旧接收链到 header.pn，把迟到消息的密钥存入 skipped 池。
-            // 本端可能从未收到对方 gen0 消息（离线漏收），接收链还没绑定。
-            // 用 header.prev_eph（对方刷新前用的 eph，正绑 gen0 链的那个）
-            // 补做一次绑定，否则快进出来的 skipped 密钥全是错的。
-            if self.gen == 0 && !self.recv_bound {
-                let own_secret = own_x25519_secret(&self.own);
-                let dh0 = x25519_shared(&own_secret, &hdr.prev_eph)?;
-                self.recv_ck = bind_chain(
-                    &self.root,
-                    &dh0,
-                    chain_info(&self.own_pub, &self.peer_pub, false),
-                );
-                self.recv_n = 0;
-                self.recv_bound = true;
-            }
             if hdr.pn > self.recv_n {
                 if hdr.pn - self.recv_n > MAX_SKIP {
                     return Err(anyhow!("pn fast-forward exceeds window"));
@@ -566,7 +608,7 @@ impl Clone for Ratchet {
             recv_ck: self.recv_ck,
             recv_n: self.recv_n,
             prev_send_n: self.prev_send_n,
-            recv_bound: self.recv_bound,
+            pending_spk: self.pending_spk,
             skipped: self.skipped.clone(),
             pending: None,
         }
@@ -582,23 +624,53 @@ fn new_eph() -> ([u8; 32], [u8; 32]) {
     (secret.to_bytes(), public.to_bytes())
 }
 
-/// 静态 ECDH + HKDF 派生 root₀。双方各自用 (私钥, 对方公钥) 计算同一根密钥。
-fn root0(own: &iroh::SecretKey, peer_pub: &[u8; 32]) -> Result<[u8; 32]> {
-    let signing: SigningKey = SigningKey::from_bytes(&own.to_bytes());
-    let my_x25519: StaticSecret = signing.to_scalar_bytes().into();
-    // Ed25519 公钥 → Montgomery 形式才可做 X25519 ECDH。
-    let peer_ed: ed25519_dalek::VerifyingKey = ed25519_dalek::VerifyingKey::from_bytes(peer_pub)
-        .map_err(|e| anyhow!("invalid peer key: {e}"))?;
-    let peer_x25519 = x25519_dalek::PublicKey::from(peer_ed.to_montgomery().to_bytes());
-    let shared = my_x25519.diffie_hellman(&peer_x25519);
-    if shared.as_bytes().iter().all(|byte| *byte == 0) {
-        return Err(anyhow!("x25519 root0 shared secret is all-zero"));
-    }
-    let hk = Hkdf::<Sha256>::new(None, shared.as_bytes());
+/// X3DH 三组 DH 混合成 root₀（发起方）。
+///   dh1 = DH(IK_own, SPK_peer)
+///   dh2 = DH(EK,     IK_peer)
+///   dh3 = DH(EK,     SPK_peer)
+fn x3dh_root_initiator(
+    own: &iroh::SecretKey,
+    peer_pub: &[u8; 32],
+    peer_spk: &[u8; 32],
+    ek_priv: &[u8; 32],
+) -> Result<[u8; 32]> {
+    let own_ik = own_x25519_secret(own);
+    let peer_ik = peer_montgomery(peer_pub)?;
+    let dh1 = x25519_shared(&own_ik, peer_spk)?;
+    let dh2 = x25519_shared(ek_priv, &peer_ik)?;
+    let dh3 = x25519_shared(ek_priv, peer_spk)?;
+    Ok(x3dh_mix(&dh1, &dh2, &dh3))
+}
+
+/// X3DH 三组 DH 混合成 root₀（响应方，与发起方逐项相等）。
+///   dh1 = DH(SPK_own, IK_peer)
+///   dh2 = DH(IK_own,  EK_peer)
+///   dh3 = DH(SPK_own, EK_peer)
+fn x3dh_root_responder(
+    own: &iroh::SecretKey,
+    peer_pub: &[u8; 32],
+    own_spk_sk: &[u8; 32],
+    ek_pub: &[u8; 32],
+) -> Result<[u8; 32]> {
+    let own_ik = own_x25519_secret(own);
+    let peer_ik = peer_montgomery(peer_pub)?;
+    let dh1 = x25519_shared(own_spk_sk, &peer_ik)?;
+    let dh2 = x25519_shared(&own_ik, ek_pub)?;
+    let dh3 = x25519_shared(own_spk_sk, ek_pub)?;
+    Ok(x3dh_mix(&dh1, &dh2, &dh3))
+}
+
+/// 三组 DH 按固定顺序拼起来做 HKDF，双方必须完全一致。
+fn x3dh_mix(dh1: &[u8; 32], dh2: &[u8; 32], dh3: &[u8; 32]) -> [u8; 32] {
+    let mut ikm = [0u8; 96];
+    ikm[..32].copy_from_slice(dh1);
+    ikm[32..64].copy_from_slice(dh2);
+    ikm[64..].copy_from_slice(dh3);
+    let hk = Hkdf::<Sha256>::new(None, &ikm);
     let mut root = [0u8; 32];
     hk.expand(INFO_ROOT, &mut root)
-        .map_err(|e| anyhow!("hkdf expand failed: {e}"))?;
-    Ok(root)
+        .expect("hkdf expand 32 bytes cannot fail");
+    root
 }
 
 /// 收敛性 DH 刷新：`root' = KDF_RK(root, DH)`。
@@ -666,28 +738,6 @@ fn peer_montgomery(peer_pub: &[u8; 32]) -> Result<[u8; 32]> {
     let peer_ed = ed25519_dalek::VerifyingKey::from_bytes(peer_pub)
         .map_err(|e| anyhow!("invalid peer key: {e}"))?;
     Ok(peer_ed.to_montgomery().to_bytes())
-}
-
-/// 按公钥字典序判定「本端是 low 侧还是 high 侧」，返回该方向的链 info。
-/// `send = true` 取发送链，`false` 取接收链（两侧互为反方向）。
-fn chain_info(own_pub: &[u8; 32], peer_pub: &[u8; 32], send: bool) -> &'static [u8] {
-    let own_is_low = own_pub < peer_pub;
-    match (own_is_low, send) {
-        (true, true) => INFO_CHAIN_LOW,
-        (true, false) => INFO_CHAIN_HIGH,
-        (false, true) => INFO_CHAIN_HIGH,
-        (false, false) => INFO_CHAIN_LOW,
-    }
-}
-
-/// gen0 链绑定：`ck = HKDF(salt=root, ikm=DH, info=方向)`。
-/// 发送侧用 `DH(eph_own, pk_peer)`，接收侧用 `DH(sk_own, eph_peer)`，二者相等。
-fn bind_chain(root: &[u8; 32], dh: &[u8; 32], info: &[u8]) -> [u8; 32] {
-    let hk = Hkdf::<Sha256>::new(Some(root), dh);
-    let mut out = [0u8; 32];
-    hk.expand(info, &mut out)
-        .expect("hkdf expand 32 bytes cannot fail");
-    out
 }
 
 fn decrypt_aead(mk: &[u8; 32], header: &Header, blob: &[u8], body_end: usize) -> Result<Vec<u8>> {
