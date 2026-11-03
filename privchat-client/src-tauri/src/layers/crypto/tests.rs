@@ -92,7 +92,10 @@ fn responder_cannot_send_before_first_message() {
     let f = fixture();
     let mut b = f.b();
     assert!(!b.is_established());
-    assert!(b.encrypt(b"too early").is_err(), "must not send before X3DH");
+    assert!(
+        b.encrypt(b"too early").is_err(),
+        "must not send before X3DH"
+    );
 
     let mut a = f.a();
     let blob = a.encrypt(b"init").unwrap();

@@ -126,6 +126,7 @@ struct SendCtx {
     /// 是否保留 P2P 直连投递（仅单机集成测试为 true；生产已删除直连）。
     allow_direct: bool,
     history: Arc<Mutex<HashMap<String, Vec<ChatMessage>>>>,
+    contacts: Arc<Mutex<HashMap<String, Contact>>>,
     stop: watch::Receiver<bool>,
 }
 
@@ -201,12 +202,9 @@ async fn onion_put(
     let (mut send, mut recv) = conn.open_bi().await?;
     send.write_all(&packet).await?;
     send.finish()?;
-    let bytes = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        recv.read_to_end(4096),
-    )
-    .await
-    .map_err(|_| anyhow!("onion ack timed out"))??;
+    let bytes = tokio::time::timeout(std::time::Duration::from_secs(30), recv.read_to_end(4096))
+        .await
+        .map_err(|_| anyhow!("onion ack timed out"))??;
     let response: privchat_common::MailboxResponse = serde_json::from_slice(&bytes)?;
     if !response.ok {
         return Err(anyhow!(
@@ -230,7 +228,23 @@ impl SendCtx {
             let key = (local_id.to_string(), peer_id.to_string());
             let mut ratchets = self.ratchets.lock().await;
             if !ratchets.contains_key(&key) {
-                ratchets.insert(key.clone(), crypto::Ratchet::new(&secret, peer_id)?);
+                // 没有会话就新建：发送方即发起方，需要对方 SPK 公钥（邀请串携带）。
+                // 若本端是响应方（对方先发的），会话已存在，不查 SPK。
+                let peer_spk = {
+                    let contacts = self.contacts.lock().await;
+                    contacts
+                        .get(peer_id)
+                        .and_then(|c| c.peer_spk.clone())
+                        .ok_or_else(|| anyhow!("contact {peer_id} has no SPK; re-add via invite"))?
+                };
+                let peer_spk: [u8; 32] = peer_spk
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| anyhow!("stored peer SPK has bad length"))?;
+                ratchets.insert(
+                    key.clone(),
+                    crypto::Ratchet::new_initiator(&secret, peer_id, &peer_spk)?,
+                );
             }
             ratchets.get_mut(&key).unwrap().encrypt(&job.plain_bytes)?
         };
@@ -257,9 +271,19 @@ impl SendCtx {
         // 1a) 洋葱路径（启用时优先）：多层封装后交给首跳中继，最后一跳落库。
         if onion.enabled && !onion.relays.is_empty() {
             let endpoint = self.transport.endpoint_for(local_id).await?;
-            match onion_put(&endpoint, &onion.relays, peer_id, &wire.msg_id, blob.clone()).await {
+            match onion_put(
+                &endpoint,
+                &onion.relays,
+                peer_id,
+                &wire.msg_id,
+                blob.clone(),
+            )
+            .await
+            {
                 Ok(()) => mailbox_ok = true,
-                Err(e) => eprintln!("[app] onion route failed ({e:#}); falling back to direct mailbox"),
+                Err(e) => {
+                    eprintln!("[app] onion route failed ({e:#}); falling back to direct mailbox")
+                }
             }
         }
 
@@ -388,6 +412,9 @@ pub struct Contact {
     pub name: Option<String>,
     /// 对方的连接票据（重启后重新拨号）。单边邀请下对方未提供票据时为空。
     pub ticket: Option<String>,
+    /// 对方的 X25519 SPK 公钥（来自邀请串，X3DH 用）。
+    #[serde(default)]
+    pub peer_spk: Option<Vec<u8>>,
 }
 
 /// 前端联系人列表条目（轻量）。
@@ -536,7 +563,15 @@ impl App {
         match self.transport.create_identity().await {
             Ok(local_id) => {
                 self.pending.lock().await.push(local_id.clone());
-                local_id
+                // 邀请串 = IK + SPK 公钥 + IK 签名，加到通讯录时验签。
+                match (
+                    self.transport.secret_for(&local_id).await,
+                    self.transport.spk_public(&local_id).await,
+                ) {
+                    // 生产邀请不带地址（避免泄漏 IP/relay），靠 DNS 发现。
+                    (Ok(secret), Ok(spk_pk)) => crypto::encode_invite(&secret, &spk_pk, None),
+                    _ => String::new(),
+                }
             }
             Err(e) => {
                 eprintln!("[app] create identity failed: {e}");
@@ -811,8 +846,9 @@ impl App {
     /// 身份（`self_ticket` 新建）则绑定给该联系人，否则新建。
     /// **防冲突**：选中的本地身份必须未被任何联系人占用，否则跳过重选。
     pub async fn connect_peer(&self, invite: &str, name: Option<String>) -> Result<String> {
-        // 先解析对方身份（同时验证邀请串合法性）。
-        let _remote = self.transport.parse_peer_id(invite)?;
+        // 邀请串 = IK + SPK + 签名；先验签再取身份。
+        let (invite_peer, spk, invite_ticket) = crypto::parse_invite(invite)?;
+        let _remote = self.transport.parse_peer_id(&invite_peer)?;
 
         // 复用未被占用的待绑定邀请身份；无则新建。
         let local_id = {
@@ -831,12 +867,16 @@ impl App {
             }
         };
 
-        let peer_id = self.transport.connect_peer(&local_id, invite).await?;
+        // 邀请里带票据就用票据拨号（免 DNS）；否则按 peer_id 走 DNS 发现。
+        let dial = invite_ticket.as_deref().unwrap_or(&invite_peer);
+        let peer_id = self.transport.connect_peer(&local_id, dial).await?;
         let contact = Contact {
             peer_id: peer_id.clone(),
             local_id,
             name,
-            ticket: Some(invite.to_string()),
+            // 存「拨号地址」（票据或 peer_id），不是邀请串本身。
+            ticket: Some(dial.to_string()),
+            peer_spk: Some(spk.to_vec()),
         };
         self.contacts.lock().await.insert(peer_id.clone(), contact);
         self.persist_contacts().await;
@@ -914,6 +954,7 @@ impl App {
                     mailbox_peers: self.mailbox_peers.clone(),
                     mailbox_write_count: self.mailbox_write_count.clone(),
                     history: self.history.clone(),
+                    contacts: self.contacts.clone(),
                     onion: self.onion.clone(),
                     allow_direct: self.allow_direct,
                     stop: self.stop_tx.subscribe(),
@@ -1007,7 +1048,12 @@ impl App {
             let key = (local_id.clone(), sender.clone());
             let mut ratchets = self.ratchets.lock().await;
             if !ratchets.contains_key(&key) {
-                ratchets.insert(key.clone(), crypto::Ratchet::new(&secret, &sender)?);
+                // 收到对方首条消息：本端是响应方，用本端 SPK 私钥完成 X3DH。
+                let spk = self.transport.spk_for(&local_id).await?;
+                ratchets.insert(
+                    key.clone(),
+                    crypto::Ratchet::new_responder(&secret, &sender, &spk)?,
+                );
             }
             ratchets.get_mut(&key).unwrap().decrypt(&wire.msg)?
         };
@@ -1039,6 +1085,9 @@ impl App {
                     local_id: local_id.clone(),
                     name: None,
                     ticket: None,
+                    // 对端未提供邀请串时拿不到其 SPK；本端仍可继续应答
+                    // （会话是对方发起的），但要主动新建会话得先交换邀请。
+                    peer_spk: None,
                 },
             );
             // 若该身份之前是待绑定邀请身份，现在已绑定。

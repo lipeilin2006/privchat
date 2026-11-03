@@ -2,6 +2,17 @@ use super::*;
 
 const TEST_KEY: [u8; 32] = [0x42; 32];
 
+/// 测试辅助：生成一个「带 EndpointTicket」的邀请（no-relay 模式没有 DNS）。
+/// 返回 `(peer_id, invite)`。
+async fn new_invite(app: &App) -> (String, String) {
+    let invite = app.self_ticket().await;
+    let (peer, _spk, _) = crypto::parse_invite(&invite).expect("parse invite");
+    let secret = app.transport.secret_for(&peer).await.expect("secret");
+    let spk_pk = app.transport.spk_public(&peer).await.expect("spk");
+    let ticket = app.transport.ticket_for(&peer).await;
+    (peer, crypto::encode_invite(&secret, &spk_pk, Some(&ticket)))
+}
+
 /// 全栈集成：两个客户端各自完整走 L4->L1->L4，通过真实 QUIC 交换消息，
 /// 验证直连、身份认证与消息贯通。每联系人使用专属身份。
 #[tokio::test]
@@ -18,25 +29,15 @@ async fn two_clients_roundtrip() {
         .await
         .expect("start b");
 
-    // 双方互相通过专属身份邀请串（完整票据）建立好友关系。
-    let alice_invite = alice.self_ticket().await;
-    let bob_invite = bob.self_ticket().await;
-    let alice_for_bob = alice.transport.parse_peer_id(&alice_invite).unwrap();
-    let bob_for_alice = bob.transport.parse_peer_id(&bob_invite).unwrap();
+    // 双方互相通过邀请串建立好友关系（no-relay 用带票据的邀请）。
+    let (alice_for_bob, alice_invite) = new_invite(&alice).await;
+    let (bob_for_alice, bob_invite) = new_invite(&bob).await;
 
-    // 注意：no-relay 模式无法经 DNS 解析地址，测试用完整票据连接；
-    // 因此把「专属身份 peer_id -> 该身份票据」的映射提供给对方。
     let bob_id = alice
-        .connect_peer(
-            &bob.transport.ticket_for(&bob_for_alice).await,
-            Some("Bob".into()),
-        )
+        .connect_peer(&bob_invite, Some("Bob".into()))
         .await
         .expect("a->b");
-    let alice_id = bob
-        .connect_peer(&alice.transport.ticket_for(&alice_for_bob).await, None)
-        .await
-        .expect("b->a");
+    let alice_id = bob.connect_peer(&alice_invite, None).await.expect("b->a");
     assert_eq!(bob_id, bob_for_alice);
     assert_eq!(alice_id, alice_for_bob);
 
@@ -87,22 +88,10 @@ async fn contacts_persist_across_restart() {
     let (bob, mut rx_b) = App::start_no_relay(dir_b.clone(), TEST_KEY)
         .await
         .expect("start b");
-    let alice_for_bob = alice
-        .transport
-        .parse_peer_id(&alice.self_ticket().await)
-        .unwrap();
-    let bob_for_alice = bob
-        .transport
-        .parse_peer_id(&bob.self_ticket().await)
-        .unwrap();
-    let bob_id = alice
-        .connect_peer(&bob.transport.ticket_for(&bob_for_alice).await, None)
-        .await
-        .expect("a->b");
-    let alice_id = bob
-        .connect_peer(&alice.transport.ticket_for(&alice_for_bob).await, None)
-        .await
-        .expect("b->a");
+    let (alice_for_bob, alice_invite) = new_invite(&alice).await;
+    let (bob_for_alice, bob_invite) = new_invite(&bob).await;
+    let bob_id = alice.connect_peer(&bob_invite, None).await.expect("a->b");
+    let alice_id = bob.connect_peer(&alice_invite, None).await.expect("b->a");
     alice
         .send_message(&bob_id, "hello bob")
         .await
@@ -195,22 +184,10 @@ async fn rapid_burst_all_delivered() {
         .await
         .expect("start b");
 
-    let alice_for_bob = alice
-        .transport
-        .parse_peer_id(&alice.self_ticket().await)
-        .unwrap();
-    let bob_for_alice = bob
-        .transport
-        .parse_peer_id(&bob.self_ticket().await)
-        .unwrap();
-    let bob_id = alice
-        .connect_peer(&bob.transport.ticket_for(&bob_for_alice).await, None)
-        .await
-        .expect("a->b");
-    let alice_id = bob
-        .connect_peer(&alice.transport.ticket_for(&alice_for_bob).await, None)
-        .await
-        .expect("b->a");
+    let (alice_for_bob, alice_invite) = new_invite(&alice).await;
+    let (bob_for_alice, bob_invite) = new_invite(&bob).await;
+    let bob_id = alice.connect_peer(&bob_invite, None).await.expect("a->b");
+    let alice_id = bob.connect_peer(&alice_invite, None).await.expect("b->a");
 
     // 并发快速连发 12 条（模拟前端高频发送）。
     let texts: Vec<String> = (0..12).map(|i| format!("burst {i}")).collect();
@@ -272,11 +249,9 @@ async fn single_invite_bidirectional() {
         .expect("start b");
 
     // 只有 Alice 出邀请（专属身份）。测试因无 DNS 用完整票据。
-    let alice_invite = alice.self_ticket().await;
-    let alice_for_bob = alice.transport.parse_peer_id(&alice_invite).unwrap();
-    let alice_ticket = alice.transport.ticket_for(&alice_for_bob).await;
+    let (alice_for_bob, alice_invite) = new_invite(&alice).await;
     let alice_id = bob
-        .connect_peer(&alice_ticket, Some("Alice".into()))
+        .connect_peer(&alice_invite, Some("Alice".into()))
         .await
         .expect("b->a");
     assert_eq!(alice_id, alice_for_bob);
@@ -333,25 +308,13 @@ async fn delete_contact_cleans_everything() {
     let (bob, _rx_b) = App::start_no_relay(dir_b.clone(), TEST_KEY)
         .await
         .expect("start b");
-    let alice_for_bob = alice
-        .transport
-        .parse_peer_id(&alice.self_ticket().await)
-        .unwrap();
-    let bob_for_alice = bob
-        .transport
-        .parse_peer_id(&bob.self_ticket().await)
-        .unwrap();
+    let (alice_for_bob, alice_invite) = new_invite(&alice).await;
+    let (bob_for_alice, bob_invite) = new_invite(&bob).await;
     let bob_id = alice
-        .connect_peer(
-            &bob.transport.ticket_for(&bob_for_alice).await,
-            Some("Bob".into()),
-        )
+        .connect_peer(&bob_invite, Some("Bob".into()))
         .await
         .expect("a->b");
-    let _alice_id = bob
-        .connect_peer(&alice.transport.ticket_for(&alice_for_bob).await, None)
-        .await
-        .expect("b->a");
+    let _alice_id = bob.connect_peer(&alice_invite, None).await.expect("b->a");
 
     // 先发一条消息产生历史。
     alice
@@ -396,25 +359,13 @@ async fn handle_incoming_rejects_identity_conflicts() {
         .expect("start b");
 
     // Alice 与 Bob 双向建立：Alice 对 Bob 生成专属身份 alice_for_bob。
-    let alice_for_bob = alice
-        .transport
-        .parse_peer_id(&alice.self_ticket().await)
-        .unwrap();
-    let bob_for_alice = bob
-        .transport
-        .parse_peer_id(&bob.self_ticket().await)
-        .unwrap();
+    let (alice_for_bob, alice_invite) = new_invite(&alice).await;
+    let (bob_for_alice, bob_invite) = new_invite(&bob).await;
     let bob_id = alice
-        .connect_peer(
-            &bob.transport.ticket_for(&bob_for_alice).await,
-            Some("Bob".into()),
-        )
+        .connect_peer(&bob_invite, Some("Bob".into()))
         .await
         .expect("a->b");
-    let _alice_id = bob
-        .connect_peer(&alice.transport.ticket_for(&alice_for_bob).await, None)
-        .await
-        .expect("b->a");
+    let _alice_id = bob.connect_peer(&alice_invite, None).await.expect("b->a");
 
     let alice_contacts = alice.list_contacts().await;
     let alice_local_for_bob = alice_contacts
@@ -494,8 +445,8 @@ async fn two_clients_roundtrip_with_relay() {
     // 生产邀请 = 专属身份的 peer_id（几十字符，可进二维码），靠 DNS/Pkarr 解析地址。
     let alice_invite = alice.self_ticket().await;
     let bob_invite = bob.self_ticket().await;
-    let alice_for_bob = alice.transport.parse_peer_id(&alice_invite).unwrap();
-    let bob_for_alice = bob.transport.parse_peer_id(&bob_invite).unwrap();
+    let (alice_for_bob, alice_invite) = new_invite(&alice).await;
+    let (bob_for_alice, bob_invite) = new_invite(&bob).await;
 
     let bob_id = alice
         .connect_peer(&bob_invite, Some("Bob".into()))
@@ -572,8 +523,12 @@ async fn mailbox_grid_sync_end_to_end() {
         msg_text: "grid hello from client0".to_string(),
         utc_time,
     };
-    let mut ratchet_a = crypto::Ratchet::new(&alice_key, &bob_id).expect("ratchet a");
-    let mut ratchet_b = crypto::Ratchet::new(&bob_key, &alice_id).expect("ratchet b");
+    let spk_sk = x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng);
+    let spk_pk = x25519_dalek::PublicKey::from(&spk_sk).to_bytes();
+    let mut ratchet_a =
+        crypto::Ratchet::new_initiator(&alice_key, &bob_id, &spk_pk).expect("ratchet a");
+    let mut ratchet_b =
+        crypto::Ratchet::new_responder(&bob_key, &alice_id, &spk_sk.to_bytes()).expect("ratchet b");
     let blob = ratchet_a
         .encrypt(&serde_json::to_vec(&plain).unwrap())
         .expect("encrypt");
@@ -641,8 +596,11 @@ fn msg_id_is_deterministic_and_direction_unique() {
         utc_time: 1,
     })
     .unwrap();
-    let mut a = crypto::Ratchet::new(&alice, &bob_id).unwrap();
-    let mut b = crypto::Ratchet::new(&bob, &alice_id).unwrap();
+    let alice_spk = x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng);
+    let alice_spk_pk = x25519_dalek::PublicKey::from(&alice_spk).to_bytes();
+    let mut a = crypto::Ratchet::new_initiator(&alice, &bob_id, &alice_spk_pk).unwrap();
+    // 双方各自作为发起方（并发发起在会话层合并，这里只验证 msg_id 方向不撞）。
+    let mut b = crypto::Ratchet::new_initiator(&bob, &alice_id, &alice_spk_pk).unwrap();
     let blob_a = a.encrypt(&plain).unwrap();
     let blob_b = b.encrypt(&plain).unwrap();
 

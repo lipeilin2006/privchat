@@ -13,6 +13,7 @@ privchat-client = { path = "../privchat-client/src-tauri" }
 privchat-common = { path = "../privchat-common" }
 privchat-onion = { path = "../privchat-onion" }
 sha2 = "0.10"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
 iroh = "1.0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "io-util"] }
 anyhow = "1"

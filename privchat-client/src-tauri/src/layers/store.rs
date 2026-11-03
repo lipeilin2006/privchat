@@ -55,7 +55,8 @@ impl Store {
                  peer_id TEXT PRIMARY KEY,
                  local_id TEXT NOT NULL,
                  name TEXT,
-                 ticket TEXT
+                 ticket TEXT,
+                 peer_spk BLOB
              );
              CREATE TABLE IF NOT EXISTS messages (
                  peer_id TEXT NOT NULL,
@@ -71,6 +72,10 @@ impl Store {
              CREATE TABLE IF NOT EXISTS identities (
                  local_id TEXT PRIMARY KEY,
                  secret BLOB NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS identity_spk (
+                 local_id TEXT PRIMARY KEY,
+                 spk_sk BLOB NOT NULL
              );
              CREATE TABLE IF NOT EXISTS ratchets (
                  local_id TEXT NOT NULL,
@@ -109,13 +114,15 @@ impl Store {
     /// 联系人表整表读入内存（peer_id → Contact）。
     pub fn load_contacts(&self) -> Result<HashMap<String, Contact>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT peer_id, local_id, name, ticket FROM contacts")?;
+        let mut stmt =
+            conn.prepare("SELECT peer_id, local_id, name, ticket, peer_spk FROM contacts")?;
         let rows = stmt.query_map([], |row| {
             Ok(Contact {
                 peer_id: row.get(0)?,
                 local_id: row.get(1)?,
                 name: row.get(2)?,
                 ticket: row.get(3)?,
+                peer_spk: row.get(4)?,
             })
         })?;
         let mut out = HashMap::new();
@@ -131,10 +138,11 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM contacts", [])?;
         let mut stmt = conn.prepare(
-            "INSERT INTO contacts (peer_id, local_id, name, ticket) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO contacts (peer_id, local_id, name, ticket, peer_spk)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
         )?;
         for c in contacts.values() {
-            stmt.execute(params![c.peer_id, c.local_id, c.name, c.ticket])?;
+            stmt.execute(params![c.peer_id, c.local_id, c.name, c.ticket, c.peer_spk])?;
         }
         Ok(())
     }
@@ -217,6 +225,31 @@ impl Store {
         Ok(())
     }
 
+    /// 保存某个专属身份的 SPK 私钥（X25519，32 字节）。
+    pub fn save_identity_spk(&self, local_id: &str, spk_sk: &[u8]) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO identity_spk (local_id, spk_sk) VALUES (?1, ?2)",
+            params![local_id, spk_sk],
+        )?;
+        Ok(())
+    }
+
+    /// 读取全部 SPK 私钥（local_id → 32 字节）。
+    pub fn load_identity_spks(&self) -> Result<HashMap<String, Vec<u8>>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT local_id, spk_sk FROM identity_spk")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        let mut out = HashMap::new();
+        for r in rows {
+            let (local_id, spk) = r?;
+            out.insert(local_id, spk);
+        }
+        Ok(out)
+    }
+
     /// 读取全部专属身份私钥（local_id → SecretKey 字节）。
     pub fn load_identities(&self) -> Result<HashMap<String, Vec<u8>>> {
         let conn = self.conn.lock().unwrap();
@@ -237,6 +270,10 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "DELETE FROM identities WHERE local_id = ?1",
+            params![local_id],
+        )?;
+        conn.execute(
+            "DELETE FROM identity_spk WHERE local_id = ?1",
             params![local_id],
         )?;
         conn.execute(
@@ -455,6 +492,7 @@ mod tests {
                 local_id: "local1".to_string(),
                 name: Some("Alice".to_string()),
                 ticket: Some("ticket1".to_string()),
+                peer_spk: None,
             },
         );
         contacts

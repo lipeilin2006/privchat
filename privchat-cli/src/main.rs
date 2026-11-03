@@ -76,7 +76,10 @@ fn state_wrap(secret: &SecretKey, payload: &[u8]) -> Vec<u8> {
 
 fn state_unwrap(secret: &SecretKey, path: &Path, raw: &[u8]) -> Result<Vec<u8>> {
     if raw.len() < STATE_HEADER || &raw[0..4] != STATE_MAGIC {
-        bail!("{} 不是合法的 PrivChat 状态文件（magic 不匹配）", path.display());
+        bail!(
+            "{} 不是合法的 PrivChat 状态文件（magic 不匹配）",
+            path.display()
+        );
     }
     if raw[4] != STATE_VERSION {
         bail!(
@@ -87,20 +90,33 @@ fn state_unwrap(secret: &SecretKey, path: &Path, raw: &[u8]) -> Result<Vec<u8>> 
         );
     }
     if &raw[5..37] != secret.public().as_bytes() {
-        bail!("{} 属于另一个身份，拒绝加载（防止身份串用）", path.display());
+        bail!(
+            "{} 属于另一个身份，拒绝加载（防止身份串用）",
+            path.display()
+        );
     }
     Ok(raw[STATE_HEADER..].to_vec())
 }
 
-fn load_ratchet(home: &Path, secret: &SecretKey, name: &str, peer: &str) -> Result<Ratchet> {
+fn load_ratchet(
+    home: &Path,
+    secret: &SecretKey,
+    name: &str,
+    peer: &str,
+    peer_spk: Option<&str>,
+) -> Result<Ratchet> {
     let path = ratchet_path(home, name, peer);
     if path.exists() {
         let raw = fs::read(&path)?;
         let bytes = state_unwrap(secret, &path, &raw)?;
         Ratchet::from_bytes(secret, peer, &bytes)
             .with_context(|| format!("恢复会话 {} 失败", path.display()))
+    } else if let Some(spk) = peer_spk {
+        let spk: [u8; 32] = hex_to_32(spk)?;
+        Ratchet::new_initiator(secret, peer, &spk)
     } else {
-        Ratchet::new(secret, peer)
+        // 没有对方 SPK：只能当响应方，等对方先发。
+        Ratchet::new_responder(secret, peer, &cli_spk(secret))
     }
 }
 
@@ -112,7 +128,10 @@ fn save_ratchet(
     ratchet: &Ratchet,
 ) -> Result<()> {
     fs::create_dir_all(home)?;
-    fs::write(ratchet_path(home, name, peer), state_wrap(secret, &ratchet.to_bytes()))?;
+    fs::write(
+        ratchet_path(home, name, peer),
+        state_wrap(secret, &ratchet.to_bytes()),
+    )?;
     Ok(())
 }
 
@@ -120,7 +139,7 @@ fn save_ratchet(
 fn known_peers(home: &Path, name: &str) -> Result<Vec<String>> {
     let mut out: Vec<String> = contacts(home, name)?
         .into_iter()
-        .map(|(_, peer)| peer)
+        .map(|(_, peer, _)| peer)
         .collect();
     let prefix = format!("{name}@");
     if let Ok(entries) = fs::read_dir(home) {
@@ -143,7 +162,7 @@ fn contact_key_path(home: &Path, name: &str, label: &str) -> PathBuf {
 }
 
 /// 联系人表：每行 `<label> <peer_id>`；只写一个字段时视为 label == peer_id。
-fn contacts(home: &Path, name: &str) -> Result<Vec<(String, String)>> {
+fn contacts(home: &Path, name: &str) -> Result<Vec<(String, String, Option<String>)>> {
     let path = home.join(format!("{name}.contacts"));
     let mut out = Vec::new();
     if let Ok(text) = fs::read_to_string(path) {
@@ -155,8 +174,12 @@ fn contacts(home: &Path, name: &str) -> Result<Vec<(String, String)>> {
             let mut it = line.split_whitespace();
             let first = it.next().unwrap_or_default();
             match it.next() {
-                Some(peer) => out.push((first.to_string(), peer.to_string())),
-                None => out.push((first.to_string(), first.to_string())),
+                Some(peer) => out.push((
+                    first.to_string(),
+                    peer.to_string(),
+                    it.next().map(|s| s.to_string()),
+                )),
+                None => out.push((first.to_string(), first.to_string(), None)),
             }
         }
     }
@@ -164,26 +187,40 @@ fn contacts(home: &Path, name: &str) -> Result<Vec<(String, String)>> {
 }
 
 /// 把 `<label>` 或完整 peer_id 解析成 `(label, peer_id)`。
-fn resolve_contact(home: &Path, name: &str, arg: &str) -> Result<(String, String)> {
-    if let Some((label, peer)) = contacts(home, name)?
+fn resolve_contact(home: &Path, name: &str, arg: &str) -> Result<(String, String, Option<String>)> {
+    if let Some((label, peer, spk)) = contacts(home, name)?
         .into_iter()
-        .find(|(label, peer)| label == arg || peer == arg)
+        .find(|(label, peer, _)| label == arg || peer == arg)
     {
-        return Ok((label, peer));
+        return Ok((label, peer, spk));
     }
     if arg.len() == 64 && arg.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Ok((arg.to_string(), arg.to_string()));
+        return Ok((arg.to_string(), arg.to_string(), None));
     }
     bail!("找不到联系人 {arg}：先执行 `contact {name} <label> <peer_id>`")
 }
 
 /// 该身份在此联系人下使用的私钥：有专属身份用专属的，否则退回主身份。
+
+/// CLI 是测试工具：每个身份的 SPK 私钥由身份私钥确定派生，不额外落盘。
+/// 生产客户端用独立的随机 SPK（见 store 的 identity_spk 表）。
+fn cli_spk(secret: &SecretKey) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(b"privchat/cli/spk/v1");
+    h.update(secret.to_bytes());
+    h.finalize().into()
+}
+
+fn cli_spk_pub(secret: &SecretKey) -> [u8; 32] {
+    let sk = x25519_dalek::StaticSecret::from(cli_spk(secret));
+    x25519_dalek::PublicKey::from(&sk).to_bytes()
+}
+
 fn identity_for(home: &Path, name: &str, label: &str) -> Result<SecretKey> {
     let path = contact_key_path(home, name, label);
     if path.exists() {
         let bytes = fs::read(&path)?;
-        return SecretKey::try_from(bytes.as_slice())
-            .map_err(|e| anyhow!("读取专属身份失败: {e}"));
+        return SecretKey::try_from(bytes.as_slice()).map_err(|e| anyhow!("读取专属身份失败: {e}"));
     }
     load_secret(home, name)
 }
@@ -275,6 +312,21 @@ fn relays_of(args: &Args) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn hex_to_32(s: &str) -> Result<[u8; 32]> {
+    if s.len() != 64 {
+        bail!("SPK 应为 64 位十六进制");
+    }
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        out[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)?;
+    }
+    Ok(out)
+}
+
+fn hex_of(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 fn sha256_hex(data: &[u8]) -> String {
     let digest = Sha256::digest(data);
     digest.iter().map(|b| format!("{b:02x}")).collect()
@@ -339,8 +391,8 @@ async fn send_onion(endpoint: &iroh::Endpoint, first: &str, packet: &[u8]) -> Re
     let bytes = tokio::time::timeout(Duration::from_secs(120), recv.read_to_end(4096))
         .await
         .map_err(|_| anyhow!("等待中继响应超时"))??;
-    let response: MailboxResponse = serde_json::from_slice(&bytes)
-        .map_err(|e| anyhow!("中继响应解析失败: {e}"))?;
+    let response: MailboxResponse =
+        serde_json::from_slice(&bytes).map_err(|e| anyhow!("中继响应解析失败: {e}"))?;
     if !response.ok {
         bail!("洋葱链路失败: {}", response.error.unwrap_or_default());
     }
@@ -379,7 +431,11 @@ async fn recv_all(
                 if slots.len() == 1 {
                     return Err(error);
                 }
-                eprintln!("[recv] 队列 {}({}) 拉取失败: {error:#}", slot.label, &me[..8]);
+                eprintln!(
+                    "[recv] 队列 {}({}) 拉取失败: {error:#}",
+                    slot.label,
+                    &me[..8]
+                );
                 continue;
             }
         };
@@ -387,14 +443,24 @@ async fn recv_all(
             if slots.len() == 1 {
                 bail!("mailbox 拒绝: {}", resp.error.unwrap_or_default());
             }
-            eprintln!("[recv] 队列 {}({}) 被拒绝: {}", slot.label, &me[..8], resp.error.unwrap_or_default());
+            eprintln!(
+                "[recv] 队列 {}({}) 被拒绝: {}",
+                slot.label,
+                &me[..8],
+                resp.error.unwrap_or_default()
+            );
             continue;
         }
         for m in resp.messages.unwrap_or_default() {
             let cipher_len = m.msg.len();
             let mut decrypted = None;
             for peer in &candidates {
-                let Ok(mut ratchet) = load_ratchet(home, &slot.secret, name, peer) else {
+                let spk = contacts(home, name)?
+                    .into_iter()
+                    .find(|(_, p, _)| p == peer)
+                    .and_then(|(_, _, spk)| spk);
+                let Ok(mut ratchet) = load_ratchet(home, &slot.secret, name, peer, spk.as_deref())
+                else {
                     continue;
                 };
                 if let Ok(raw) = ratchet.decrypt(&m.msg) {
@@ -439,7 +505,11 @@ async fn cmd_init(home: &Path, name: &str) -> Result<()> {
 }
 
 fn cmd_id(home: &Path, name: &str) -> Result<()> {
-    println!("{}", peer_id_of(&load_secret(home, name)?));
+    let secret = load_secret(home, name)?;
+    println!(
+        "{}",
+        privchat_client_lib::layers::crypto::encode_invite(&secret, &cli_spk_pub(&secret), None)
+    );
     Ok(())
 }
 
@@ -474,9 +544,29 @@ fn cmd_ls(home: &Path) -> Result<()> {
 
 fn cmd_contact(home: &Path, name: &str, label_or_peer: &str, peer: Option<&str>) -> Result<()> {
     load_secret(home, name)?;
-    let (label, peer_id) = match peer {
-        Some(peer) => (label_or_peer.to_string(), peer.to_string()),
-        None => (label_or_peer.to_string(), label_or_peer.to_string()),
+    // 邀请串 → (peer_id, SPK)；兼容直接给 peer_id（此时只能当响应方）。
+    let parse_one = |raw: &str| -> Result<(String, Option<String>)> {
+        if raw.starts_with("pc1:") {
+            let (peer, spk, _ticket) = privchat_client_lib::layers::crypto::parse_invite(raw)?;
+            Ok((peer, Some(hex_of(&spk))))
+        } else {
+            Ok((raw.to_string(), None))
+        }
+    };
+    let (label, peer_id, spk) = match peer {
+        Some(p) => {
+            let (peer_id, spk) = parse_one(p)?;
+            (label_or_peer.to_string(), peer_id, spk)
+        }
+        None => {
+            let (peer_id, spk) = parse_one(label_or_peer)?;
+            let label = if peer_id.len() > 8 {
+                peer_id[..8].to_string()
+            } else {
+                peer_id.clone()
+            };
+            (label, peer_id, spk)
+        }
     };
     if peer_id.len() != 64 {
         bail!("peer id 应为 64 位十六进制");
@@ -485,12 +575,15 @@ fn cmd_contact(home: &Path, name: &str, label_or_peer: &str, peer: Option<&str>)
     let mut existing = fs::read_to_string(&path).unwrap_or_default();
     let already = contacts(home, name)?
         .iter()
-        .any(|(l, p)| l == &label || p == &peer_id);
+        .any(|(l, p, _)| l == &label || p == &peer_id);
     if !already {
         if !existing.ends_with('\n') && !existing.is_empty() {
             existing.push('\n');
         }
-        existing.push_str(&format!("{label} {peer_id}\n"));
+        match &spk {
+            Some(spk) => existing.push_str(&format!("{label} {peer_id} {spk}\n")),
+            None => existing.push_str(&format!("{label} {peer_id}\n")),
+        }
         fs::write(&path, existing)?;
     }
     println!("contact added: {name} {label} -> {peer_id}");
@@ -499,7 +592,7 @@ fn cmd_contact(home: &Path, name: &str, label_or_peer: &str, peer: Option<&str>)
 
 /// 校验状态文件：magic / 版本 / 归属身份是否匹配（P3 的可观测入口）。
 fn cmd_state(home: &Path, name: &str, label: &str) -> Result<()> {
-    let (label, peer) = resolve_contact(home, name, label)?;
+    let (label, peer, _spk) = resolve_contact(home, name, label)?;
     let secret = identity_for(home, name, &label)?;
     let path = ratchet_path(home, name, &peer);
     if !path.exists() {
@@ -557,9 +650,9 @@ async fn cmd_send(
     mailbox: &str,
     relays: Vec<String>,
 ) -> Result<()> {
-    let (label, peer) = resolve_contact(home, from, to)?;
+    let (label, peer, spk) = resolve_contact(home, from, to)?;
     let secret = identity_for(home, from, &label)?;
-    let mut ratchet = load_ratchet(home, &secret, from, &peer)?;
+    let mut ratchet = load_ratchet(home, &secret, from, &peer, spk.as_deref())?;
     // P0：连接身份一次性生成，不暴露发送方的长期 iroh 身份。
     let endpoint = make_endpoint(SecretKey::generate()).await?;
     let body = json!({"v": 1, "type": "text", "ts": now_ms(), "text": text}).to_string();
@@ -569,7 +662,15 @@ async fn cmd_send(
         format!("onion({} hops)", relays.len())
     };
     let (msg_id, cipher_len) = deliver(
-        home, from, &secret, &peer, body.as_bytes(), mailbox, &relays, &endpoint, &mut ratchet,
+        home,
+        from,
+        &secret,
+        &peer,
+        body.as_bytes(),
+        mailbox,
+        &relays,
+        &endpoint,
+        &mut ratchet,
     )
     .await?;
     endpoint.close().await;
@@ -580,16 +681,26 @@ async fn cmd_send(
 async fn cmd_recv(home: &Path, name: &str, mailbox: &str, only_peer: Option<&str>) -> Result<()> {
     let started = Instant::now();
     let msgs = recv_all(home, name, mailbox, only_peer).await?;
-    println!("recv {} message(s) in {}ms", msgs.len(), started.elapsed().as_millis());
+    println!(
+        "recv {} message(s) in {}ms",
+        msgs.len(),
+        started.elapsed().as_millis()
+    );
     for m in msgs {
         match serde_json::from_slice::<Value>(&m.plain) {
             Ok(v) if v.get("text").is_some() => {
-                println!("  [{}] from={} ciphertext={}B", m.msg_id, m.peer, m.cipher_len);
+                println!(
+                    "  [{}] from={} ciphertext={}B",
+                    m.msg_id, m.peer, m.cipher_len
+                );
                 println!("  {}", v["text"].as_str().unwrap_or_default());
             }
             _ => println!(
                 "  [{}] from={} ciphertext={}B <非文本 {}B>",
-                m.msg_id, m.peer, m.cipher_len, m.plain.len()
+                m.msg_id,
+                m.peer,
+                m.cipher_len,
+                m.plain.len()
             ),
         }
     }
@@ -622,15 +733,22 @@ async fn cmd_send_image(
         "ts": now_ms(),
     });
 
-    let (label, peer) = resolve_contact(home, from, to)?;
+    let (label, peer, spk) = resolve_contact(home, from, to)?;
     let secret = identity_for(home, from, &label)?;
-    let mut ratchet = load_ratchet(home, &secret, from, &peer)?;
+    let mut ratchet = load_ratchet(home, &secret, from, &peer, spk.as_deref())?;
     // P0：图片发送同样用一次性连接身份。
     let endpoint = make_endpoint(SecretKey::generate()).await?;
 
     let started = Instant::now();
     let (mid, _) = deliver(
-        home, from, &secret, &peer, manifest.to_string().as_bytes(), mailbox, &relays, &endpoint,
+        home,
+        from,
+        &secret,
+        &peer,
+        manifest.to_string().as_bytes(),
+        mailbox,
+        &relays,
+        &endpoint,
         &mut ratchet,
     )
     .await?;
@@ -641,7 +759,15 @@ async fn cmd_send_image(
 
     for (i, piece) in data.chunks(chunk).enumerate() {
         let (mid, len) = deliver(
-            home, from, &secret, &peer, piece, mailbox, &relays, &endpoint, &mut ratchet,
+            home,
+            from,
+            &secret,
+            &peer,
+            piece,
+            mailbox,
+            &relays,
+            &endpoint,
+            &mut ratchet,
         )
         .await?;
         println!(
@@ -722,19 +848,32 @@ async fn cmd_demo(home: &Path, mailbox: &str) -> Result<()> {
     fs::write(key_path(&demo_home, "bob"), bob.to_bytes())?;
     let alice_id = peer_id_of(&alice);
     let bob_id = peer_id_of(&bob);
-    fs::write(demo_home.join("bob.contacts"), format!("{alice_id}\n"))?;
-    fs::write(demo_home.join("alice.contacts"), format!("{bob_id}\n"))?;
+    fs::write(
+        demo_home.join("bob.contacts"),
+        format!("{alice_id} {alice_id} {}\n", hex_of(&cli_spk_pub(&alice))),
+    )?;
+    fs::write(
+        demo_home.join("alice.contacts"),
+        format!("{bob_id} {bob_id} {}\n", hex_of(&cli_spk_pub(&bob))),
+    )?;
     println!("demo identities\n  alice: {alice_id}\n  bob  : {bob_id}");
 
     let text = format!("hello from alice @ {}", now_ms());
     let t0 = Instant::now();
     let (msg_id, cipher_len) = {
         let secret = alice.clone();
-        let mut ratchet = Ratchet::new(&secret, &bob_id)?;
+        let mut ratchet = Ratchet::new_initiator(&secret, &bob_id, &cli_spk_pub(&bob))?;
         let endpoint = make_endpoint(SecretKey::generate()).await?;
         let body = json!({"v":1,"type":"text","ts":now_ms(),"text":text}).to_string();
         let r = deliver(
-            &demo_home, "alice", &secret, &bob_id, body.as_bytes(), mailbox, &[], &endpoint,
+            &demo_home,
+            "alice",
+            &secret,
+            &bob_id,
+            body.as_bytes(),
+            mailbox,
+            &[],
+            &endpoint,
             &mut ratchet,
         )
         .await;
@@ -818,14 +957,20 @@ async fn main() -> Result<()> {
             cmd_ping(&home, mailbox, args.from.as_deref()).await
         }
         "send" => {
-            let mailbox = args.mailbox.as_deref().context("send 需要 --mailbox <peer>")?;
+            let mailbox = args
+                .mailbox
+                .as_deref()
+                .context("send 需要 --mailbox <peer>")?;
             if pos.len() < 4 {
                 bail!("用法: send <from> <to> <text> --mailbox <peer>");
             }
             cmd_send(&home, &pos[1], &pos[2], &pos[3], mailbox, relays).await
         }
         "recv" => {
-            let mailbox = args.mailbox.as_deref().context("recv 需要 --mailbox <peer>")?;
+            let mailbox = args
+                .mailbox
+                .as_deref()
+                .context("recv 需要 --mailbox <peer>")?;
             let name = pos.get(1).context("recv 需要 <name>")?;
             let peer = match args.peer.as_deref() {
                 Some(arg) => Some(resolve_contact(&home, name, arg)?.1),
