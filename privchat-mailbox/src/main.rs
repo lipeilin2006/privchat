@@ -256,7 +256,7 @@ impl ProtocolHandler for OnionHandler {
             Ok(bi) => bi,
             Err(_) => return Ok(()),
         };
-        let packet = match recv.read_to_end(MAX_PAYLOAD).await {
+        let packet = match recv.read_to_end(ONION_PACKET_MAX).await {
             Ok(bytes) => bytes,
             Err(error) => {
                 eprintln!("[onion] read failed: {error:#}");
@@ -546,6 +546,10 @@ async fn handle_request(
 }
 
 /// 本地操作完成后在后台向所有 peer mailbox 并发广播，避免阻塞客户端响应。
+/// 单个洋葱包上限：内层载荷 64KB + 每层 94B 开销，留足余量。
+/// 中继按此上限读取，避免恶意客户端用 16MB 包做内存放大。
+const ONION_PACKET_MAX: usize = 128 * 1024;
+
 /// 单节点邻居表上限，防止 PEX 无限膨胀。
 const MAX_PEERS: usize = 64;
 

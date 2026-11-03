@@ -587,8 +587,8 @@ mod tests {
         let dir = temp_dir("settings");
         let store = Store::open(&dir, KEY).expect("open");
 
-        // 未设置时缺省 0（= 全部节点）。
-        assert_eq!(store.load_mailbox_write_count().unwrap(), 0);
+        // 未设置时缺省 3（PEX 会扩充邻居表，默认全量写代价过高）。
+        assert_eq!(store.load_mailbox_write_count().unwrap(), 3);
         assert!(store.load_setting("nope").unwrap().is_none());
 
         store.save_mailbox_write_count(2).expect("save count");

@@ -222,6 +222,7 @@ npm run uitest
 
 - [privchat-mailbox/CONFIG.md](privchat-mailbox/CONFIG.md) — 节点配置、角色、PEX
 - [privchat-cli/README.md](privchat-cli/README.md) — CLI 用法、图片与洋葱路径
+- [docs/SECURITY.md](docs/SECURITY.md) — 威胁模型、安全审查与抗追踪分析
 
 ---
 

@@ -691,8 +691,14 @@ async fn cmd_recv_image(
     if actual != expect_sha {
         bail!("sha256 校验失败：期望 {expect_sha}，实际 {actual}");
     }
-    let file_name = manifest["name"].as_str().unwrap_or("image.bin");
-    let out_path = PathBuf::from(out.unwrap_or(file_name));
+    // 清单里的文件名来自对端，必须只取最后一段，防止 `../` 路径穿越。
+    let raw_name = manifest["name"].as_str().unwrap_or("image.bin");
+    let safe_name = Path::new(raw_name)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .filter(|s| !s.is_empty() && s != ".." && s != ".")
+        .unwrap_or_else(|| "image.bin".into());
+    let out_path = PathBuf::from(out.unwrap_or(&safe_name));
     fs::write(&out_path, &data)?;
     println!(
         "image received: {} bytes -> {} (sha256 ok)",
