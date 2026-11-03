@@ -896,7 +896,8 @@ impl App {
             msg_text: text.to_string(),
             utc_time,
         };
-        let plain_bytes = serde_json::to_vec(&plain)?;
+        // 加密前做桶填充：同桶内消息密文长度一致，削弱长度侧信道。
+        let plain_bytes = privchat_common::pad_plaintext(&serde_json::to_vec(&plain)?);
 
         let key = (local_id.clone(), peer_id.to_string());
         // 取该会话的发送 worker；不存在则创建一个（懒启动，之后复用）。
@@ -1018,6 +1019,7 @@ impl App {
         if let Err(e) = self.store.save_ratchet(&local_id, &sender, &state) {
             eprintln!("[app] failed to persist ratchet: {e}");
         }
+        let plain = privchat_common::unpad_plaintext(&plain);
         let inner: PlainMsg = serde_json::from_slice(&plain)?;
 
         let msg = ChatMessage {

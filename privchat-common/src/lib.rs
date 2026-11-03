@@ -214,6 +214,54 @@ pub async fn make_endpoint(secret_key: iroh::SecretKey) -> Result<Endpoint> {
         .await?)
 }
 
+
+// ===================== 明文填充（抗长度分析） =====================
+//
+// 消息在棘轮加密前先按「桶」对齐：明文 = magic(4) | len(4 BE) | payload |
+// 零填充，总长为 256 / 512 / 1K / 2K / … / 64K 中最小的不小于 payload+8 的桶。
+// 接收端按 magic 识别并截取；旧版无 magic 的消息原样返回（向后兼容）。
+
+/// 填充头魔数。
+pub const PAD_MAGIC: &[u8; 4] = b"PPAD";
+/// 填充头长度：magic + len(u32 BE)。
+pub const PAD_HEADER: usize = 8;
+/// 最小桶。
+pub const PAD_MIN_BUCKET: usize = 256;
+/// 最大桶（超过则不再对齐）。
+pub const PAD_MAX_BUCKET: usize = 64 * 1024;
+
+fn next_bucket(need: usize) -> usize {
+    let mut bucket = PAD_MIN_BUCKET;
+    while bucket < need && bucket < PAD_MAX_BUCKET {
+        bucket *= 2;
+    }
+    bucket
+}
+
+/// 给明文加长度头并对齐到桶；超长明文按原样加头（不再对齐）。
+pub fn pad_plaintext(payload: &[u8]) -> Vec<u8> {
+    let need = payload.len() + PAD_HEADER;
+    let bucket = next_bucket(need);
+    let total = if bucket >= need { bucket } else { need };
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(PAD_MAGIC);
+    out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    out.extend_from_slice(payload);
+    out.resize(total, 0);
+    out
+}
+
+/// 去掉填充；没有 magic（旧消息）时原样返回。
+pub fn unpad_plaintext(data: &[u8]) -> Vec<u8> {
+    if data.len() < PAD_HEADER || &data[0..4] != PAD_MAGIC {
+        return data.to_vec();
+    }
+    let len = u32::from_be_bytes([data[4], data[5], data[6], data[7]]) as usize;
+    if len > data.len() - PAD_HEADER {
+        return data.to_vec();
+    }
+    data[PAD_HEADER..PAD_HEADER + len].to_vec()
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,6 +289,32 @@ mod tests {
             !verify_pow(to, &other, nonce),
             "payload change must invalidate nonce"
         );
+    }
+
+    #[test]
+    fn pad_roundtrip_and_buckets() {
+        for len in [0usize, 1, 100, 247, 248, 500, 1000, 5000, 60000] {
+            let payload = vec![7u8; len];
+            let padded = pad_plaintext(&payload);
+            assert_eq!(unpad_plaintext(&padded), payload);
+            if len + PAD_HEADER <= PAD_MAX_BUCKET {
+                assert_eq!(padded.len() % PAD_MIN_BUCKET, 0, "bucket aligned");
+                assert!(padded.len().is_power_of_two());
+            }
+        }
+    }
+
+    #[test]
+    fn unpad_legacy_passthrough() {
+        let legacy = b"{\"msg_text\":\"hi\"}";
+        assert_eq!(unpad_plaintext(legacy), legacy.to_vec());
+    }
+
+    #[test]
+    fn pad_hides_length() {
+        let a = pad_plaintext(&vec![1u8; 10]);
+        let b = pad_plaintext(&vec![1u8; 200]);
+        assert_eq!(a.len(), b.len(), "同桶内长度应一致");
     }
 
     #[test]

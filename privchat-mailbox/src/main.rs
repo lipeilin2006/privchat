@@ -293,7 +293,12 @@ impl ProtocolHandler for OnionHandler {
                         return Ok(());
                     }
                 }
-                eprintln!("[onion] relay from {remote}: forwarding {}B to {}", inner.len(), next);
+                eprintln!(
+                    "[onion] relay from {}: forwarding {}B to {}",
+                    short_id(&remote),
+                    inner.len(),
+                    short_id(&next)
+                );
                 let endpoint = self.endpoint.clone();
                 let forwarded = forward_onion(&endpoint, &next, inner).await;
                 eprintln!(
@@ -575,6 +580,11 @@ fn load_onion_allowlist() -> Option<Arc<Vec<String>>> {
     } else {
         Some(Arc::new(list))
     }
+}
+
+/// 日志里只打印 peer_id 前缀，减少节点日志泄露完整身份。
+fn short_id(id: &str) -> &str {
+    &id[..id.len().min(12)]
 }
 
 /// 单个洋葱包上限：内层载荷 64KB + 每层 94B 开销，留足余量。

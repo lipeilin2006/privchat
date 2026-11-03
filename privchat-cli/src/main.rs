@@ -299,7 +299,8 @@ async fn deliver(
     endpoint: &iroh::Endpoint,
     ratchet: &mut Ratchet,
 ) -> Result<(String, usize)> {
-    let blob = ratchet.encrypt(body)?;
+    let padded = privchat_common::pad_plaintext(body);
+    let blob = ratchet.encrypt(&padded)?;
     let (gen, n) = Ratchet::header_gen_n(&blob)?;
     let msg_id = format!("{gen}:{n}");
     let nonce = find_pow(to, &blob);
@@ -396,7 +397,8 @@ async fn recv_all(
                 let Ok(mut ratchet) = load_ratchet(home, &slot.secret, name, peer) else {
                     continue;
                 };
-                if let Ok(plain) = ratchet.decrypt(&m.msg) {
+                if let Ok(raw) = ratchet.decrypt(&m.msg) {
+                    let plain = privchat_common::unpad_plaintext(&raw);
                     save_ratchet(home, name, peer, &slot.secret, &ratchet)?;
                     decrypted = Some((peer.clone(), plain));
                     break;
