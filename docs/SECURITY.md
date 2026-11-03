@@ -111,6 +111,19 @@ v5 起 gen0 的两条方向链改为：
 的签名方案一起做）。消息格式版本随之升到 `PRR3/v5`，旧会话状态不兼容
 （`from_bytes` 会按版本拒绝，双方重建会话）。
 
+### 3.8 每消息身份签名（v6）
+
+v6 起每条消息末尾追加 64 字节 Ed25519 签名，覆盖 `header + ciphertext`
+（带域分隔前缀 `privchat/msg/sig/v1`）。收端**先验签、再动棘轮状态**：
+
+- 伪造/篡改的消息在进入 gen0 绑定与 AEAD 解密之前就被拒绝；
+- 身份与消息显式绑定，杜绝「实现层把消息解到错误会话 / 错误联系人」；
+- 为后续「身份密钥只签名、会话密钥另起」的 prekey 方案铺路。
+
+**边界**：签名密钥就是棘轮 root0 用的那把长期身份密钥，所以**单靠签名挡不住
+「长期密钥泄漏后冒充」**——攻击者拿到私钥同样能签。要真正解决需要
+signed prekey（P2-1）：长期密钥只签预密钥包，会话密钥一次性。
+
 ### 3.5 WebView 与打包层
 
 - **CSP**：已配置 `default-src 'self'; script-src 'self'; style-src 'self'
@@ -137,9 +150,9 @@ v5 起 gen0 的两条方向链改为：
 
 | 项 | 取值 |
 |---|---|
-| 消息加密 | ChaCha20-Poly1305（AEAD，头部作为 AAD） |
+| 消息加密 | ChaCha20-Poly1305（AEAD，头部作为 AAD）+ 每条 Ed25519 签名 |
 | 密钥交换 | X25519（Ed25519 身份转 Montgomery） |
-| 棘轮 | 双棘轮，跳窗 200，skipped 池上限 1000；gen0 链绑定临时 eph（v5） |
+| 棘轮 | 双棘轮，跳窗 200，skipped 池上限 1000；gen0 链绑定临时 eph；消息签名（v6） |
 | 洋葱层密钥 | HKDF-SHA256，info=`privchat/onion/key/v1`，AAD=`privchat/onion/v1` |
 | 保险箱 KDF | PBKDF2-HMAC-SHA256，600,000 次，16B salt |
 | 本地库 | SQLCipher（全库加密） |

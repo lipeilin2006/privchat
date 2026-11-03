@@ -35,12 +35,15 @@
 //!
 //! 消息 blob 格式（存 mailbox / 走 wire 的 `msg`）：
 //! ```text
-//! [0..4] magic "PRR3" | [4] version=5 | [5..9] gen u32LE
+//! [0..4] magic "PRR4" | [4] version=6 | [5..9] gen u32LE
 //! [9..41] dh_pub (32) | [41..45] n u32LE | [45..49] pn u32LE
 //! [49..81] prev_eph (32) | [81..93] nonce (12) | [93..] ChaCha20-Poly1305 ciphertext
+//! [len-64..] Ed25519 签名（覆盖 header + ciphertext）
 //! ```
 //! 固定前缀 93 字节（gen 为 u32，杜绝刷新回绕），完整头作为 AEAD AAD
-//! 认证。mailbox 只接触密文。
+//! 认证；末尾 64 字节是发送方专属身份的 Ed25519 签名，收端**先验签再动
+//! 棘轮状态**。签名把「这条消息确实出自该联系人身份」显式绑到每条消息，
+//! 也挡住实现层把消息解到错误会话上的问题。mailbox 只接触密文。
 
 use std::collections::HashMap;
 
@@ -54,11 +57,13 @@ use sha2::Sha256;
 use x25519_dalek::StaticSecret;
 
 /// wire 消息头魔数。
-const MAGIC: &[u8; 4] = b"PRR3";
+const MAGIC: &[u8; 4] = b"PRR4";
 /// 状态 / 消息版本。
-const VERSION: u8 = 5;
+const VERSION: u8 = 6;
 /// 消息固定前缀长度。
 const HEADER_LEN: usize = 93;
+/// 每条消息末尾的 Ed25519 签名长度。
+const SIG_LEN: usize = 64;
 /// 单次前跳 / 跨代快进的最大窗口。
 const MAX_SKIP: u32 = 200;
 /// skipped 池容量上限（防 DoS）。
@@ -69,6 +74,8 @@ const INFO_RK: &[u8] = b"privchat/ratchet/rk/v1";
 const INFO_CK: &[u8] = b"privchat/ratchet/ck/v1";
 const INFO_CHAIN_LOW: &[u8] = b"privchat/ratchet/chain/low";
 const INFO_CHAIN_HIGH: &[u8] = b"privchat/ratchet/chain/high";
+/// 每消息签名的域分隔前缀（防跨协议重放）。
+const INFO_MSG_SIG: &[u8] = b"privchat/msg/sig/v1";
 
 /// 双棘轮会话。key 为 `(local_id, peer_id)`：本端专属身份 + 对端 peer_id。
 pub struct Ratchet {
@@ -410,11 +417,20 @@ impl Ratchet {
             )
             .map_err(|e| anyhow!("encrypt failed: {e}"))?;
         out.extend_from_slice(&ct);
+        // 末尾追加发送方身份签名：覆盖 header + ciphertext。
+        let sig = sign_body(&self.own, &out);
+        out.extend_from_slice(&sig);
         Ok(out)
     }
 
     fn decrypt_inner(&mut self, blob: &[u8]) -> Result<Vec<u8>> {
         let hdr = parse_header(blob)?;
+        if blob.len() < HEADER_LEN + SIG_LEN {
+            return Err(anyhow!("blob too short for signature"));
+        }
+        // 先验签，再动任何棘轮状态：伪造/篡改的消息在进入绑定与解密前就被拒。
+        let body_end = blob.len() - SIG_LEN;
+        verify_body(&self.peer_pub, &blob[..body_end], &blob[body_end..])?;
 
         // gen0 接收链绑定：与发送端 encrypt_inner 的绑定对称。
         // 用对方 header 里的 dh_pub 做 DH(sk_own, eph_peer)，只绑一次。
@@ -520,14 +536,14 @@ impl Ratchet {
                     .remove(&(self.gen, hdr.n))
                     .ok_or_else(|| anyhow!("message {} too old / already consumed", hdr.n))?
             };
-            decrypt_aead(&mk, &hdr, blob)
+            decrypt_aead(&mk, &hdr, blob, body_end)
         } else {
             // 跨代迟到（hdr.gen < self.gen）：只能从 skipped 池取用。
             let mk = self
                 .skipped
                 .remove(&(hdr.gen, hdr.n))
                 .ok_or_else(|| anyhow!("message from stale gen {} too old", hdr.gen))?;
-            decrypt_aead(&mk, &hdr, blob)
+            decrypt_aead(&mk, &hdr, blob, body_end)
         }
     }
 }
@@ -674,17 +690,42 @@ fn bind_chain(root: &[u8; 32], dh: &[u8; 32], info: &[u8]) -> [u8; 32] {
     out
 }
 
-fn decrypt_aead(mk: &[u8; 32], header: &Header, blob: &[u8]) -> Result<Vec<u8>> {
+fn decrypt_aead(mk: &[u8; 32], header: &Header, blob: &[u8], body_end: usize) -> Result<Vec<u8>> {
     let cipher = ChaCha20Poly1305::new(Key::from_slice(mk));
     cipher
         .decrypt(
             Nonce::from_slice(&header.nonce),
             Payload {
-                msg: &blob[header.len..],
+                msg: &blob[header.len..body_end],
                 aad: &blob[..header.len],
             },
         )
         .map_err(|e| anyhow!("decrypt failed: {e}"))
+}
+
+/// 对 `body`（header + ciphertext）做 Ed25519 签名，返回 64 字节。
+fn sign_body(own: &iroh::SecretKey, body: &[u8]) -> [u8; SIG_LEN] {
+    use ed25519_dalek::Signer;
+    let signing: SigningKey = SigningKey::from_bytes(&own.to_bytes());
+    let mut msg = Vec::with_capacity(INFO_MSG_SIG.len() + body.len());
+    msg.extend_from_slice(INFO_MSG_SIG);
+    msg.extend_from_slice(body);
+    signing.sign(&msg).to_bytes()
+}
+
+/// 用对端身份公钥验证签名（覆盖 header + ciphertext，含域分隔）。
+fn verify_body(peer_pub: &[u8; 32], body: &[u8], sig_bytes: &[u8]) -> Result<()> {
+    let vk = ed25519_dalek::VerifyingKey::from_bytes(peer_pub)
+        .map_err(|e| anyhow!("invalid peer key: {e}"))?;
+    let sig_arr: [u8; SIG_LEN] = sig_bytes
+        .try_into()
+        .map_err(|_| anyhow!("bad signature length: {}", sig_bytes.len()))?;
+    let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
+    let mut msg = Vec::with_capacity(INFO_MSG_SIG.len() + body.len());
+    msg.extend_from_slice(INFO_MSG_SIG);
+    msg.extend_from_slice(body);
+    vk.verify_strict(&msg, &sig)
+        .map_err(|_| anyhow!("message signature verification failed"))
 }
 
 fn insert_skipped(

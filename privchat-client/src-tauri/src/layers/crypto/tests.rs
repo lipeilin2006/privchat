@@ -242,8 +242,8 @@ fn tamper_detected_and_state_unpoisoned() {
 
     let mut blob = a.encrypt(b"hello").unwrap();
     a.next();
-    let last = blob.len() - 1;
-    blob[last] ^= 0x01;
+    let last_cipher_byte = blob.len() - SIG_LEN - 1;
+    blob[last_cipher_byte] ^= 0x01;
     assert!(b.decrypt(&blob).is_err(), "tampered blob must fail");
 
     // 失败不推进状态：重新加密的同一消息（n=1，含 skipped 池还原）仍可解密。
@@ -321,7 +321,7 @@ fn v4_header_and_gen_n() {
     let blob = a.encrypt(b"x").unwrap();
     a.next();
     let hdr = parse_header(&blob).unwrap();
-    assert_eq!(blob.len(), HEADER_LEN + 1 + 16); // ct = 明文1B + AEAD tag 16B
+    assert_eq!(blob.len(), HEADER_LEN + SIG_LEN + 1 + 16); // ct 1B + tag 16B + sig 64B
     assert_eq!(hdr.gen, 0);
     assert_eq!(hdr.n, 0);
     assert_eq!(Ratchet::header_gen_n(&blob).unwrap(), (0, 0));
@@ -397,11 +397,48 @@ fn long_term_key_alone_cannot_open_gen0() {
     let (_, mk) = kdf_ck(&send_ck);
     let hdr = parse_header(&blob).unwrap();
     assert!(
-        decrypt_aead(&mk, &hdr, &blob).is_err(),
+        decrypt_aead(&mk, &hdr, &blob, blob.len() - SIG_LEN).is_err(),
         "leaked long-term key alone must not open gen0 messages"
     );
 
     // 正常接收方仍然能解（绑定链由 header.dh_pub 还原）。
     let mut b = Ratchet::new(&_bob, &_alice_id).unwrap();
     assert_eq!(b.decrypt(&blob).unwrap(), b"top-secret");
+}
+
+/// 签名被篡改必须在进入棘轮前被拒绝（不消耗状态）。
+#[test]
+fn signature_tamper_is_rejected() {
+    let (alice, bob, bob_id, alice_id) = peers();
+    let mut a = Ratchet::new(&alice, &bob_id).unwrap();
+    let mut b = Ratchet::new(&bob, &alice_id).unwrap();
+
+    let good = a.encrypt(b"signed").unwrap();
+    a.next();
+    let mut bad = good.clone();
+    let last = bad.len() - 1;
+    bad[last] ^= 0x01;
+    assert!(b.decrypt(&bad).is_err(), "bad signature must be rejected");
+
+    // 状态未被污染：原消息仍可正常解密。
+    assert_eq!(b.decrypt(&good).unwrap(), b"signed");
+}
+
+/// 冒名者用自己的密钥签名、冒充发送方身份，必须验签失败。
+#[test]
+fn wrong_signer_is_rejected() {
+    let (alice, _bob, bob_id, alice_id) = peers();
+    let mut a = Ratchet::new(&alice, &bob_id).unwrap();
+    let blob = a.encrypt(b"from-alice").unwrap();
+
+    // mallory 用「bob 视角下 alice 的身份」建棘轮（同一 peer_pub），
+    // 但消息是 alice 的密钥签的？—— 这里反过来：换一个签名者。
+    let mallory = SecretKey::generate();
+    let mut m = Ratchet::new(&mallory, &alice_id).unwrap();
+    let forged = m.encrypt(b"from-alice").unwrap();
+
+    // bob 用 alice 的公钥验签 → mallory 的签名不通过。
+    let mut b = Ratchet::new(&_bob, &alice_id).unwrap();
+    assert!(b.decrypt(&forged).is_err(), "wrong signer must be rejected");
+    assert_eq!(b.decrypt(&blob).unwrap(), b"from-alice");
 }
