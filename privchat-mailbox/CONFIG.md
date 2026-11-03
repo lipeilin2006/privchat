@@ -84,6 +84,7 @@ N1(只知道 N2) ──询问──> N2(认识 N1、N3) ──返回──> N1 �
 | `PRIVCHAT_MAILBOX_TTL_SECS` | 覆盖 `config.json` 的 `ttl_secs` |
 | `PRIVCHAT_MAILBOX_PEERS` | 覆盖 `mailboxes.json` |
 | `PRIVCHAT_MAILBOX_PEX_SECS` | 邻居交换周期（秒），默认 60 |
+| `PRIVCHAT_MAILBOX_ONION_PEERS` | 洋葱转发白名单（逗号分隔 peer_id）；未设则不限制 |
 
 ## 客户端侧
 

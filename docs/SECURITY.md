@@ -26,11 +26,13 @@
 | S1 | **高** | CLI 接收图片时直接用清单里的文件名落盘，可被 `../` 路径穿越写任意文件 | ✅ 已修复（只取 `file_name()`，过滤 `.`/`..`） |
 | S2 | 中 | 洋葱中继按 16 MB 上限读取单包（实际包 ≤ 64 KB），恶意客户端可做内存放大 | ✅ 已修复（`ONION_PACKET_MAX = 128 KB`） |
 | S3 | 中 | `put` 无发送方认证，PoW 难度仅 1 字节（平均 256 次哈希）→ 队列灌水成本极低 | ⚠️ 已知，建议提高难度（见下） |
-| S4 | 中 | 洋葱中继允许转发到**任意** peer id（开放中继），可被用来探测内网/第三方节点 | ⚠️ 已知，建议加转发白名单 |
+| S4 | 中 | 洋葱中继允许转发到**任意** peer id（开放中继），可被用来探测内网/第三方节点 | ✅ 可缓解：`PRIVCHAT_MAILBOX_ONION_PEERS` 白名单 |
 | S5 | 中 | 无定长分片/填充，包长泄漏"几跳 + 大致内容长度" | ⚠️ 已知，建议固定信元 + 填充 |
 | S6 | 低 | `msg_id = gen:n`，节点可看出会话消息序号与总数 | ⚠️ 已知（排序需要） |
 | S7 | 低 | mailbox 存储到达时间（TTL 需要），可做发送频率画像 | ⚠️ 可改为小时粒度 |
 | S8 | 低 | 节点日志会打印 peer id 与包长 | ⚠️ 生产建议调高日志级别 |
+| S9 | **高** | WebView 未设置 CSP（`app.security.csp = null`），一旦有注入即可调用 Tauri 命令 | ✅ 已修复（见下） |
+| S10 | 中 | 安卓默认允许 `adb backup` 导出应用数据 | ✅ 已修复（`allowBackup=false`） |
 
 ---
 
@@ -77,12 +79,21 @@
 
 ---
 
+### 3.5 WebView 与打包层
+
+- **CSP**：已配置 `default-src 'self'; script-src 'self'; style-src 'self'
+  'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' ipc:
+  http://ipc.localhost`，并用 Chromium 按同一策略加载构建产物验证，无违规。
+- **安卓清单**：`android:allowBackup="false"`，避免通过 adb backup 导出应用
+  数据目录（库本身是加密的，但备份会带走全部密文与元数据）。
+- **权限**：capability 只开放 `core:default`、opener 与条码扫描所需项。
+
 ## 4. 加固建议（按投入产出排序）
 
 1. **PoW 难度可配置**（S3）：节点在 `config.json` 里声明 `pow_bytes`，客户端
    按节点返回的难度重算；建议 2–3 字节。
-2. **洋葱转发白名单**（S4）：`PRIVCHAT_MAILBOX_ONION_PEERS`，只允许转发给
-   配置过的邻居，避免成为开放中继。
+2. **洋葱转发白名单**（S4）：已实现 `PRIVCHAT_MAILBOX_ONION_PEERS`，
+   设置后只允许转发给列表中的节点；建议中继节点都开启。
 3. **GUI 一次性上传身份**（3.3）：发送时临时生成 Endpoint，E2EE 身份不变。
 4. **固定信元 + 填充**（S5）：所有包填充到同一长度，隐藏跳数与内容长度。
 5. **部署层面**：role 分离（首跳 relay 与终点 mailbox 不同运营者）、
@@ -104,7 +115,34 @@
 
 ---
 
-## 6. 报告问题
+## 6. 依赖审计
+
+`cargo audit`（RustSec 1403 条 advisory，677 个依赖）：
+
+**审计发现的 8 个漏洞已全部通过升级修复**（`cargo update`）：
+
+| crate | 原版本 → 新版本 | 问题 |
+|---|---|---|
+| ctutils | 0.4.2 → 0.4.8 | 掩码生成非恒定时间（影响密码学实现） |
+| rustls | 0.23.43 → 0.23.46 | 证书解压内存放大 / 降级 / 握手跨加密层 / Debug 泄漏会话密钥 |
+| rustls-webpki | 0.103.14 → 0.103.16 | 可能接受不受信任的中间证书 |
+| webpki-roots / webpki-root-certs | 1.0.9 → 1.0.11 | 内置根证书包含已吊销的 emSign 中间证书 |
+
+复跑结果：**0 vulnerabilities**。
+
+剩余 15 条为警告（非漏洞）：部分 crate 标记 unmaintained（`atomic-polyfill`、
+`paste`、`proc-macro-error`、`unic-*`、`glib`、`zvariant`）、`async-executor`
+与 `chacha20 0.10.1` 被 yank、`tokio` 的 `AsyncFd` unsound（本项目未使用
+`AsyncFd`）。`chacha20` 由 `chacha20poly1305` 锁定，后续跟上游升级。
+
+复现：
+
+```bash
+cargo install cargo-audit --locked
+cd privchat && cargo audit
+```
+
+## 7. 报告问题
 
 发现安全问题时请附：复现步骤、影响范围、版本/commit。请勿在公开 issue 里
 贴可直接利用的载荷；先私下联系维护者。

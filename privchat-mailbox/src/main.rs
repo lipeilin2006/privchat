@@ -247,6 +247,8 @@ struct OnionHandler {
     allow_forward: bool,
     /// 允许作为终点把最内层请求交给 mailbox（存储角色）
     allow_terminal: bool,
+    /// 允许转发的下一跳白名单（None = 不限制）
+    onion_allow: Option<Arc<Vec<String>>>,
 }
 
 impl ProtocolHandler for OnionHandler {
@@ -276,6 +278,20 @@ impl ProtocolHandler for OnionHandler {
                     let _ = send.finish();
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                     return Ok(());
+                }
+                if let Some(allow) = &self.onion_allow {
+                    if !allow.iter().any(|p| p == &next) {
+                        let response = MailboxResponse {
+                            ok: false,
+                            error: Some("next hop is not in the onion allowlist".into()),
+                            messages: None,
+                            peers: None,
+                        };
+                        let _ = send.write_all(&serde_json::to_vec(&response).unwrap_or_default()).await;
+                        let _ = send.finish();
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        return Ok(());
+                    }
                 }
                 eprintln!("[onion] relay from {remote}: forwarding {}B to {}", inner.len(), next);
                 let endpoint = self.endpoint.clone();
@@ -546,6 +562,21 @@ async fn handle_request(
 }
 
 /// 本地操作完成后在后台向所有 peer mailbox 并发广播，避免阻塞客户端响应。
+/// 洋葱转发白名单：`PRIVCHAT_MAILBOX_ONION_PEERS="id1,id2"`，未设置则不限制。
+fn load_onion_allowlist() -> Option<Arc<Vec<String>>> {
+    let raw = std::env::var("PRIVCHAT_MAILBOX_ONION_PEERS").ok()?;
+    let list: Vec<String> = raw
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| s.len() == 64)
+        .collect();
+    if list.is_empty() {
+        None
+    } else {
+        Some(Arc::new(list))
+    }
+}
+
 /// 单个洋葱包上限：内层载荷 64KB + 每层 94B 开销，留足余量。
 /// 中继按此上限读取，避免恶意客户端用 16MB 包做内存放大。
 const ONION_PACKET_MAX: usize = 128 * 1024;
@@ -873,6 +904,7 @@ async fn main() -> Result<()> {
             endpoint: endpoint.clone(),
             allow_forward: role != "mailbox",
             allow_terminal: role != "relay",
+            onion_allow: load_onion_allowlist(),
         },
     );
     let router = router_builder.spawn();
