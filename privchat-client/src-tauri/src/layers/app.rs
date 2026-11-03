@@ -34,6 +34,15 @@ use super::crypto;
 use super::mailbox::{MailboxClient, StoredMessage};
 use super::transport::{IncomingEnvelope, Transport};
 
+/// 洋葱路由配置：是否启用 + 中继路径（最后一跳应为 mailbox 节点）。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OnionConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub relays: Vec<String>,
+}
+
 /// 应用层消息（前后端共享结构）。`id` 为消息 ID（由棘轮序号和密文派生），
 /// 用于跨直连/mailbox 双通道投递去重。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,6 +121,10 @@ struct SendCtx {
     mailbox_peers: Arc<Mutex<Vec<String>>>,
     /// 每条离线消息写入的 mailbox 节点数（0 = 全部已配置节点）。
     mailbox_write_count: Arc<AtomicUsize>,
+    /// 洋葱路由配置（启用时 mailbox 投递走多层转发）。
+    onion: Arc<Mutex<OnionConfig>>,
+    /// 是否保留 P2P 直连投递（仅单机集成测试为 true；生产已删除直连）。
+    allow_direct: bool,
     history: Arc<Mutex<HashMap<String, Vec<ChatMessage>>>>,
     stop: watch::Receiver<bool>,
 }
@@ -155,6 +168,55 @@ async fn run_send_worker(
     }
 }
 
+/// 通过洋葱路径投递一条 mailbox PUT。
+///
+/// 路径最后一跳必须是 mailbox 节点：它剥离最后一层后按普通请求落库。
+async fn onion_put(
+    endpoint: &iroh::Endpoint,
+    relays: &[String],
+    to: &str,
+    id: &str,
+    payload: Vec<u8>,
+) -> Result<()> {
+    use privchat_common::MailboxRequest;
+
+    let nonce = {
+        let to_owned = to.to_string();
+        let payload_owned = payload.clone();
+        tokio::task::spawn_blocking(move || privchat_common::find_pow(&to_owned, &payload_owned))
+            .await?
+    };
+    let request = MailboxRequest::put(to, id, payload, nonce);
+    let packet = privchat_onion::wrap(relays, &serde_json::to_vec(&request)?)?;
+
+    let first: iroh::EndpointId = relays[0]
+        .parse()
+        .map_err(|_| anyhow!("invalid first relay: {}", relays[0]))?;
+    let conn = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        endpoint.connect(iroh::EndpointAddr::new(first), privchat_onion::ONION_ALPN),
+    )
+    .await
+    .map_err(|_| anyhow!("onion connect timed out"))??;
+    let (mut send, mut recv) = conn.open_bi().await?;
+    send.write_all(&packet).await?;
+    send.finish()?;
+    let bytes = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        recv.read_to_end(4096),
+    )
+    .await
+    .map_err(|_| anyhow!("onion ack timed out"))??;
+    let response: privchat_common::MailboxResponse = serde_json::from_slice(&bytes)?;
+    if !response.ok {
+        return Err(anyhow!(
+            "onion route rejected: {}",
+            response.error.unwrap_or_default()
+        ));
+    }
+    Ok(())
+}
+
 impl SendCtx {
     /// 单条消息的完整发送流程（加密→mailbox→直连→确认提交）。
     async fn send_one(&self, local_id: &str, peer_id: &str, job: &SendJob) -> Result<ChatMessage> {
@@ -189,8 +251,20 @@ impl SendCtx {
         //    节点永久离线也不丢。任一节点成功即视为 mailbox 可用；全部
         //    失败才算 mailbox 不可用。
         let peers = self.mailbox_peers.lock().await.clone();
+        let onion = self.onion.lock().await.clone();
         let mut mailbox_ok = false;
-        if !peers.is_empty() {
+
+        // 1a) 洋葱路径（启用时优先）：多层封装后交给首跳中继，最后一跳落库。
+        if onion.enabled && !onion.relays.is_empty() {
+            let endpoint = self.transport.endpoint_for(local_id).await?;
+            match onion_put(&endpoint, &onion.relays, peer_id, &wire.msg_id, blob.clone()).await {
+                Ok(()) => mailbox_ok = true,
+                Err(e) => eprintln!("[app] onion route failed ({e:#}); falling back to direct mailbox"),
+            }
+        }
+
+        // 1b) 直连 mailbox（未启用洋葱或洋葱失败时）。
+        if !mailbox_ok && !peers.is_empty() {
             let endpoint = self.transport.endpoint_for(local_id).await?;
             let count = self.mailbox_write_count.load(Ordering::Relaxed);
             match MailboxClient::put_multi(
@@ -208,15 +282,19 @@ impl SendCtx {
             }
         }
 
-        // 2) 直连（尽力而为）：传完整 pack。
-        let wire_bytes = serde_json::to_vec(&wire)?;
-        if let Err(e) = self.transport.send(local_id, peer_id, &wire_bytes).await {
-            // mailbox 已承担离线投递（至少一个节点成功）时，直连失败不算错误。
-            if !mailbox_ok {
-                // 消息未送达（无 mailbox 兜底）：不提交加密推进，状态保持
-                // 加密前，下次发送从同一 (gen, n) 继续，不会污染会话链。
-                return Err(e);
+        // 2) 直连：生产模式已删除 P2P 投递，只保留单机集成测试的直连通道。
+        if self.allow_direct {
+            let wire_bytes = serde_json::to_vec(&wire)?;
+            if let Err(e) = self.transport.send(local_id, peer_id, &wire_bytes).await {
+                if !mailbox_ok {
+                    return Err(e);
+                }
             }
+        } else if !mailbox_ok {
+            // 生产模式没有直连兜底：mailbox 未配置或全部失败 = 消息没送达。
+            return Err(anyhow!(
+                "no delivery path: configure at least one mailbox node (direct P2P has been removed)"
+            ));
         }
 
         // 送达确认（直连成功或有 mailbox 兜底）：提交棘轮推进并持久化。
@@ -275,6 +353,10 @@ pub struct App {
     mailbox_peers: Arc<Mutex<Vec<String>>>,
     /// 每条离线消息写入的 mailbox 节点数（0 = 全部已配置节点）。
     mailbox_write_count: Arc<AtomicUsize>,
+    /// 洋葱路由配置（relay 路径 + 开关）。
+    onion: Arc<Mutex<OnionConfig>>,
+    /// 是否保留 P2P 直连投递（仅测试模式为 true）。
+    allow_direct: bool,
     /// 待绑定专属身份（已生成邀请但尚未被连接的 local_id）。
     pending: Arc<Mutex<Vec<String>>>,
     /// 双棘轮会话缓存：`(local_id, peer_id) -> Ratchet`，随发送/接收推进并
@@ -410,6 +492,13 @@ impl App {
         let mailbox_poll_task = Arc::new(Mutex::new(None));
         let (stop_tx, _) = watch::channel(false);
         let worker_tasks = Arc::new(Mutex::new(Vec::new()));
+        let onion = Arc::new(Mutex::new(
+            store
+                .load_onion_config()
+                .ok()
+                .and_then(|json| serde_json::from_str::<OnionConfig>(&json).ok())
+                .unwrap_or_default(),
+        ));
 
         let app = Self {
             transport,
@@ -418,6 +507,8 @@ impl App {
             history,
             mailbox_peers,
             mailbox_write_count,
+            onion,
+            allow_direct: !use_relay,
             pending,
             ratchets,
             send_queues,
@@ -470,6 +561,27 @@ impl App {
     }
 
     /// 当前配置的 mailbox 节点 peer_id 列表（空 = 未启用离线消息）。
+    /// 读取洋葱路由配置。
+    pub async fn get_onion_config(&self) -> OnionConfig {
+        self.onion.lock().await.clone()
+    }
+
+    /// 保存洋葱路由配置（校验每个中继 id 必须是 64 位十六进制）。
+    pub async fn set_onion_config(&self, config: OnionConfig) -> Result<()> {
+        for relay in &config.relays {
+            if relay.len() != 64 || !relay.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(anyhow!("invalid relay peer id: {relay}"));
+            }
+        }
+        if config.enabled && config.relays.is_empty() {
+            return Err(anyhow!("onion routing enabled but relay path is empty"));
+        }
+        self.store
+            .save_onion_config(&serde_json::to_string(&config)?)?;
+        *self.onion.lock().await = config;
+        Ok(())
+    }
+
     pub async fn get_mailbox_peers(&self) -> Vec<String> {
         self.mailbox_peers.lock().await.clone()
     }
@@ -801,6 +913,8 @@ impl App {
                     mailbox_peers: self.mailbox_peers.clone(),
                     mailbox_write_count: self.mailbox_write_count.clone(),
                     history: self.history.clone(),
+                    onion: self.onion.clone(),
+                    allow_direct: self.allow_direct,
                     stop: self.stop_tx.subscribe(),
                 };
                 let key_for_worker = key.clone();

@@ -55,8 +55,9 @@ pub struct IncomingEnvelope {
 struct Identity {
     secret: SecretKey,
     endpoint: Endpoint,
-    #[allow(dead_code)] // held alive: dropping the router aborts the accept loop
-    router: Router,
+    /// 直连接收循环。生产模式（use_relay=true）为 None：不再接受 P2P 入站。
+    #[allow(dead_code)]
+    router: Option<Router>,
     peers: Arc<RwLock<HashMap<String, EndpointAddr>>>,
     /// 已建立的连接缓存（peer_id → QUIC 连接）。
     ///
@@ -247,7 +248,9 @@ impl Transport {
                 .map(|duration| duration.as_millis() as u64)
                 .unwrap_or(0),
         ) {
-            let _ = id.router.shutdown().await;
+            if let Some(router) = &id.router {
+                let _ = router.shutdown().await;
+            }
             id.endpoint.close().await;
             return Err(error);
         }
@@ -280,7 +283,9 @@ impl Transport {
     /// 删除一个专属身份（删除联系人时调用，释放 Endpoint 与数据库记录）。
     pub async fn drop_identity(&self, local_id: &str) {
         if let Some(identity) = self.identities.write().await.remove(local_id) {
-            let _ = identity.router.shutdown().await;
+            if let Some(router) = &identity.router {
+                let _ = router.shutdown().await;
+            }
             identity.endpoint.close().await;
         }
         let _ = self.store.delete_identity(local_id);
@@ -356,7 +361,9 @@ impl Transport {
             .map(|(_, id)| id)
             .collect();
         for id in identities {
-            let _ = id.router.shutdown().await;
+            if let Some(router) = &id.router {
+                let _ = router.shutdown().await;
+            }
             id.endpoint.close().await;
         }
     }
@@ -368,10 +375,11 @@ async fn build_identity(
     use_relay: bool,
     tx: mpsc::UnboundedSender<IncomingEnvelope>,
 ) -> Result<Identity> {
-    let mut builder = Endpoint::builder(presets::N0)
-        .secret_key(secret.clone())
-        .alpns(vec![ALPN.to_vec()]);
+    // 生产模式只做「拨号方」：不注册聊天 ALPN，也不启动 P2P 接收循环。
+    // 直连接收仅保留给单机集成测试（use_relay=false）。
+    let mut builder = Endpoint::builder(presets::N0).secret_key(secret.clone());
     if !use_relay {
+        builder = builder.alpns(vec![ALPN.to_vec()]);
         builder = builder.relay_mode(iroh::RelayMode::Disabled);
         // 单机测试：绑定由密钥派生的固定端口，保证重启后票据仍然有效。
         let port = deterministic_port(&secret);
@@ -384,17 +392,23 @@ async fn build_identity(
     let conns: Arc<RwLock<HashMap<String, Connection>>> = Arc::new(RwLock::new(HashMap::new()));
     let peers: Arc<RwLock<HashMap<String, EndpointAddr>>> = Arc::new(RwLock::new(HashMap::new()));
     let local_id = endpoint.id().to_string();
-    let router = Router::builder(endpoint.clone())
-        .accept(
-            ALPN,
-            EnvelopeHandler {
-                tx: tx.clone(),
-                conns: conns.clone(),
-                peers: peers.clone(),
-                local_id: local_id.clone(),
-            },
+    let router = if use_relay {
+        None
+    } else {
+        Some(
+            Router::builder(endpoint.clone())
+                .accept(
+                    ALPN,
+                    EnvelopeHandler {
+                        tx: tx.clone(),
+                        conns: conns.clone(),
+                        peers: peers.clone(),
+                        local_id: local_id.clone(),
+                    },
+                )
+                .spawn(),
         )
-        .spawn();
+    };
 
     if use_relay {
         // 等待端点上线（已联系上 relay），确保地址可被远端拨号。

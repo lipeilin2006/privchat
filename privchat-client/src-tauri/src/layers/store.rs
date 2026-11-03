@@ -31,6 +31,7 @@ use super::app::{ChatMessage, Contact};
 /// 每条离线消息写入的 mailbox 节点数（0 = 全部已配置节点）。
 const MAILBOX_WRITE_COUNT_KEY: &str = "mailbox_write_count";
 const AUTO_LOCK_MINUTES_KEY: &str = "auto_lock_minutes";
+const ONION_CONFIG_KEY: &str = "onion_config";
 const IDENTITY_CREATED_PREFIX: &str = "identity_created:";
 pub const UNBOUND_IDENTITY_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 pub const MAX_MAILBOX_WRITE_COUNT: usize = 64;
@@ -335,13 +336,14 @@ impl Store {
         Ok(())
     }
 
-    /// 读取 mailbox 投放数量（0 = 全部已配置节点）。
+    /// 读取「每条消息最多成功推送节点数」（0 = 全部已配置节点）。
+    /// 默认 3：PEX 会把邻居表自动扩到 64，默认全量写会放大网络开销。
     pub fn load_mailbox_write_count(&self) -> Result<usize> {
         Ok(self
             .load_setting(MAILBOX_WRITE_COUNT_KEY)?
             .and_then(|v| v.parse().ok())
             .filter(|count| *count <= MAX_MAILBOX_WRITE_COUNT)
-            .unwrap_or(0))
+            .unwrap_or(3))
     }
 
     /// 保存 mailbox 投放数量（0 = 全部已配置节点）。
@@ -352,6 +354,17 @@ impl Store {
             ));
         }
         self.save_setting(MAILBOX_WRITE_COUNT_KEY, &count.to_string())
+    }
+
+    /// 洋葱路由配置（JSON：`{"enabled":bool,"relays":[peer_id,...]}`）。
+    pub fn load_onion_config(&self) -> Result<String> {
+        Ok(self
+            .load_setting(ONION_CONFIG_KEY)?
+            .unwrap_or_else(|| "{\"enabled\":false,\"relays\":[]}".to_string()))
+    }
+
+    pub fn save_onion_config(&self, json: &str) -> Result<()> {
+        self.save_setting(ONION_CONFIG_KEY, json)
     }
 
     pub fn load_auto_lock_minutes(&self) -> Result<u64> {

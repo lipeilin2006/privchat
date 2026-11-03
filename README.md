@@ -1,6 +1,6 @@
 # PrivChat
 
-端到端加密点对点聊天。基于 iroh QUIC 实现直连与离线投递，双棘轮（Double Ratchet）提供前向保密，SQLCipher 加密全部本地数据。
+端到端加密聊天。消息统一经 mailbox 节点投递（P2P 直连已移除），可选洋葱路由多层转发；双棘轮（Double Ratchet）提供前向保密，SQLCipher 加密全部本地数据。
 
 ## 仓库结构
 
@@ -10,6 +10,8 @@ privchat-client/       Tauri 客户端（Android / Windows / macOS）
   src-tauri/           Rust 后端（L2 应用层 / L2.5 加密 / L3 传输 / L4 封装）
 privchat-common/       共享 crate：mailbox wire 协议与 PoW
 privchat-mailbox/      离线消息缓存节点（可网格组网同步）
+privchat-onion/        洋葱路由：多层封装 / 逐跳剥离
+privchat-cli/          命令行测试客户端（文本 / 图片 / 洋葱路径）
 ```
 
 ## 安全模型
@@ -17,7 +19,8 @@ privchat-mailbox/      离线消息缓存节点（可网格组网同步）
 - **无主身份**：每个联系人使用独立 SecretKey + 独立 iroh Endpoint，跨联系人不关联。
 - **双棘轮加密**：每条消息独立密钥，发送失败不推进链；接收方跳过窗口可自愈乱序。
 - **本地加密存储**：SQLCipher 全库加密，密码解锁保险箱（vault）。
-- **离线投递**：mailbox 节点缓存密文（可组网同步，取回即删），不接触明文。
+- **统一投递**：所有消息经 mailbox 节点（可网格同步，取回即删）；发送端不再尝试直连对端。
+- **洋葱路由（可选）**：多层加密逐跳转发，最后一跳为 mailbox 节点；中继看不到完整路径与明文。
 
 ## 开发
 
@@ -54,7 +57,7 @@ cd privchat-mailbox
 cargo run --release
 ```
 
-首次启动自动生成 `config.json` / `mailboxes.json` / `secret.key`（可配置 `PRIVCHAT_MAILBOX_DATA_DIR` 等环境变量）。
+首次启动自动生成 `config.json` / `mailboxes.json` / `secret.key`。角色（`both`/`relay`/`mailbox`）与 TTL 可在 `config.json` 配置，详见 [privchat-mailbox/CONFIG.md](privchat-mailbox/CONFIG.md)。
 
 ## 测试
 

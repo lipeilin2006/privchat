@@ -1,0 +1,15 @@
+[package]
+name = "privchat-onion"
+version = "0.1.0"
+edition = "2021"
+description = "PrivChat 洋葱路由：多层加密、逐跳剥离、定长跳转发"
+
+[dependencies]
+anyhow = "1"
+iroh = "1.0.3"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+ed25519-dalek = "3"
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+rand_core = { version = "0.6", features = ["getrandom"] }

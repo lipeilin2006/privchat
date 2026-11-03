@@ -53,7 +53,7 @@ pub fn find_pow(to: &str, payload: &[u8]) -> u64 {
 }
 
 /// 请求方 → 节点请求。
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MailboxRequest {
     #[serde(rename = "op")]
     pub op: Op,
@@ -94,6 +94,20 @@ impl MailboxRequest {
         }
     }
 
+    /// 邻居交换请求：索取对方已知的 mailbox 列表。
+    pub fn peers() -> Self {
+        Self {
+            op: Op::Peers,
+            to: None,
+            for_peer: None,
+            id: None,
+            ids: None,
+            payload: None,
+            nonce: None,
+            msg: None,
+        }
+    }
+
     pub fn fetch(for_peer: &str) -> Self {
         Self {
             op: Op::Fetch,
@@ -114,6 +128,8 @@ pub enum Op {
     Put,
     Fetch,
     Ping,
+    /// 邻居交换：请求方询问节点已知的 mailbox 列表（PEX）。
+    Peers,
     Sync,
     SyncAck,
 }
@@ -127,6 +143,9 @@ pub struct MailboxResponse {
     /// fetch 命中的待收密文。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub messages: Option<Vec<StoredMessage>>,
+    /// `peers` 操作返回的已知 mailbox 列表（PEX）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peers: Option<Vec<String>>,
 }
 
 /// 存储在邮箱里的密文消息。`to_peer_id` 是接收方的专属身份（各联系人

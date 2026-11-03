@@ -1,0 +1,19 @@
+[package]
+name = "privchat-cli"
+version = "0.1.0"
+edition = "2021"
+description = "PrivChat 命令行测试客户端：复用真实双棘轮加密，验证 mailbox 收发"
+
+[[bin]]
+name = "privchat-cli"
+path = "src/main.rs"
+
+[dependencies]
+privchat-client = { path = "../privchat-client/src-tauri" }
+privchat-common = { path = "../privchat-common" }
+privchat-onion = { path = "../privchat-onion" }
+sha2 = "0.10"
+iroh = "1.0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "io-util"] }
+anyhow = "1"
+serde_json = "1"

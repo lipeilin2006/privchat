@@ -99,7 +99,7 @@ async fn fetch_forbidden_for_other_identity() {
     let handler = MailboxHandler {
         store,
         endpoint,
-        peers: Arc::new(Vec::new()),
+        peers: Arc::new(tokio::sync::Mutex::new(Vec::new())),
     };
 
     let victim = "victim-peer".to_string();
@@ -183,7 +183,7 @@ async fn sync_ack_forbidden_for_non_mailbox_peer() {
     let handler = MailboxHandler {
         store: store.clone(),
         endpoint,
-        peers: Arc::new(vec!["trusted-mailbox".into()]),
+        peers: Arc::new(tokio::sync::Mutex::new(vec!["trusted-mailbox".into()])),
     };
     let req = MailboxRequest {
         op: Op::SyncAck,

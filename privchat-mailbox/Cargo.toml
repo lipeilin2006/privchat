@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 privchat-common = { path = "../privchat-common" }
+privchat-onion = { path = "../privchat-onion" }
 iroh = "1.0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util"] }
 serde = { version = "1", features = ["derive"] }

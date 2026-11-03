@@ -4185,6 +4185,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "privchat-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "iroh",
+ "privchat-client",
+ "privchat-common",
+ "privchat-onion",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+]
+
+[[package]]
 name = "privchat-client"
 version = "0.1.0"
 dependencies = [
@@ -4199,6 +4213,7 @@ dependencies = [
  "ndk-context",
  "pbkdf2",
  "privchat-common",
+ "privchat-onion",
  "rand_core 0.6.4",
  "rusqlite",
  "serde",
@@ -4232,11 +4247,26 @@ dependencies = [
  "anyhow",
  "iroh",
  "privchat-common",
+ "privchat-onion",
  "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "tokio",
+]
+
+[[package]]
+name = "privchat-onion"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chacha20poly1305",
+ "ed25519-dalek",
+ "hkdf",
+ "iroh",
+ "rand_core 0.6.4",
+ "sha2 0.10.9",
+ "x25519-dalek",
 ]
 
 [[package]]

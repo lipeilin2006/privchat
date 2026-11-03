@@ -1,10 +1,10 @@
-mod layers;
+pub mod layers;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use layers::app::App;
+use layers::app::{App, OnionConfig};
 use layers::transport::IncomingEnvelope;
 use layers::vault::Vault;
 use tauri::async_runtime::JoinHandle;
@@ -498,6 +498,20 @@ async fn rename_contact(
 }
 
 #[tauri::command]
+async fn get_onion_config(state: State<'_, AppState>) -> Result<OnionConfig, String> {
+    Ok(state.require_app()?.get_onion_config().await)
+}
+
+#[tauri::command]
+async fn set_onion_config(config: OnionConfig, state: State<'_, AppState>) -> Result<(), String> {
+    state
+        .require_app()?
+        .set_onion_config(config)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn get_mailbox_peers(state: State<'_, AppState>) -> Result<Vec<String>, String> {
     Ok(state.require_app()?.get_mailbox_peers().await)
 }
@@ -635,6 +649,8 @@ pub fn run() {
             delete_contact,
             rename_contact,
             get_mailbox_peers,
+            get_onion_config,
+            set_onion_config,
             ping_mailbox,
             add_mailbox_peer,
             remove_mailbox_peer,

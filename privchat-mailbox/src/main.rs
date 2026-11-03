@@ -37,6 +37,7 @@ use rusqlite::{params, Connection as SqlConn};
 use tokio::sync::Mutex;
 
 use privchat_mailbox::{MailboxRequest, MailboxResponse, Op, StoredMessage, ALPN, MAX_PAYLOAD};
+use privchat_onion::{peel, ONION_ALPN};
 
 /// 内存邮箱 + SQLite 持久化。
 ///
@@ -144,6 +145,26 @@ impl MailboxStore {
         Ok(out)
     }
 
+    /// 取出全部待收密文（PEX 学习到新节点时的一次性补推，带上限）。
+    async fn list_all(&self, limit: usize) -> Result<Vec<StoredMessage>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT msg_id, to_peer_id, msg FROM messages ORDER BY time DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            Ok(StoredMessage {
+                msg_id: row.get(0)?,
+                to_peer_id: row.get(1)?,
+                msg: row.get(2)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     /// 删除已超过 TTL 的消息，返回删除行数。
     async fn purge_expired(&self, now_ms: u64) -> Result<usize> {
         if self.ttl_secs == 0 {
@@ -185,7 +206,7 @@ struct MailboxHandler {
     store: MailboxStore,
     endpoint: iroh::Endpoint,
     /// 其他 mailbox 节点的 peer_id（全连通/链式/环状均可）。
-    peers: Arc<Vec<String>>,
+    peers: Arc<tokio::sync::Mutex<Vec<String>>>,
 }
 
 impl ProtocolHandler for MailboxHandler {
@@ -216,6 +237,149 @@ impl ProtocolHandler for MailboxHandler {
     }
 }
 
+/// 洋葱中继处理器：剥离一层后转发，或作为终点把最内层请求交给 mailbox 处理。
+#[derive(Debug, Clone)]
+struct OnionHandler {
+    mailbox: MailboxHandler,
+    secret: SecretKey,
+    endpoint: iroh::Endpoint,
+    /// 允许把剥离后的包继续转发（中继角色）
+    allow_forward: bool,
+    /// 允许作为终点把最内层请求交给 mailbox（存储角色）
+    allow_terminal: bool,
+}
+
+impl ProtocolHandler for OnionHandler {
+    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        let remote = connection.remote_id().to_string();
+        let (mut send, mut recv) = match connection.accept_bi().await {
+            Ok(bi) => bi,
+            Err(_) => return Ok(()),
+        };
+        let packet = match recv.read_to_end(MAX_PAYLOAD).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                eprintln!("[onion] read failed: {error:#}");
+                return Ok(());
+            }
+        };
+        match peel(&self.secret, &packet) {
+            Ok((Some(next), inner)) => {
+                if !self.allow_forward {
+                    let response = MailboxResponse {
+                        ok: false,
+                        error: Some("this node is mailbox-only: refusing to relay".into()),
+                        messages: None,
+                        peers: None,
+                    };
+                    let _ = send.write_all(&serde_json::to_vec(&response).unwrap_or_default()).await;
+                    let _ = send.finish();
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    return Ok(());
+                }
+                eprintln!("[onion] relay from {remote}: forwarding {}B to {}", inner.len(), next);
+                let endpoint = self.endpoint.clone();
+                let forwarded = forward_onion(&endpoint, &next, inner).await;
+                eprintln!(
+                    "[onion] forward result: {}",
+                    match &forwarded {
+                        Ok(resp) => format!("ok={}", resp.ok),
+                        Err(error) => format!("err={error:#}"),
+                    }
+                );
+                let response = match forwarded {
+                    Ok(resp) if resp.ok => MailboxResponse {
+                        ok: true,
+                        error: None,
+                        messages: None,
+                        peers: None,
+                    },
+                    Ok(resp) => MailboxResponse {
+                        ok: false,
+                        error: Some(format!(
+                            "downstream {next} rejected: {}",
+                            resp.error.unwrap_or_default()
+                        )),
+                        messages: None,
+                        peers: None,
+                    },
+                    Err(error) => MailboxResponse {
+                        ok: false,
+                        error: Some(format!("relay to {next} failed: {error:#}")),
+                        messages: None,
+                        peers: None,
+                    },
+                };
+                let wrote = send.write_all(&serde_json::to_vec(&response).unwrap_or_default()).await;
+                eprintln!("[onion] response write ok={}", wrote.is_ok());
+                let _ = send.finish();
+            }
+            Ok((None, inner)) => {
+                if !self.allow_terminal {
+                    let response = MailboxResponse {
+                        ok: false,
+                        error: Some("this node is relay-only: refusing terminal delivery".into()),
+                        messages: None,
+                        peers: None,
+                    };
+                    let _ = send.write_all(&serde_json::to_vec(&response).unwrap_or_default()).await;
+                    let _ = send.finish();
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    return Ok(());
+                }
+                // 终点：只允许匿名投递（put），fetch 需要真实身份队列认证。
+                let response = handle_request(&self.mailbox, &remote, &inner).await;
+                let _ = send.write_all(&serde_json::to_vec(&response).unwrap_or_default()).await;
+                let _ = send.finish();
+            }
+            Err(error) => {
+                eprintln!("[onion] peel failed from {remote}: {error:#}");
+                let response = MailboxResponse {
+                    ok: false,
+                    error: Some(format!("onion peel failed: {error:#}")),
+                    messages: None,
+                    peers: None,
+                };
+                let _ = send.write_all(&serde_json::to_vec(&response).unwrap_or_default()).await;
+                let _ = send.finish();
+            }
+        }
+        // 给对端一点时间读走最后一段响应再关闭连接（QUIC 关闭会丢弃
+        // 尚未被读取的流数据，实测直接返回会导致客户端读到 connection lost）。
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        Ok(())
+    }
+}
+
+/// 把剩余洋葱包转发给下一跳（限制超时，避免慢节点拖死中继）。
+async fn forward_onion(
+    endpoint: &iroh::Endpoint,
+    next: &str,
+    inner: Vec<u8>,
+) -> Result<MailboxResponse> {
+    let id: iroh::EndpointId = next
+        .parse()
+        .map_err(|_| anyhow!("invalid next hop: {next}"))?;
+    let conn = tokio::time::timeout(
+        std::time::Duration::from_secs(90),
+        endpoint.connect(iroh::EndpointAddr::new(id), ONION_ALPN),
+    )
+    .await
+    .map_err(|_| anyhow!("connect {next} timed out"))??;
+    let (mut send, mut recv) = conn.open_bi().await?;
+    send.write_all(&inner).await?;
+    send.finish()?;
+    let bytes = tokio::time::timeout(
+        std::time::Duration::from_secs(90),
+        recv.read_to_end(4096),
+    )
+    .await
+    .map_err(|_| anyhow!("waiting {next} response timed out"))??;
+    let response: MailboxResponse = serde_json::from_slice(&bytes)
+        .map_err(|e| anyhow!("bad response from {next}: {e}"))?;
+    Ok(response)
+}
+
 async fn handle_request(
     handler: &MailboxHandler,
     remote_id: &str,
@@ -226,13 +390,22 @@ async fn handle_request(
         Err(e) => return err(&format!("bad request: {e}")),
     };
     if matches!(req.op, Op::Sync | Op::SyncAck)
-        && !handler.peers.iter().any(|peer| peer == remote_id)
+        && !handler.peers.lock().await.iter().any(|peer| peer == remote_id)
     {
         return err("mailbox sync forbidden: sender is not a configured peer");
     }
 
     match req.op {
         Op::Ping => ok(),
+        Op::Peers => {
+            let known: Vec<String> = handler.peers.lock().await.clone();
+            MailboxResponse {
+                ok: true,
+                error: None,
+                messages: None,
+                peers: Some(known),
+            }
+        }
         Op::Put => match StoredMessage::from_request(&req) {
             Ok(msg) => {
                 if msg.msg.len() > MAX_PAYLOAD {
@@ -249,7 +422,7 @@ async fn handle_request(
                         // 让客户端误判 PUT 超时并回滚发送棘轮。
                         spawn_broadcast(
                             handler.endpoint.clone(),
-                            handler.peers.clone(),
+                            handler.peers.lock().await.clone(),
                             MailboxRequest {
                                 op: Op::Sync,
                                 msg: Some(msg),
@@ -286,7 +459,7 @@ async fn handle_request(
                         let ids: Vec<String> = messages.iter().map(|m| m.msg_id.clone()).collect();
                         spawn_broadcast(
                             handler.endpoint.clone(),
-                            handler.peers.clone(),
+                            handler.peers.lock().await.clone(),
                             MailboxRequest {
                                 op: Op::SyncAck,
                                 to: Some(recipient),
@@ -303,6 +476,7 @@ async fn handle_request(
                         ok: true,
                         error: None,
                         messages: Some(messages),
+                        peers: None,
                     }
                 }
                 Err(e) => err(&format!("fetch failed: {e}")),
@@ -317,7 +491,7 @@ async fn handle_request(
                     Ok(true) => {
                         spawn_broadcast(
                             handler.endpoint.clone(),
-                            handler.peers.clone(),
+                            handler.peers.lock().await.clone(),
                             MailboxRequest {
                                 op: Op::Sync,
                                 msg: Some(msg),
@@ -350,7 +524,7 @@ async fn handle_request(
                     if deleted > 0 {
                         spawn_broadcast(
                             handler.endpoint.clone(),
-                            handler.peers.clone(),
+                            handler.peers.lock().await.clone(),
                             MailboxRequest {
                                 op: Op::SyncAck,
                                 to: Some(recipient),
@@ -372,26 +546,145 @@ async fn handle_request(
 }
 
 /// 本地操作完成后在后台向所有 peer mailbox 并发广播，避免阻塞客户端响应。
-fn spawn_broadcast(endpoint: iroh::Endpoint, peers: Arc<Vec<String>>, req: MailboxRequest) {
+/// 单节点邻居表上限，防止 PEX 无限膨胀。
+const MAX_PEERS: usize = 64;
+
+/// 邻居交换（PEX）：定期向已知 mailbox 询问它们认识谁，自动扩充列表并落盘。
+///
+/// - 只向**当前已知**的节点询问，不接受陌生人主动推送 → 信任沿已有边扩散
+/// - 只接受 64 位十六进制、非自身、未重复的 id
+/// - 有新节点才重写 `mailboxes.json`
+fn spawn_peer_exchange(
+    endpoint: iroh::Endpoint,
+    peers: Arc<tokio::sync::Mutex<Vec<String>>>,
+    data_dir: PathBuf,
+    store: MailboxStore,
+) {
+    let interval_secs: u64 = std::env::var("PRIVCHAT_MAILBOX_PEX_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v| *v >= 5)
+        .unwrap_or(60);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+        loop {
+            ticker.tick().await;
+            let current = peers.lock().await.clone();
+            if current.is_empty() {
+                continue;
+            }
+            let self_id = endpoint.id().to_string();
+            let mut added: Vec<String> = Vec::new();
+            for peer in current {
+                let request = MailboxRequest::peers();
+                let Ok(response) = privchat_mailbox::send_request(&endpoint, &peer, &request).await
+                else {
+                    continue;
+                };
+                if !response.ok {
+                    continue;
+                }
+                let Some(known) = response.peers else {
+                    continue;
+                };
+                let mut list = peers.lock().await;
+                for id in known {
+                    if id == self_id {
+                        continue;
+                    }
+                    if id.len() != 64 || !id.chars().all(|c| c.is_ascii_hexdigit()) {
+                        continue;
+                    }
+                    if list.iter().any(|existing| existing == &id) {
+                        continue;
+                    }
+                    if list.len() >= MAX_PEERS {
+                        break;
+                    }
+                    list.push(id.clone());
+                    added.push(id);
+                }
+            }
+            if !added.is_empty() {
+                let snapshot = peers.lock().await.clone();
+                if let Ok(json) = serde_json::to_string_pretty(&snapshot) {
+                    if let Err(error) = std::fs::write(data_dir.join("mailboxes.json"), json) {
+                        eprintln!("[mailbox] failed to persist peers: {error}");
+                    }
+                }
+                eprintln!("[mailbox] PEX learned {} peer(s): {added:?}", added.len());
+                // 给新邻居补推本节点已有的消息，避免它空着（限量，后台执行）。
+                let messages = store.list_all(200).await.unwrap_or_default();
+                for peer in &added {
+                    for msg in &messages {
+                        let request = MailboxRequest {
+                            op: Op::Sync,
+                            to: None,
+                            for_peer: None,
+                            id: None,
+                            ids: None,
+                            payload: None,
+                            nonce: None,
+                            msg: Some(msg.clone()),
+                        };
+                        let _ = sync_with_retry(&endpoint, peer, &request).await;
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// 单次同步的重试次数（网络抖动时重试；逻辑拒绝不重试）。
+const SYNC_ATTEMPTS: usize = 3;
+
+fn spawn_broadcast(endpoint: iroh::Endpoint, peers: Vec<String>, req: MailboxRequest) {
     tokio::spawn(async move {
         let mut requests = tokio::task::JoinSet::new();
         let req = Arc::new(req);
-        for peer in peers.iter().cloned() {
+        for peer in peers {
             let endpoint = endpoint.clone();
             let req = Arc::clone(&req);
             requests.spawn(async move {
-                let result = privchat_mailbox::send_request(&endpoint, &peer, req.as_ref()).await;
+                let result = sync_with_retry(&endpoint, &peer, req.as_ref()).await;
                 (peer, result)
             });
         }
         while let Some(result) = requests.join_next().await {
             match result {
-                Ok((peer, Err(e))) => eprintln!("[mailbox] sync to {peer} failed: {e}"),
+                Ok((peer, Err(e))) => eprintln!("[mailbox] sync to {peer} failed: {e:#}"),
                 Err(e) => eprintln!("[mailbox] sync task failed: {e}"),
-                Ok((_, Ok(_))) => {}
+                Ok((_, Ok(()))) => {}
             }
         }
     });
+}
+
+/// 带指数退避的同步：网络错误重试，逻辑拒绝（resp.ok=false）直接放弃。
+async fn sync_with_retry(
+    endpoint: &iroh::Endpoint,
+    peer: &str,
+    req: &MailboxRequest,
+) -> Result<()> {
+    let mut last_error = None;
+    for attempt in 1..=SYNC_ATTEMPTS {
+        match privchat_mailbox::send_request(endpoint, peer, req).await {
+            Ok(response) if response.ok => return Ok(()),
+            Ok(response) => {
+                return Err(anyhow!(
+                    "sync rejected by {peer}: {}",
+                    response.error.unwrap_or_default()
+                ))
+            }
+            Err(error) => {
+                last_error = Some(error);
+                if attempt < SYNC_ATTEMPTS {
+                    tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
+                }
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow!("sync failed")))
 }
 
 fn ok() -> MailboxResponse {
@@ -399,6 +692,7 @@ fn ok() -> MailboxResponse {
         ok: true,
         error: None,
         messages: None,
+        peers: None,
     }
 }
 
@@ -407,6 +701,7 @@ fn err(e: &str) -> MailboxResponse {
         ok: false,
         error: Some(e.to_string()),
         messages: None,
+        peers: None,
     }
 }
 
@@ -462,13 +757,45 @@ fn load_ttl(data_dir: &std::path::Path) -> u64 {
 
 /// 首次启动兜底：若 `config.json` / `mailboxes.json` 不存在则按当前生效值
 /// 落盘生成，便于用户直接编辑。已存在的文件绝不覆盖。
-fn ensure_config_files(data_dir: &std::path::Path, ttl_secs: u64, peers: &[String]) -> Result<()> {
+/// 读取节点角色：环境变量 > `config.json` 的 `role` > `both`。
+fn load_role(data_dir: &std::path::Path) -> Result<String> {
+    if let Ok(role) = std::env::var("PRIVCHAT_MAILBOX_ROLE") {
+        return validate_role(role);
+    }
+    let cfg_path = data_dir.join("config.json");
+    if let Ok(bytes) = std::fs::read(&cfg_path) {
+        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+            if let Some(role) = value.get("role").and_then(|v| v.as_str()) {
+                return validate_role(role.to_string());
+            }
+        }
+    }
+    Ok("both".into())
+}
+
+fn validate_role(role: String) -> Result<String> {
+    if matches!(role.as_str(), "both" | "relay" | "mailbox") {
+        Ok(role)
+    } else {
+        Err(anyhow!(
+            "node role 只能是 both/relay/mailbox（环境变量 PRIVCHAT_MAILBOX_ROLE 或 config.json 的 role），当前: {role}"
+        ))
+    }
+}
+
+fn ensure_config_files(
+    data_dir: &std::path::Path,
+    ttl_secs: u64,
+    peers: &[String],
+    role: &str,
+) -> Result<()> {
     let cfg_path = data_dir.join("config.json");
     if !cfg_path.exists() {
         std::fs::write(
             &cfg_path,
             serde_json::to_string_pretty(&serde_json::json!({
                 "ttl_secs": ttl_secs,
+                "role": role,
             }))?,
         )?;
         eprintln!("[mailbox] wrote {}", cfg_path.display());
@@ -504,11 +831,13 @@ async fn main() -> Result<()> {
     };
 
     let ttl_secs = load_ttl(&data_dir);
+    let role = load_role(&data_dir)?;
     let store = MailboxStore::open(data_dir.join("mailbox.db"), ttl_secs)?;
-    let peers = Arc::new(load_peers(&data_dir));
+    let peers = Arc::new(tokio::sync::Mutex::new(load_peers(&data_dir)));
+    let peers_snapshot = peers.lock().await.clone();
 
     // 首次启动兜底：缺失的配置文件落盘，方便用户后续编辑。
-    ensure_config_files(&data_dir, ttl_secs, &peers)?;
+    ensure_config_files(&data_dir, ttl_secs, &peers_snapshot, &role)?;
 
     let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
         .secret_key(secret_key.clone())
@@ -516,16 +845,41 @@ async fn main() -> Result<()> {
         .bind()
         .await?;
 
-    let router = Router::builder(endpoint.clone())
-        .accept(
-            ALPN,
-            MailboxHandler {
-                store: store.clone(),
-                endpoint: endpoint.clone(),
-                peers: peers.clone(),
-            },
-        )
-        .spawn();
+    let mailbox_handler = MailboxHandler {
+        store: store.clone(),
+        endpoint: endpoint.clone(),
+        peers: peers.clone(),
+    };
+
+    // P2：角色分离。relay 只转发洋葱、不落库；mailbox 只存取、不参与中继；
+    // both 兼容旧部署。角色来源：环境变量 > config.json > 默认 both。
+    let serve_mailbox = role != "relay";
+    let serve_onion = role != "mailbox";
+
+    let mut router_builder = Router::builder(endpoint.clone());
+    if serve_mailbox {
+        router_builder = router_builder.accept(ALPN, mailbox_handler.clone());
+    }
+    let _ = serve_onion;
+    router_builder = router_builder.accept(
+        ONION_ALPN,
+        OnionHandler {
+            mailbox: mailbox_handler,
+            secret: secret_key.clone(),
+            endpoint: endpoint.clone(),
+            allow_forward: role != "mailbox",
+            allow_terminal: role != "relay",
+        },
+    );
+    let router = router_builder.spawn();
+
+    // 邻居自动扩充：周期向已知节点询问它们的邻居列表。
+    spawn_peer_exchange(
+        endpoint.clone(),
+        peers.clone(),
+        data_dir.clone(),
+        store.clone(),
+    );
 
     // 到期消息清理任务：按 TTL/4 频率（夹在 1 分钟 ~ 1 小时）周期清除。
     if ttl_secs > 0 {
@@ -555,10 +909,11 @@ async fn main() -> Result<()> {
     println!("  store   : {}", store.path.display());
     println!("  ttl     : {} secs (0 = never expire)", ttl_secs);
     println!("  data_dir: {}", data_dir.display());
-    if peers.is_empty() {
-        println!("  peers   : (none) — 单节点模式");
+    println!("  role    : {role} (mailbox={serve_mailbox}, onion_relay={serve_onion})");
+    if peers_snapshot.is_empty() {
+        println!("  peers   : (none) — 单节点模式（PEX 会自动扩充）");
     } else {
-        println!("  peers   : {}", peers.join(", "));
+        println!("  peers   : {}", peers_snapshot.join(", "));
     }
 
     // 保持进程常驻。
