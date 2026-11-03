@@ -380,3 +380,28 @@ fn offline_missed_old_eph_still_converges() {
     assert_eq!(a.decrypt(&msg4).unwrap(), b"b2");
     assert_eq!(b.decrypt(&msg1).unwrap(), b"a1");
 }
+
+/// gen0 绑定（X3DH 式）的安全回归：只拿到长期私钥的攻击者，
+/// 按「静态-静态 root0 直接派生链」的老办法解 gen0 消息必须失败。
+/// 否则长期私钥泄漏就能回溯解开全部 gen0 / 单向会话消息。
+#[test]
+fn long_term_key_alone_cannot_open_gen0() {
+    let (alice, _bob, bob_id, _alice_id) = peers();
+    let mut a = Ratchet::new(&alice, &bob_id).unwrap();
+    let blob = a.encrypt(b"top-secret").unwrap();
+
+    // 攻击者视角：有 alice 的长期私钥 + bob 的公开 peer_id。
+    let peer_pub = decode_peer_pub(&bob_id).unwrap();
+    let root = root0(&alice, &peer_pub).unwrap();
+    let (send_ck, _) = derive_chains(&root, alice.public().as_bytes(), &peer_pub);
+    let (_, mk) = kdf_ck(&send_ck);
+    let hdr = parse_header(&blob).unwrap();
+    assert!(
+        decrypt_aead(&mk, &hdr, &blob).is_err(),
+        "leaked long-term key alone must not open gen0 messages"
+    );
+
+    // 正常接收方仍然能解（绑定链由 header.dh_pub 还原）。
+    let mut b = Ratchet::new(&_bob, &_alice_id).unwrap();
+    assert_eq!(b.decrypt(&blob).unwrap(), b"top-secret");
+}

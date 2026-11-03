@@ -92,6 +92,25 @@
 旧版无头消息原样兼容。仍未覆盖的是**跳数**（洋葱层数会改变总长）与跨桶
 的粗粒度差异——下一步是固定信元（所有包等长）。
 
+### 3.7 gen0 绑定临时 eph（v5）
+
+纯静态-静态 DH 派生 root0 的问题是：长期私钥一泄漏，**全部 gen0 消息**
+（包括历史、包括单向会话里对方从不回复的那一整段）都能被离线解开。
+v5 起 gen0 的两条方向链改为：
+
+```
+发送侧: ck = HKDF(root0, DH(eph_own, pk_peer))
+接收侧: ck = HKDF(root0, DH(sk_own,  eph_peer))
+```
+
+临时 `eph` 每代一个、只出现在消息头里，私钥不落盘。于是攻击者仅凭长期
+私钥拿不到 gen0 消息密钥。gen>=1 仍由 DH 刷新保证前向保密。
+
+已知边界：**接收方**长期私钥泄漏时，攻击者可用 `DH(epk_peer, sk_own)`
+还原接收侧绑定，gen0 仍会失守 —— 要补上需要 signed prekey（与 P0-3
+的签名方案一起做）。消息格式版本随之升到 `PRR3/v5`，旧会话状态不兼容
+（`from_bytes` 会按版本拒绝，双方重建会话）。
+
 ### 3.5 WebView 与打包层
 
 - **CSP**：已配置 `default-src 'self'; script-src 'self'; style-src 'self'
@@ -120,7 +139,7 @@
 |---|---|
 | 消息加密 | ChaCha20-Poly1305（AEAD，头部作为 AAD） |
 | 密钥交换 | X25519（Ed25519 身份转 Montgomery） |
-| 棘轮 | 双棘轮，跳窗 200，skipped 池上限 1000 |
+| 棘轮 | 双棘轮，跳窗 200，skipped 池上限 1000；gen0 链绑定临时 eph（v5） |
 | 洋葱层密钥 | HKDF-SHA256，info=`privchat/onion/key/v1`，AAD=`privchat/onion/v1` |
 | 保险箱 KDF | PBKDF2-HMAC-SHA256，600,000 次，16B salt |
 | 本地库 | SQLCipher（全库加密） |
