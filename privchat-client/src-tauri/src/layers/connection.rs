@@ -21,8 +21,8 @@ pub const DOMAIN_DELETE: &[u8] = b"privchat/queue/delete/v1";
 /// 邀请：告诉对方「往哪条队列写、用什么 key 写、用哪把 E2E 公钥」。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Invite {
-    /// mailbox 节点的 peer_id（hex 32 字节）。
-    pub mailbox: String,
+    /// mailbox 节点列表（peer_id 或票据）；多台时消息会同时投递，任一台可收。
+    pub mailboxes: Vec<String>,
     /// 接收队列 id（16 字节）。
     pub queue_id: [u8; 16],
     /// 邀请创建方的连接公钥（X25519）。
@@ -46,16 +46,19 @@ impl Invite {
         body.extend_from_slice(&self.queue_id);
         body.extend_from_slice(&self.ek);
         body.extend_from_slice(&self.sender_sk);
-        match hex_decode(&self.mailbox) {
-            Ok(bytes) if bytes.len() == 32 => {
-                body.push(0);
-                body.extend_from_slice(&bytes);
-            }
-            _ => {
-                body.push(1);
-                let raw = self.mailbox.as_bytes();
-                body.extend_from_slice(&(raw.len() as u16).to_be_bytes());
-                body.extend_from_slice(raw);
+        body.push(self.mailboxes.len() as u8);
+        for mailbox in &self.mailboxes {
+            match hex_decode(mailbox) {
+                Ok(bytes) if bytes.len() == 32 => {
+                    body.push(0);
+                    body.extend_from_slice(&bytes);
+                }
+                _ => {
+                    body.push(1);
+                    let raw = mailbox.as_bytes();
+                    body.extend_from_slice(&(raw.len() as u16).to_be_bytes());
+                    body.extend_from_slice(raw);
+                }
             }
         }
         let ticket = self.ticket.as_deref().unwrap_or_default().as_bytes();
@@ -80,32 +83,43 @@ impl Invite {
         let ek: [u8; 32] = bytes[16..48].try_into().unwrap();
         let sender_sk: [u8; 32] = bytes[48..80].try_into().unwrap();
         let mut pos = 80;
-        let tag = bytes[pos];
+        let count = *bytes
+            .get(pos)
+            .ok_or_else(|| anyhow!("truncated mailbox count"))? as usize;
         pos += 1;
-        let mailbox = match tag {
-            0 => {
-                let raw = bytes
-                    .get(pos..pos + 32)
-                    .ok_or_else(|| anyhow!("truncated mailbox id"))?;
-                pos += 32;
-                hex_encode(raw)
-            }
-            1 => {
-                let len = u16::from_be_bytes([
-                    *bytes.get(pos).ok_or_else(|| anyhow!("truncated mailbox"))?,
-                    *bytes
-                        .get(pos + 1)
-                        .ok_or_else(|| anyhow!("truncated mailbox"))?,
-                ]) as usize;
-                pos += 2;
-                let raw = bytes
-                    .get(pos..pos + len)
-                    .ok_or_else(|| anyhow!("truncated mailbox"))?;
-                pos += len;
-                String::from_utf8(raw.to_vec()).map_err(|_| anyhow!("mailbox not utf8"))?
-            }
-            _ => return Err(anyhow!("bad mailbox tag")),
-        };
+        if count == 0 || count > 16 {
+            return Err(anyhow!("bad mailbox count: {count}"));
+        }
+        let mut mailboxes = Vec::with_capacity(count);
+        for _ in 0..count {
+            let tag = *bytes.get(pos).ok_or_else(|| anyhow!("truncated mailbox"))?;
+            pos += 1;
+            let mailbox = match tag {
+                0 => {
+                    let raw = bytes
+                        .get(pos..pos + 32)
+                        .ok_or_else(|| anyhow!("truncated mailbox id"))?;
+                    pos += 32;
+                    hex_encode(raw)
+                }
+                1 => {
+                    let len = u16::from_be_bytes([
+                        *bytes.get(pos).ok_or_else(|| anyhow!("truncated mailbox"))?,
+                        *bytes
+                            .get(pos + 1)
+                            .ok_or_else(|| anyhow!("truncated mailbox"))?,
+                    ]) as usize;
+                    pos += 2;
+                    let raw = bytes
+                        .get(pos..pos + len)
+                        .ok_or_else(|| anyhow!("truncated mailbox"))?;
+                    pos += len;
+                    String::from_utf8(raw.to_vec()).map_err(|_| anyhow!("mailbox not utf8"))?
+                }
+                _ => return Err(anyhow!("bad mailbox tag")),
+            };
+            mailboxes.push(mailbox);
+        }
         if bytes.len() < pos + 2 {
             return Err(anyhow!("truncated ticket length"));
         }
@@ -123,7 +137,7 @@ impl Invite {
             )
         };
         Ok(Self {
-            mailbox,
+            mailboxes,
             queue_id,
             ek,
             sender_sk,
@@ -260,7 +274,7 @@ pub enum LinkState {
 /// 出站队列：对方的入站队列地址，以及写它需要的 sender 私钥。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OutQueue {
-    pub mailbox: String,
+    pub mailboxes: Vec<String>,
     pub queue_id: [u8; 16],
     pub sender_sk: [u8; 32],
 }
@@ -269,7 +283,7 @@ pub struct OutQueue {
 pub struct Link {
     /// 本端入站队列地址与钥匙（读/删用 owner；sender 私钥发给对方）。
     pub in_queue: [u8; 16],
-    pub in_mailbox: String,
+    pub in_mailboxes: Vec<String>,
     pub owner_keys: QueueKeys,
     /// 对方的入站队列（互扫后才有）。
     pub out: Option<OutQueue>,
@@ -279,14 +293,14 @@ pub struct Link {
 
 impl Link {
     /// 生成本端的入站队列与连接密钥，返回 `(连接, 自己的邀请)`。
-    pub fn create(mailbox: &str) -> (Self, Invite) {
+    pub fn create(mailboxes: &[String]) -> (Self, Invite) {
         let (e2e, ek_pub) = crate::layers::crypto::connection::Connection::unpaired();
         let keys = QueueKeys::generate();
         let mut queue_id = [0u8; 16];
         rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut queue_id);
 
         let invite = Invite {
-            mailbox: mailbox.to_string(),
+            mailboxes: mailboxes.to_vec(),
             queue_id,
             ek: ek_pub,
             // 邀请即写权限：私钥交给拿到邀请的人。
@@ -296,7 +310,7 @@ impl Link {
         (
             Self {
                 in_queue: queue_id,
-                in_mailbox: mailbox.to_string(),
+                in_mailboxes: mailboxes.to_vec(),
                 owner_keys: keys,
                 out: None,
                 e2e,
@@ -310,7 +324,7 @@ impl Link {
     pub fn accept(&mut self, their: &Invite) -> anyhow::Result<()> {
         self.e2e.pair_with(&their.ek)?;
         self.out = Some(OutQueue {
-            mailbox: their.mailbox.clone(),
+            mailboxes: their.mailboxes.clone(),
             queue_id: their.queue_id,
             sender_sk: their.sender_sk,
         });
@@ -325,7 +339,7 @@ mod tests {
 
     fn sample() -> Invite {
         Invite {
-            mailbox: hex_encode(&[7u8; 32]),
+            mailboxes: vec![hex_encode(&[7u8; 32])],
             queue_id: [1u8; 16],
             ek: [2u8; 32],
             sender_sk: [3u8; 32],
@@ -358,8 +372,8 @@ mod tests {
 
     #[test]
     fn mutual_scan_pairing() {
-        let (mut alice, alice_invite) = Link::create("mb-alice");
-        let (mut bob, bob_invite) = Link::create("mb-bob");
+        let (mut alice, alice_invite) = Link::create(&["mb-alice".to_string()]);
+        let (mut bob, bob_invite) = Link::create(&["mb-bob".to_string()]);
         assert_eq!(alice.state, LinkState::Pending);
         assert_eq!(bob.state, LinkState::Pending);
         assert!(!alice.e2e.is_established());
@@ -384,8 +398,8 @@ mod tests {
 
     #[test]
     fn state_serialization_roundtrip() {
-        let (mut alice, alice_invite) = Link::create("mb-a");
-        let (mut bob, bob_invite) = Link::create("mb-b");
+        let (mut alice, alice_invite) = Link::create(&["mb-a".to_string()]);
+        let (mut bob, bob_invite) = Link::create(&["mb-b".to_string()]);
         alice.accept(&bob_invite).unwrap();
         bob.accept(&alice_invite).unwrap();
 

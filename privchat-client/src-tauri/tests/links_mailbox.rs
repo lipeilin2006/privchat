@@ -49,8 +49,8 @@ async fn two_clients_over_real_mailbox() {
     let (b, _sb) = manager("b", transport_b).await;
 
     // 各自建队列、出邀请；互扫配对。
-    let (a_id, a_invite) = a.create(&mailbox).await.expect("a create");
-    let (b_id, b_invite) = b.create(&mailbox).await.expect("b create");
+    let (a_id, a_invite) = a.create(&[mailbox.clone()]).await.expect("a create");
+    let (b_id, b_invite) = b.create(&[mailbox.clone()]).await.expect("b create");
     a.accept(&a_id, &b_invite).await.expect("a accept");
     b.accept(&b_id, &a_invite).await.expect("b accept");
 

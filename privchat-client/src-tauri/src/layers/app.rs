@@ -90,9 +90,11 @@ impl App {
 
     // ---- 连接 ----
 
-    /// 生成邀请：在 mailbox 上建接收队列，返回 `(conn_id, 邀请串)`。
-    pub async fn create_connection(&self, mailbox: &str) -> Result<(String, String)> {
-        self.links.create(mailbox).await
+    /// 生成邀请：在**所有已配置 mailbox** 上建同一接收队列（多副本），
+    /// 返回 `(conn_id, 邀请串)`。
+    pub async fn create_connection(&self) -> Result<(String, String)> {
+        let mailboxes = self.mailbox_peers.lock().await.clone();
+        self.links.create(&mailboxes).await
     }
 
     /// 互扫到对方邀请后配对。

@@ -145,18 +145,33 @@ impl LinkManager {
     }
 
     /// 建连接：在 mailbox 上创建接收队列，返回 `(conn_id, 邀请串)`。
-    pub async fn create(&self, mailbox: &str) -> Result<(String, String)> {
-        let (link, invite) = Link::create(mailbox);
+    pub async fn create(&self, mailboxes: &[String]) -> Result<(String, String)> {
+        if mailboxes.is_empty() {
+            return Err(anyhow!("no mailbox configured"));
+        }
+        let (link, invite) = Link::create(mailboxes);
         let conn_id = unique_conn_id();
-        self.api
-            .create(
-                &conn_id,
-                mailbox,
-                &connection::hex_encode(&link.in_queue),
-                &link.owner_keys.sender_pub_hex(),
-                &link.owner_keys.owner_pub_hex(),
-            )
-            .await?;
+        let mut ok = 0;
+        for mailbox in mailboxes {
+            match self
+                .api
+                .create(
+                    &conn_id,
+                    mailbox,
+                    &connection::hex_encode(&link.in_queue),
+                    &link.owner_keys.sender_pub_hex(),
+                    &link.owner_keys.owner_pub_hex(),
+                )
+                .await
+            {
+                Ok(()) => ok += 1,
+                // 单台失败不影响其它副本；已存在的队列（重试）也算成功。
+                Err(e) => eprintln!("[links] create queue on {mailbox} failed: {e}"),
+            }
+        }
+        if ok == 0 {
+            return Err(anyhow!("failed to create queue on any mailbox"));
+        }
         self.persist(&conn_id, &link)?;
         self.links.lock().await.insert(conn_id.clone(), link);
         Ok((conn_id, invite.encode()))
@@ -195,31 +210,50 @@ impl LinkManager {
             &blob,
             &SigningKey::from_bytes(&out.sender_sk),
         );
-        self.api
-            .send(
-                conn_id,
-                &out.mailbox,
-                &connection::hex_encode(&out.queue_id),
-                blob,
-                &sig,
-            )
-            .await
+        // 多副本：写成功任意一台即可；其余失败只记日志。
+        let mut ok = 0;
+        for mailbox in &out.mailboxes {
+            match self
+                .api
+                .send(
+                    conn_id,
+                    mailbox,
+                    &connection::hex_encode(&out.queue_id),
+                    blob.clone(),
+                    &sig,
+                )
+                .await
+            {
+                Ok(()) => ok += 1,
+                Err(e) => eprintln!("[links] send via {mailbox} failed: {e}"),
+            }
+        }
+        if ok == 0 {
+            return Err(anyhow!("failed to deliver to any mailbox"));
+        }
+        Ok(())
     }
 
     /// 取走并解密本连接入站队列的全部消息。
     pub async fn poll(&self, conn_id: &str) -> Result<Vec<Vec<u8>>> {
-        let (mailbox, queue, sig) = {
+        let (mailboxes, queue, sig) = {
             let links = self.links.lock().await;
             let link = links
                 .get(conn_id)
                 .ok_or_else(|| anyhow!("unknown connection {conn_id}"))?;
             (
-                link.in_mailbox.clone(),
+                link.in_mailboxes.clone(),
                 connection::hex_encode(&link.in_queue),
                 connection::sign_get(&link.in_queue, &link.owner_keys.owner),
             )
         };
-        let blobs = self.api.get(conn_id, &mailbox, &queue, &sig).await?;
+        let mut blobs = Vec::new();
+        for mailbox in &mailboxes {
+            match self.api.get(conn_id, mailbox, &queue, &sig).await {
+                Ok(mut rows) => blobs.append(&mut rows),
+                Err(e) => eprintln!("[links] get from {mailbox} failed: {e}"),
+            }
+        }
 
         let mut out = Vec::new();
         let mut links = self.links.lock().await;
@@ -271,9 +305,12 @@ impl LinkManager {
             role: "peer".to_string(),
             state: state_str(link.state).to_string(),
             in_queue: connection::hex_encode(&link.in_queue),
-            in_mailbox: link.in_mailbox.clone(),
+            in_mailbox: serde_json::to_string(&link.in_mailboxes)?,
             out_queue: out.as_ref().map(|q| connection::hex_encode(&q.queue_id)),
-            out_mailbox: out.as_ref().map(|q| q.mailbox.clone()),
+            out_mailbox: out
+                .as_ref()
+                .map(|q| serde_json::to_string(&q.mailboxes))
+                .transpose()?,
             out_sender_sk: out.as_ref().map(|q| q.sender_sk.to_vec()),
             owner_sk: owner_sk.to_vec(),
             e2e_state: link.e2e.to_bytes(),
@@ -313,7 +350,7 @@ fn row_to_link(row: &ConnRow) -> Result<Link> {
         .map_err(|_| anyhow!("bad owner_sk"))?;
     let out = match (&row.out_queue, &row.out_mailbox, &row.out_sender_sk) {
         (Some(q), Some(m), Some(sk)) => Some(OutQueue {
-            mailbox: m.clone(),
+            mailboxes: serde_json::from_str(m).unwrap_or_else(|_| vec![m.clone()]),
             queue_id: connection::hex_decode(q)?
                 .as_slice()
                 .try_into()
@@ -327,7 +364,8 @@ fn row_to_link(row: &ConnRow) -> Result<Link> {
     };
     Ok(Link {
         in_queue,
-        in_mailbox: row.in_mailbox.clone(),
+        in_mailboxes: serde_json::from_str(&row.in_mailbox)
+            .unwrap_or_else(|_| vec![row.in_mailbox.clone()]),
         owner_keys: QueueKeys::from_bytes([0u8; 32], owner_sk),
         out,
         e2e,
@@ -350,6 +388,18 @@ mod tests {
     #[derive(Default)]
     struct MemQueues {
         queues: StdMutex<HashMap<String, MemQueue>>,
+        /// 这些 mailbox 上的操作直接失败，用来模拟单台故障。
+        broken: StdMutex<Vec<String>>,
+    }
+
+    impl MemQueues {
+        fn key(mailbox: &str, queue: &str) -> String {
+            format!("{mailbox}|{queue}")
+        }
+
+        fn fail(&self, mailbox: &str) -> bool {
+            self.broken.lock().unwrap().iter().any(|m| m == mailbox)
+        }
     }
 
     struct MemQueue {
@@ -362,7 +412,7 @@ mod tests {
         fn create<'a>(
             &'a self,
             _conn_id: &'a str,
-            _mailbox: &'a str,
+            mailbox: &'a str,
             queue: &'a str,
             sender_pub: &'a str,
             owner_pub: &'a str,
@@ -376,12 +426,16 @@ mod tests {
                     .as_slice()
                     .try_into()
                     .map_err(|_| anyhow!("bad owner"))?;
+                if self.fail(mailbox) {
+                    return Err(anyhow!("mailbox unavailable"));
+                }
                 let mut q = self.queues.lock().unwrap();
-                if q.contains_key(queue) {
-                    return Err(anyhow!("queue exists"));
+                let key = Self::key(mailbox, queue);
+                if q.contains_key(&key) {
+                    return Ok(());
                 }
                 q.insert(
-                    queue.to_string(),
+                    key,
                     MemQueue {
                         sender_pub: sender,
                         owner_pub: owner,
@@ -395,7 +449,7 @@ mod tests {
         fn send<'a>(
             &'a self,
             _conn_id: &'a str,
-            _mailbox: &'a str,
+            mailbox: &'a str,
             queue: &'a str,
             payload: Vec<u8>,
             sig: &'a str,
@@ -405,8 +459,13 @@ mod tests {
                     .as_slice()
                     .try_into()
                     .map_err(|_| anyhow!("bad queue"))?;
+                if self.fail(mailbox) {
+                    return Err(anyhow!("mailbox unavailable"));
+                }
                 let mut q = self.queues.lock().unwrap();
-                let item = q.get_mut(queue).ok_or_else(|| anyhow!("no queue"))?;
+                let item = q
+                    .get_mut(&Self::key(mailbox, queue))
+                    .ok_or_else(|| anyhow!("no queue"))?;
                 if !connection::verify(
                     &item.sender_pub,
                     connection::DOMAIN_SEND,
@@ -424,7 +483,7 @@ mod tests {
         fn get<'a>(
             &'a self,
             _conn_id: &'a str,
-            _mailbox: &'a str,
+            mailbox: &'a str,
             queue: &'a str,
             sig: &'a str,
         ) -> BoxFut<'a, Vec<Vec<u8>>> {
@@ -433,8 +492,13 @@ mod tests {
                     .as_slice()
                     .try_into()
                     .map_err(|_| anyhow!("bad queue"))?;
+                if self.fail(mailbox) {
+                    return Err(anyhow!("mailbox unavailable"));
+                }
                 let mut q = self.queues.lock().unwrap();
-                let item = q.get_mut(queue).ok_or_else(|| anyhow!("no queue"))?;
+                let item = q
+                    .get_mut(&Self::key(mailbox, queue))
+                    .ok_or_else(|| anyhow!("no queue"))?;
                 if !connection::verify(&item.owner_pub, connection::DOMAIN_GET, &qid, None, sig) {
                     return Err(anyhow!("bad signature"));
                 }
@@ -453,13 +517,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn multi_mailbox_redundancy() {
+        let api = Arc::new(MemQueues::default());
+        // 第二台一开始就挂着，验证「一台故障仍可用」。
+        api.broken.lock().unwrap().push("m2".to_string());
+        let a = manager(api.clone() as Arc<dyn QueueApi>, "ma").await;
+        let b = manager(api.clone() as Arc<dyn QueueApi>, "mb").await;
+
+        let mailboxes = vec!["m1".to_string(), "m2".to_string()];
+        let (a_id, a_invite) = a.create(&mailboxes).await.expect("a create");
+        let (b_id, b_invite) = b.create(&mailboxes).await.expect("b create");
+        a.accept(&a_id, &b_invite).await.expect("a accept");
+        b.accept(&b_id, &a_invite).await.expect("b accept");
+
+        // m2 全挂，m1 仍能收发。
+        a.send(&a_id, b"via m1").await.expect("a send");
+        assert_eq!(b.poll(&b_id).await.unwrap(), vec![b"via m1".to_vec()]);
+
+        // 恢复 m2 后，消息会同时写两台；接收端只解出一条（重放被拒）。
+        api_recover(&api, "m2");
+        a.send(&a_id, b"both").await.expect("a send");
+        let got = b.poll(&b_id).await.unwrap();
+        assert_eq!(got, vec![b"both".to_vec()]);
+    }
+
+    fn api_recover(api: &Arc<MemQueues>, mailbox: &str) {
+        api.broken.lock().unwrap().retain(|m| m != mailbox);
+    }
+
+    #[tokio::test]
     async fn mutual_scan_end_to_end() {
         let api = Arc::new(MemQueues::default());
         let a = manager(api.clone() as Arc<dyn QueueApi>, "a").await;
         let b = manager(api as Arc<dyn QueueApi>, "b").await;
 
-        let (a_id, a_invite) = a.create("mb").await.expect("a create");
-        let (b_id, b_invite) = b.create("mb").await.expect("b create");
+        let mb = vec!["mb".to_string()];
+        let (a_id, a_invite) = a.create(&mb).await.expect("a create");
+        let (b_id, b_invite) = b.create(&mb).await.expect("b create");
         a.accept(&a_id, &b_invite).await.expect("a accept");
         b.accept(&b_id, &a_invite).await.expect("b accept");
 
