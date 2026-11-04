@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { Button, Placeholder } from "@telegram-apps/telegram-ui";
-import { Activity, ArrowLeft, Mail, X } from "lucide-react";
+import { ArrowLeft, Gauge, Mail, X } from "lucide-react";
 import { api } from "../../api";
 import { t } from "../../i18n";
 
@@ -189,9 +189,10 @@ export default function MailboxPage({ notify, onClose }) {
                 <button
                   className="row-icon"
                   onClick={() => ping(peer.peer_id)}
-                  aria-label={t("ping")}
+                  aria-label={t("testSpeed")}
+                  title={t("testSpeed")}
                 >
-                  <Activity size={18} />
+                  <Gauge size={18} />
                 </button>
                 <button
                   className="row-icon"
