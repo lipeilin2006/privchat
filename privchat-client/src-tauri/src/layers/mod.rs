@@ -19,6 +19,7 @@
 
 pub mod app;
 pub mod connection;
+pub mod links;
 pub mod crypto;
 pub mod mailbox;
 pub mod store;
