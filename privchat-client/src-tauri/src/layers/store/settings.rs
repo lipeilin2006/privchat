@@ -2,6 +2,13 @@
 
 use super::*;
 
+/// 一个信箱节点：peer_id + 优先级（数字大的先用）。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct MailboxPeer {
+    pub peer_id: String,
+    pub priority: i64,
+}
+
 const AUTO_LOCK_MINUTES_KEY: &str = "auto_lock_minutes";
 const ONION_CONFIG_KEY: &str = "onion_config";
 
@@ -48,19 +55,28 @@ impl Store {
         self.save_setting(AUTO_LOCK_MINUTES_KEY, &minutes.to_string())
     }
     /// mailbox 节点列表。
-    pub fn load_mailbox_peers(&self) -> Result<Vec<String>> {
+    pub fn load_mailbox_peers(&self) -> Result<Vec<MailboxPeer>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT peer_id FROM mailbox_peers")?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut stmt = conn.prepare(
+            "SELECT peer_id, priority FROM mailbox_peers ORDER BY priority DESC, peer_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(MailboxPeer {
+                peer_id: row.get(0)?,
+                priority: row.get(1)?,
+            })
+        })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
-    /// 写回 mailbox 节点列表（先删后插）。
-    pub fn save_mailbox_peers(&self, peers: &[String]) -> Result<()> {
+
+    /// 写回信箱节点列表（先删后插）。
+    pub fn save_mailbox_peers(&self, peers: &[MailboxPeer]) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM mailbox_peers", [])?;
-        let mut stmt = conn.prepare("INSERT INTO mailbox_peers (peer_id) VALUES (?1)")?;
-        for p in peers {
-            stmt.execute(params![p])?;
+        let mut stmt =
+            conn.prepare("INSERT INTO mailbox_peers (peer_id, priority) VALUES (?1, ?2)")?;
+        for peer in peers {
+            stmt.execute(params![peer.peer_id, peer.priority])?;
         }
         Ok(())
     }

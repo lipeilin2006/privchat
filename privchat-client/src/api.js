@@ -10,7 +10,7 @@ export const api = {
 
 
   // 新协议：连接（没有「联系人」实体，只有连接 + 备注）
-  createConnection: (mailbox) => invoke("create_connection", { mailbox }),
+  createConnection: (mailbox = null) => invoke("create_connection", { mailbox }),
   acceptConnection: (connId, invite) =>
     invoke("accept_connection", { connId, invite }),
   sendOnConnection: (connId, text) =>
@@ -22,9 +22,12 @@ export const api = {
     invoke("rename_connection", { connId, name }),
 
   mailboxPeers: () => invoke("get_mailbox_peers"),
-  addMailbox: (peerId) => invoke("add_mailbox_peer", { peerId }),
+  addMailbox: (peerId, priority = 0) => invoke("add_mailbox_peer", { peerId, priority }),
   removeMailbox: (peerId) => invoke("remove_mailbox_peer", { peerId }),
+  setMailboxPriority: (peerId, priority) =>
+    invoke("set_mailbox_priority", { peerId, priority }),
   pingMailbox: (peerId) => invoke("ping_mailbox", { peerId }),
+  pingMailboxes: () => invoke("ping_mailboxes"),
 
   getOnion: () => invoke("get_onion_config"),
   setOnion: (config) => invoke("set_onion_config", { config }),

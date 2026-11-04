@@ -29,6 +29,7 @@ mod connections;
 mod settings;
 
 pub use connections::{ConnMessage, ConnRow};
+pub use settings::MailboxPeer;
 
 pub const UNBOUND_IDENTITY_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 
@@ -48,7 +49,8 @@ impl Store {
             "PRAGMA journal_mode=WAL;
              PRAGMA foreign_keys=ON;
              CREATE TABLE IF NOT EXISTS mailbox_peers (
-                 peer_id TEXT PRIMARY KEY
+                 peer_id TEXT PRIMARY KEY,
+                 priority INTEGER NOT NULL DEFAULT 0
              );
              CREATE TABLE IF NOT EXISTS connections (
                  conn_id TEXT PRIMARY KEY,
@@ -79,6 +81,18 @@ impl Store {
                      value TEXT NOT NULL
                  );",
         )?;
+        // 旧库升级：mailbox_peers 早先没有 priority 列。
+        let has_priority: i64 = conn.query_row(
+            "SELECT count(*) FROM pragma_table_info('mailbox_peers') WHERE name = 'priority'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_priority == 0 {
+            conn.execute(
+                "ALTER TABLE mailbox_peers ADD COLUMN priority INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
         // 旧库升级：早先的 connections 表没有 draining 列。
         let has_draining: i64 = conn.query_row(
             "SELECT count(*) FROM pragma_table_info('connections') WHERE name = 'draining'",
@@ -133,9 +147,21 @@ mod tests {
         assert!(dir.join("privchat.db").exists());
 
         store
-            .save_mailbox_peers(&["mb1".to_string(), "mb2".to_string()])
+            .save_mailbox_peers(&[
+                MailboxPeer {
+                    peer_id: "mb1".into(),
+                    priority: 1,
+                },
+                MailboxPeer {
+                    peer_id: "mb2".into(),
+                    priority: 0,
+                },
+            ])
             .expect("save mailbox");
-        assert_eq!(store.load_mailbox_peers().unwrap(), vec!["mb1", "mb2"]);
+        let peers = store.load_mailbox_peers().unwrap();
+        assert_eq!(peers.len(), 2);
+        assert_eq!(peers[0].peer_id, "mb1", "higher priority first");
+        assert_eq!(peers[0].priority, 1);
 
         // 落盘文件不得含明文。
         let raw = std::fs::read(dir.join("privchat.db")).unwrap();
@@ -154,7 +180,12 @@ mod tests {
     fn wrong_key_cannot_open() {
         let dir = temp_dir("wrongkey");
         let store = Store::open(&dir, KEY).expect("open");
-        store.save_mailbox_peers(&["mb".to_string()]).expect("save");
+        store
+            .save_mailbox_peers(&[MailboxPeer {
+                peer_id: "mb".into(),
+                priority: 0,
+            }])
+            .expect("save");
         drop(store);
 
         // 错误密钥打开加密库 → 打开即报错（SQLCipher 首页解密失败）。

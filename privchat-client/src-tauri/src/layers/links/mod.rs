@@ -259,10 +259,8 @@ impl LinkManager {
                     let Ok(queue_id) = <[u8; 16]>::try_from(bytes.as_slice()) else {
                         return;
                     };
-                    let sig = connection::sign_delete(
-                        &queue_id,
-                        &SigningKey::from_bytes(&owner_sk),
-                    );
+                    let sig =
+                        connection::sign_delete(&queue_id, &SigningKey::from_bytes(&owner_sk));
                     let _ = api.delete(&conn_id, &mailbox, &queue, &sig).await;
                 });
             }

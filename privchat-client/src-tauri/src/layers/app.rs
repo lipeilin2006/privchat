@@ -11,8 +11,93 @@ use tokio::sync::{watch, Mutex};
 
 use super::connection::LinkState;
 use super::links::{IrohQueues, LinkManager};
-use super::store::{ConnMessage, Store};
+use super::store::{ConnMessage, MailboxPeer, Store};
 use super::transport::Transport;
+
+/// 一次测速的结果。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MailboxPing {
+    pub peer_id: String,
+    /// 成功的往返毫秒数；失败为 None。
+    pub ms: Option<u64>,
+    pub error: Option<String>,
+}
+
+impl MailboxPing {
+    fn failed(peer_id: &str, error: &str) -> Self {
+        Self {
+            peer_id: peer_id.to_string(),
+            ms: None,
+            error: Some(error.to_string()),
+        }
+    }
+}
+
+/// 优先级的合法区间：0..=9，数字越大越先用。
+fn clamp_priority(priority: i64) -> i64 {
+    priority.clamp(0, 9)
+}
+
+fn peer_ids(peers: &[MailboxPeer]) -> Vec<String> {
+    peers.iter().map(|p| p.peer_id.clone()).collect()
+}
+
+/// 选信箱：优先级最高的那一档里，挑实测延迟最低的；
+/// 都没测过就按列表顺序（列表本身已按优先级排序）。
+fn choose_peer(
+    peers: &[MailboxPeer],
+    latencies: &std::collections::HashMap<String, u64>,
+) -> Option<String> {
+    let top = peers.iter().map(|p| p.priority).max()?;
+    peers
+        .iter()
+        .filter(|p| p.priority == top)
+        .min_by_key(|p| latencies.get(&p.peer_id).copied().unwrap_or(u64::MAX))
+        .map(|p| p.peer_id.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn peer(id: &str, priority: i64) -> MailboxPeer {
+        MailboxPeer {
+            peer_id: id.to_string(),
+            priority,
+        }
+    }
+
+    #[test]
+    fn picks_highest_priority_first() {
+        let peers = vec![peer("hi", 5), peer("lo", 0)];
+        let mut latencies = std::collections::HashMap::new();
+        latencies.insert("lo".to_string(), 5);
+        latencies.insert("hi".to_string(), 300);
+        assert_eq!(choose_peer(&peers, &latencies).as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn ties_pick_lowest_latency() {
+        let peers = vec![peer("a", 3), peer("b", 3), peer("c", 1)];
+        let mut latencies = std::collections::HashMap::new();
+        latencies.insert("a".to_string(), 120);
+        latencies.insert("b".to_string(), 40);
+        assert_eq!(choose_peer(&peers, &latencies).as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn untested_nodes_are_last_resort() {
+        let peers = vec![peer("slow", 3), peer("untested", 3)];
+        let mut latencies = std::collections::HashMap::new();
+        latencies.insert("slow".to_string(), 900);
+        assert_eq!(choose_peer(&peers, &latencies).as_deref(), Some("slow"));
+        assert_eq!(
+            choose_peer(&peers, &std::collections::HashMap::new()).as_deref(),
+            Some("slow"),
+            "no latencies -> first in list"
+        );
+    }
+}
 
 /// 洋葱路由配置。
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -27,8 +112,8 @@ pub struct App {
     transport: Transport,
     store: Arc<Store>,
     links: Arc<LinkManager>,
-    /// 配置的 mailbox 节点（建连接时用第一个）。
-    mailbox_peers: Arc<Mutex<Vec<String>>>,
+    /// 配置的信箱节点（带优先级；建连接时按优先级 + 延迟挑一台）。
+    mailbox_peers: Arc<Mutex<Vec<MailboxPeer>>>,
     onion: Arc<Mutex<OnionConfig>>,
     stop_tx: watch::Sender<bool>,
 }
@@ -61,7 +146,9 @@ impl App {
         ));
         let queue_api = Arc::new(IrohQueues::new(transport.clone(), onion.clone()));
         let links = Arc::new(LinkManager::load(store.clone(), queue_api).await?);
-        links.set_pool(mailbox_peers.lock().await.clone()).await;
+        links
+            .set_pool(peer_ids(&mailbox_peers.lock().await.clone()))
+            .await;
         let (stop_tx, _) = watch::channel(false);
         Ok(Self {
             transport,
@@ -75,9 +162,15 @@ impl App {
 
     // ---- 连接 ----
 
-    /// 生成邀请：在 mailbox 上建接收队列，返回 `(conn_id, 邀请串)`。
-    pub async fn create_connection(&self, mailbox: &str) -> Result<(String, String)> {
-        self.links.create(mailbox).await
+    /// 生成邀请：在信箱上建接收队列，返回 `(conn_id, 邀请串)`。
+    ///
+    /// 不指定信箱时按「优先级最高 → 同优先级里延迟最低」自动挑一台。
+    pub async fn create_connection(&self, mailbox: Option<&str>) -> Result<(String, String)> {
+        let mailbox = match mailbox.map(str::trim).filter(|m| !m.is_empty()) {
+            Some(mailbox) => mailbox.to_string(),
+            None => self.pick_mailbox().await?,
+        };
+        self.links.create(&mailbox).await
     }
 
     /// 互扫到对方邀请后配对。
@@ -162,38 +255,133 @@ impl App {
         Ok(())
     }
 
-    pub async fn get_mailbox_peers(&self) -> Vec<String> {
+    pub async fn get_mailbox_peers(&self) -> Vec<MailboxPeer> {
         self.mailbox_peers.lock().await.clone()
     }
 
-    pub async fn add_mailbox_peer(&self, peer_id: &str) -> Result<()> {
+    pub async fn add_mailbox_peer(&self, peer_id: &str, priority: i64) -> Result<()> {
+        let peer_id = peer_id.trim();
         if peer_id.len() != 64 || !peer_id.chars().all(|c| c.is_ascii_hexdigit()) {
             return Err(anyhow!("mailbox peer id must be 64 hex chars"));
         }
         let mut peers = self.mailbox_peers.lock().await;
-        if !peers.iter().any(|p| p == peer_id) {
-            peers.push(peer_id.to_string());
-            self.store.save_mailbox_peers(&peers)?;
+        match peers.iter_mut().find(|p| p.peer_id == peer_id) {
+            Some(peer) => peer.priority = clamp_priority(priority),
+            None => peers.push(MailboxPeer {
+                peer_id: peer_id.to_string(),
+                priority: clamp_priority(priority),
+            }),
         }
+        peers.sort_by(|a, b| b.priority.cmp(&a.priority).then(a.peer_id.cmp(&b.peer_id)));
+        self.store.save_mailbox_peers(&peers)?;
+        self.links.set_pool(peer_ids(&peers)).await;
+        Ok(())
+    }
+
+    pub async fn set_mailbox_priority(&self, peer_id: &str, priority: i64) -> Result<()> {
+        let mut peers = self.mailbox_peers.lock().await;
+        let Some(peer) = peers.iter_mut().find(|p| p.peer_id == peer_id) else {
+            return Err(anyhow!("unknown mailbox peer"));
+        };
+        peer.priority = clamp_priority(priority);
+        peers.sort_by(|a, b| b.priority.cmp(&a.priority).then(a.peer_id.cmp(&b.peer_id)));
+        self.store.save_mailbox_peers(&peers)?;
+        self.links.set_pool(peer_ids(&peers)).await;
         Ok(())
     }
 
     pub async fn remove_mailbox_peer(&self, peer_id: &str) -> Result<()> {
         let mut peers = self.mailbox_peers.lock().await;
-        peers.retain(|p| p != peer_id);
+        peers.retain(|p| p.peer_id != peer_id);
         self.store.save_mailbox_peers(&peers)?;
+        self.links.set_pool(peer_ids(&peers)).await;
         Ok(())
     }
 
-    pub async fn ping_mailbox(&self, peer_id: &str) -> Result<u64> {
-        let local_id = self.transport.create_identity().await?;
-        let endpoint = self.transport.endpoint_for(&local_id).await?;
-        let started = std::time::Instant::now();
-        let result = super::mailbox::MailboxClient::ping(&endpoint, peer_id).await;
-        let elapsed = started.elapsed().as_millis() as u64;
-        // 检测是一次性的：端点用完就关，别每点一次攒一个 socket。
+    /// 测速：一次临时身份，并发测所有给定节点（省得每台各建一条连接）。
+    pub async fn ping_mailboxes(&self, peers: &[String]) -> Vec<MailboxPing> {
+        if peers.is_empty() {
+            return Vec::new();
+        }
+        let Ok(local_id) = self.transport.create_identity().await else {
+            return peers
+                .iter()
+                .map(|peer| MailboxPing::failed(peer, "创建拨号身份失败"))
+                .collect();
+        };
+        let endpoint = match self.transport.endpoint_for(&local_id).await {
+            Ok(endpoint) => endpoint,
+            Err(e) => {
+                self.transport.forget(&local_id).await;
+                return peers
+                    .iter()
+                    .map(|peer| MailboxPing::failed(peer, &e.to_string()))
+                    .collect();
+            }
+        };
+
+        let mut set = tokio::task::JoinSet::new();
+        for peer in peers {
+            let endpoint = endpoint.clone();
+            let peer = peer.clone();
+            set.spawn(async move {
+                let started = std::time::Instant::now();
+                match super::mailbox::MailboxClient::ping(&endpoint, &peer).await {
+                    Ok(()) => MailboxPing {
+                        peer_id: peer,
+                        ms: Some(started.elapsed().as_millis() as u64),
+                        error: None,
+                    },
+                    Err(e) => MailboxPing {
+                        peer_id: peer,
+                        ms: None,
+                        error: Some(e.to_string()),
+                    },
+                }
+            });
+        }
+        let mut out = Vec::new();
+        while let Some(res) = set.join_next().await {
+            if let Ok(ping) = res {
+                out.push(ping);
+            }
+        }
         self.transport.forget(&local_id).await;
-        result.map(|_| elapsed)
+        out
+    }
+
+    pub async fn ping_mailbox(&self, peer_id: &str) -> Result<u64> {
+        let pings = self.ping_mailboxes(&[peer_id.to_string()]).await;
+        match pings.into_iter().next() {
+            Some(MailboxPing { ms: Some(ms), .. }) => Ok(ms),
+            Some(MailboxPing { error: Some(e), .. }) => Err(anyhow!(e)),
+            Some(MailboxPing { error: None, .. }) => Err(anyhow!("ping failed")),
+            None => Err(anyhow!("ping failed")),
+        }
+    }
+
+    /// 挑一台信箱建队列：先看优先级，最高的一档里挑延迟最低的。
+    pub async fn pick_mailbox(&self) -> Result<String> {
+        let peers = self.mailbox_peers.lock().await.clone();
+        if peers.is_empty() {
+            return Err(anyhow!("还没有配置信箱节点"));
+        }
+        let top = peers.iter().map(|p| p.priority).max().unwrap_or(0);
+        let candidates: Vec<String> = peers
+            .iter()
+            .filter(|p| p.priority == top)
+            .map(|p| p.peer_id.clone())
+            .collect();
+        if candidates.len() == 1 {
+            return Ok(candidates[0].clone());
+        }
+        // 同优先级：实测一把，取最快的；全失败就退化成第一台。
+        let pings = self.ping_mailboxes(&candidates).await;
+        let latencies: std::collections::HashMap<String, u64> = pings
+            .into_iter()
+            .filter_map(|ping| ping.ms.map(|ms| (ping.peer_id, ms)))
+            .collect();
+        Ok(choose_peer(&peers, &latencies).unwrap_or_else(|| candidates[0].clone()))
     }
 
     pub fn get_auto_lock_minutes(&self) -> Result<u64> {

@@ -33,7 +33,8 @@ export default function MyIdPage({ onClose, onAdded, notify, onScanStateChange }
         notify(t("noMailbox"), "err");
         return;
       }
-      const [id, text] = await api.createConnection(mailboxes[0]);
+      // 不指定信箱：后端按优先级 + 实测延迟自己挑一台。
+      const [id, text] = await api.createConnection(null);
       setConnId(id);
       setMyId(text);
       setQr(await QRCode.toDataURL(text, { width: 220, margin: 1 }));

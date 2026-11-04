@@ -99,7 +99,7 @@ export default function SettingsMain({ notify, onLocked, onOpenMailbox, onOpenOn
                 : mailboxCount === 0
                   ? t("mailboxNone")
                   : locale === "zh"
-                    ? `${mailboxCount} 个节点`
+                    ? `${mailboxCount} 个信箱`
                     : `${mailboxCount} ${mailboxCount === 1 ? "node" : "nodes"}`
             }
             onClick={onOpenMailbox}

@@ -165,8 +165,25 @@ pub(crate) async fn set_onion_config(
 }
 
 #[tauri::command]
-pub(crate) async fn get_mailbox_peers(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+pub(crate) async fn get_mailbox_peers(
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::layers::store::MailboxPeer>, String> {
     Ok(state.require_app()?.get_mailbox_peers().await)
+}
+
+/// 一次给所有信箱测速（并发），返回各自的往返毫秒数。
+#[tauri::command]
+pub(crate) async fn ping_mailboxes(
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::layers::app::MailboxPing>, String> {
+    let app = state.require_app()?;
+    let peers: Vec<String> = app
+        .get_mailbox_peers()
+        .await
+        .into_iter()
+        .map(|peer| peer.peer_id)
+        .collect();
+    Ok(app.ping_mailboxes(&peers).await)
 }
 
 #[tauri::command]
@@ -184,11 +201,25 @@ pub(crate) async fn ping_mailbox(
 #[tauri::command]
 pub(crate) async fn add_mailbox_peer(
     peer_id: String,
+    priority: Option<i64>,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     state
         .require_app()?
-        .add_mailbox_peer(&peer_id)
+        .add_mailbox_peer(&peer_id, priority.unwrap_or(0))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub(crate) async fn set_mailbox_priority(
+    peer_id: String,
+    priority: i64,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    state
+        .require_app()?
+        .set_mailbox_priority(&peer_id, priority)
         .await
         .map_err(|e| e.to_string())
 }
@@ -244,12 +275,12 @@ pub(crate) struct ConnectionMessage {
 /// 新协议：生成邀请（同时在该 mailbox 上创建接收队列）。
 #[tauri::command]
 pub(crate) async fn create_connection(
-    mailbox: String,
+    mailbox: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<(String, String), String> {
     state
         .require_app()?
-        .create_connection(&mailbox)
+        .create_connection(mailbox.as_deref())
         .await
         .map_err(|e| e.to_string())
 }
