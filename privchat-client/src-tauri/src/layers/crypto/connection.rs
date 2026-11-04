@@ -186,6 +186,105 @@ impl Connection {
         Ok(plain)
     }
 
+    /// 序列化会话状态（不含任何长期密钥——本协议就没有长期密钥）。
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(200 + self.skipped.len() * 36);
+        out.push(match self.role {
+            Role::Owner => 0,
+            Role::Joiner => 1,
+        });
+        out.extend_from_slice(&self.own_ek);
+        out.extend_from_slice(&self.own_ek_pub);
+        match self.peer_ek {
+            Some(ek) => {
+                out.push(1);
+                out.extend_from_slice(&ek);
+            }
+            None => out.push(0),
+        }
+        match self.root {
+            Some(root) => {
+                out.push(1);
+                out.extend_from_slice(&root);
+            }
+            None => out.push(0),
+        }
+        out.extend_from_slice(&self.send_ck);
+        out.extend_from_slice(&self.recv_ck);
+        out.extend_from_slice(&self.send_n.to_le_bytes());
+        out.extend_from_slice(&self.recv_n.to_le_bytes());
+        out.extend_from_slice(&(self.skipped.len() as u32).to_le_bytes());
+        for (n, mk) in &self.skipped {
+            out.extend_from_slice(&n.to_le_bytes());
+            out.extend_from_slice(mk);
+        }
+        out
+    }
+
+    /// 反序列化会话状态。
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let mut pos = 0usize;
+        let mut take = |n: usize| -> Result<&[u8]> {
+            let end = pos + n;
+            let slice = bytes
+                .get(pos..end)
+                .ok_or_else(|| anyhow!("truncated connection state"))?;
+            pos = end;
+            Ok(slice)
+        };
+        let role = match *take(1)?.first().unwrap() {
+            0 => Role::Owner,
+            1 => Role::Joiner,
+            _ => return Err(anyhow!("bad role")),
+        };
+        let own_ek: [u8; 32] = take(32)?.try_into().unwrap();
+        let own_ek_pub: [u8; 32] = take(32)?.try_into().unwrap();
+        let peer_ek = if *take(1)?.first().unwrap() == 1 {
+            Some(take(32)?.try_into().unwrap())
+        } else {
+            None
+        };
+        let root = if *take(1)?.first().unwrap() == 1 {
+            Some(take(32)?.try_into().unwrap())
+        } else {
+            None
+        };
+        let send_ck: [u8; 32] = take(32)?.try_into().unwrap();
+        let recv_ck: [u8; 32] = take(32)?.try_into().unwrap();
+        let send_n = u32::from_le_bytes(take(4)?.try_into().unwrap());
+        let recv_n = u32::from_le_bytes(take(4)?.try_into().unwrap());
+        let skipped_len = u32::from_le_bytes(take(4)?.try_into().unwrap()) as usize;
+        if skipped_len > MAX_SKIP as usize {
+            return Err(anyhow!("skipped pool too large"));
+        }
+        let mut skipped = Vec::with_capacity(skipped_len);
+        for _ in 0..skipped_len {
+            let n = u32::from_le_bytes(take(4)?.try_into().unwrap());
+            let mk: [u8; 32] = take(32)?.try_into().unwrap();
+            skipped.push((n, mk));
+        }
+        if pos != bytes.len() {
+            return Err(anyhow!("trailing bytes in connection state"));
+        }
+        let sid = match peer_ek {
+            Some(peer) => session_id(&peer, &own_ek_pub),
+            None => String::new(),
+        };
+        Ok(Self {
+            role,
+            own_ek,
+            own_ek_pub,
+            peer_ek,
+            root,
+            send_ck,
+            recv_ck,
+            send_n,
+            recv_n,
+            skipped,
+            sid,
+        })
+    }
+
     /// 取第 `n` 条消息的密钥：推进接收链，跳过的存池。
     fn message_key(&mut self, n: u32) -> Result<[u8; 32]> {
         if n < self.recv_n {

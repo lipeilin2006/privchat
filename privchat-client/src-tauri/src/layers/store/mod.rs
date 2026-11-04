@@ -26,6 +26,8 @@ use std::sync::Mutex;
 use anyhow::{anyhow, Result};
 use rusqlite::{params, Connection};
 
+pub use connections::ConnRow;
+mod connections;
 mod contacts;
 mod identities;
 mod messages;
@@ -86,6 +88,21 @@ impl Store {
              CREATE TABLE IF NOT EXISTS identity_spk (
                  local_id TEXT PRIMARY KEY,
                  spk_sk BLOB NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS connections (
+                 conn_id TEXT PRIMARY KEY,
+                 name TEXT,
+                 role TEXT NOT NULL,
+                 state TEXT NOT NULL,
+                 in_queue TEXT NOT NULL,
+                 in_mailbox TEXT NOT NULL,
+                 out_queue TEXT,
+                 out_mailbox TEXT,
+                 out_sender_sk BLOB,
+                 owner_sk BLOB NOT NULL,
+                 e2e_state BLOB NOT NULL,
+                 created INTEGER NOT NULL,
+                 last_used INTEGER NOT NULL
              );
              CREATE TABLE IF NOT EXISTS sessions (
                  session_id TEXT PRIMARY KEY,
@@ -236,6 +253,41 @@ mod tests {
         assert!(store.load_history().unwrap().is_empty());
         assert!(store.load_mailbox_peers().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn connections_roundtrip() {
+        let dir = temp_dir("connections");
+        let store = Store::open(&dir, [7u8; 32]).expect("open");
+        let row = ConnRow {
+            conn_id: "c1".into(),
+            name: Some("Alice".into()),
+            role: "owner".into(),
+            state: "invited".into(),
+            in_queue: "00112233445566778899aabbccddeeff".into(),
+            in_mailbox: "mb".into(),
+            out_queue: None,
+            out_mailbox: None,
+            out_sender_sk: None,
+            owner_sk: vec![1u8; 32],
+            e2e_state: vec![2u8; 8],
+            created: 1,
+            last_used: 1,
+        };
+        store.save_connection(&row).expect("save");
+        let loaded = store.load_connections().expect("load");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].conn_id, "c1");
+        assert_eq!(loaded[0].name.as_deref(), Some("Alice"));
+
+        store.rename_connection("c1", Some("Bob")).expect("rename");
+        assert_eq!(
+            store.connection("c1").unwrap().unwrap().name.as_deref(),
+            Some("Bob")
+        );
+
+        store.delete_connection("c1").expect("delete");
+        assert!(store.connection("c1").unwrap().is_none());
     }
 
     #[test]

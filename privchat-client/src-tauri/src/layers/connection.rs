@@ -386,9 +386,42 @@ mod tests {
 
         // owner 用对方的 sender 私钥签名才能写对方的队列。
         let out = owner.out_queue().unwrap().clone();
-        let sig = sign_send(&out.queue_id, b"reply", &SigningKey::from_bytes(&out.sender_sk));
-        let sender_pub: [u8; 32] = *SigningKey::from_bytes(&out.sender_sk).verifying_key().as_bytes();
-        assert!(verify(&sender_pub, DOMAIN_SEND, &out.queue_id, Some(b"reply"), &sig));
+        let sig = sign_send(
+            &out.queue_id,
+            b"reply",
+            &SigningKey::from_bytes(&out.sender_sk),
+        );
+        let sender_pub: [u8; 32] = *SigningKey::from_bytes(&out.sender_sk)
+            .verifying_key()
+            .as_bytes();
+        assert!(verify(
+            &sender_pub,
+            DOMAIN_SEND,
+            &out.queue_id,
+            Some(b"reply"),
+            &sig
+        ));
+    }
+
+    #[test]
+    fn state_serialization_roundtrip() {
+        let (mut owner, invite) = Link::owner(&sample().mailbox);
+        let mut joiner = Link::joiner(&invite).unwrap();
+        let first = joiner.e2e.encrypt(&joiner.opening("bob").unwrap()).unwrap();
+        let plain = owner.e2e.decrypt(&first).unwrap();
+        owner.absorb_opening(&plain).unwrap();
+
+        let mut owner2 =
+            crate::layers::crypto::connection::Connection::from_bytes(&owner.e2e.to_bytes())
+                .unwrap();
+        let mut joiner2 =
+            crate::layers::crypto::connection::Connection::from_bytes(&joiner.e2e.to_bytes())
+                .unwrap();
+
+        let reply = owner2.encrypt(b"after restart").unwrap();
+        assert_eq!(joiner2.decrypt(&reply).unwrap(), b"after restart");
+        let back = joiner2.encrypt(b"me too").unwrap();
+        assert_eq!(owner2.decrypt(&back).unwrap(), b"me too");
     }
 
     #[test]
