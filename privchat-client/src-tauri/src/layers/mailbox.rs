@@ -49,11 +49,11 @@ impl MailboxClient {
                 payload: None,
                 nonce: None,
                 msg: None,
-                            queue: None,
+                queue: None,
                 sender_auth: None,
                 owner_auth: None,
                 sig: None,
-},
+            },
         )
         .await?;
         if response.ok {
@@ -245,6 +245,91 @@ impl MailboxClient {
         } else {
             Err(anyhow!(
                 "mailbox fetch failed: {}",
+                resp.error.unwrap_or_default()
+            ))
+        }
+    }
+    // ---- 单向队列（SimpleX 式） ----
+
+    /// 在 mailbox 上创建接收队列（登记 sender / owner 两把公钥）。
+    pub async fn queue_create(
+        endpoint: &Endpoint,
+        mailbox: &str,
+        queue: &str,
+        sender_auth: &str,
+        owner_auth: &str,
+    ) -> Result<()> {
+        let resp = Self::call(
+            endpoint,
+            mailbox,
+            &MailboxRequest::queue_create(queue, sender_auth, owner_auth),
+        )
+        .await?;
+        if resp.ok {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "queue_create failed: {}",
+                resp.error.unwrap_or_default()
+            ))
+        }
+    }
+
+    /// 向队列投递一条密文（`sig` 覆盖 domain || queue || payload）。
+    pub async fn queue_send(
+        endpoint: &Endpoint,
+        mailbox: &str,
+        queue: &str,
+        payload: Vec<u8>,
+        sig: &str,
+    ) -> Result<()> {
+        let resp = Self::call(
+            endpoint,
+            mailbox,
+            &MailboxRequest::queue_send(queue, payload, sig),
+        )
+        .await?;
+        if resp.ok {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "queue_send failed: {}",
+                resp.error.unwrap_or_default()
+            ))
+        }
+    }
+
+    /// 取走队列里的全部消息（owner 签名）。
+    pub async fn queue_get(
+        endpoint: &Endpoint,
+        mailbox: &str,
+        queue: &str,
+        sig: &str,
+    ) -> Result<Vec<StoredMessage>> {
+        let resp = Self::call(endpoint, mailbox, &MailboxRequest::queue_get(queue, sig)).await?;
+        if resp.ok {
+            Ok(resp.messages.unwrap_or_default())
+        } else {
+            Err(anyhow!(
+                "queue_get failed: {}",
+                resp.error.unwrap_or_default()
+            ))
+        }
+    }
+
+    /// 删除队列（owner 签名）。
+    pub async fn queue_delete(
+        endpoint: &Endpoint,
+        mailbox: &str,
+        queue: &str,
+        sig: &str,
+    ) -> Result<()> {
+        let resp = Self::call(endpoint, mailbox, &MailboxRequest::queue_delete(queue, sig)).await?;
+        if resp.ok {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "queue_delete failed: {}",
                 resp.error.unwrap_or_default()
             ))
         }

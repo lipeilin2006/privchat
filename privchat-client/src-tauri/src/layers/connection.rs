@@ -27,8 +27,11 @@ pub struct Invite {
     pub queue_id: [u8; 16],
     /// 邀请创建方的连接公钥（X25519）。
     pub owner_ek: [u8; 32],
-    /// 允许写这条队列的 sender 公钥（Ed25519）。
-    pub sender_auth: [u8; 32],
+    /// 允许写这条队列的 sender 私钥（Ed25519）。
+    ///
+    /// 邀请本身就是「写权限」：拿到邀请的人才能往这条队列投递；
+    /// 交换完成后 owner 可以换掉队列的 sender key 来收回权限。
+    pub sender_sk: [u8; 32],
     /// 可选拨号票据（无 DNS 环境用）。
     pub ticket: Option<String>,
 }
@@ -39,7 +42,7 @@ impl Invite {
         let mut body = Vec::with_capacity(112 + self.ticket.as_ref().map_or(0, |t| t.len() + 2));
         body.extend_from_slice(&self.queue_id);
         body.extend_from_slice(&self.owner_ek);
-        body.extend_from_slice(&self.sender_auth);
+        body.extend_from_slice(&self.sender_sk);
         let mailbox = hex_decode(&self.mailbox).unwrap_or_else(|_| vec![0u8; 32]);
         body.extend_from_slice(&mailbox);
         let ticket = self.ticket.as_deref().unwrap_or_default().as_bytes();
@@ -62,7 +65,7 @@ impl Invite {
         }
         let queue_id: [u8; 16] = bytes[..16].try_into().unwrap();
         let owner_ek: [u8; 32] = bytes[16..48].try_into().unwrap();
-        let sender_auth: [u8; 32] = bytes[48..80].try_into().unwrap();
+        let sender_sk: [u8; 32] = bytes[48..80].try_into().unwrap();
         let mailbox_bytes: [u8; 32] = bytes[80..112].try_into().unwrap();
         let ticket_len = u16::from_be_bytes([bytes[112], bytes[113]]) as usize;
         if bytes.len() != 114 + ticket_len {
@@ -80,7 +83,7 @@ impl Invite {
             mailbox: hex_encode(&mailbox_bytes),
             queue_id,
             owner_ek,
-            sender_auth,
+            sender_sk,
             ticket,
         })
     }
@@ -205,7 +208,7 @@ fn hex_val(b: u8) -> Result<u8> {
 pub enum LinkState {
     /// 已发出邀请，等对方首条消息（只有 owner 会停在这里）。
     Invited,
-    /// 已接受邀请，等对方确认（joiner 用）。
+    /// 已接受邀请并建好自己的队列，等对方确认。
     Joining,
     /// 已建立，可以双向收发。
     Established,
@@ -213,10 +216,32 @@ pub enum LinkState {
     Closed,
 }
 
-/// 一条连接：邀请 + 本端队列钥匙 + E2E 会话 + 状态。
+/// 出站队列：对方的入站队列地址，以及写它需要的 sender 私钥。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct OutQueue {
+    pub mailbox: String,
+    pub queue_id: [u8; 16],
+    pub sender_sk: [u8; 32],
+}
+
+/// 首条消息里携带的「我的入站队列」信息（E2E 加密后传输）。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LinkOpening {
+    pub mailbox: String,
+    pub queue_id: [u8; 16],
+    pub sender_sk: [u8; 32],
+}
+
+/// 一条连接：邀请 + 本端入站队列钥匙 + 出站队列 + E2E 会话。
 pub struct Link {
     pub invite: Invite,
-    pub keys: QueueKeys,
+    /// 本端入站队列的 owner 钥匙（读/删用）。
+    pub owner_keys: QueueKeys,
+    /// 本端入站队列地址（= 邀请里的那一条）。
+    pub in_queue: [u8; 16],
+    pub in_mailbox: String,
+    /// 对方的入站队列（拿到 opening 后才有）。
+    pub out: Option<OutQueue>,
     pub e2e: crate::layers::crypto::connection::Connection,
     pub state: LinkState,
 }
@@ -228,18 +253,22 @@ impl Link {
         let keys = QueueKeys::generate();
         let mut queue_id = [0u8; 16];
         rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut queue_id);
-        let sender_pub: [u8; 32] = *keys.sender.verifying_key().as_bytes();
+
         let invite = Invite {
             mailbox: mailbox.to_string(),
             queue_id,
             owner_ek: ek_pub,
-            sender_auth: sender_pub,
+            // 邀请即写权限：私钥交给拿到邀请的人。
+            sender_sk: keys.sender.to_bytes(),
             ticket: None,
         };
         (
             Self {
                 invite: invite.clone(),
-                keys,
+                owner_keys: keys,
+                in_queue: queue_id,
+                in_mailbox: mailbox.to_string(),
+                out: None,
                 e2e,
                 state: LinkState::Invited,
             },
@@ -247,20 +276,54 @@ impl Link {
         )
     }
 
-    /// 邀请接受方：用邀请里的 owner 公钥派生 E2E 会话，并生成自己的队列钥匙。
+    /// 邀请接受方：派生 E2E 会话，生成自己的入站队列，
+    /// 出站队列直接取邀请里的那一条。
     pub fn joiner(invite: &Invite) -> anyhow::Result<Self> {
         let e2e = crate::layers::crypto::connection::Connection::joiner(&invite.owner_ek)?;
+        let keys = QueueKeys::generate();
+        let mut queue_id = [0u8; 16];
+        rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut queue_id);
         Ok(Self {
             invite: invite.clone(),
-            keys: QueueKeys::generate(),
+            owner_keys: keys,
+            in_queue: queue_id,
+            in_mailbox: String::new(),
+            out: Some(OutQueue {
+                mailbox: invite.mailbox.clone(),
+                queue_id: invite.queue_id,
+                sender_sk: invite.sender_sk,
+            }),
             e2e,
             state: LinkState::Joining,
         })
     }
 
-    /// 握手完成（owner 解出首条消息后调用）。
-    pub fn mark_established(&mut self) {
+    /// 首条消息的明文：告诉对方「往哪条队列写、用什么 key」。
+    pub fn opening(&self, mailbox: &str) -> anyhow::Result<Vec<u8>> {
+        Ok(serde_json::to_vec(&LinkOpening {
+            mailbox: mailbox.to_string(),
+            queue_id: self.in_queue,
+            sender_sk: self.owner_keys.sender.to_bytes(),
+        })?)
+    }
+
+    /// owner 解出首条消息后登记对方的队列并转 established。
+    pub fn absorb_opening(&mut self, plain: &[u8]) -> anyhow::Result<()> {
+        let opening: LinkOpening = serde_json::from_slice(plain)?;
+        self.out = Some(OutQueue {
+            mailbox: opening.mailbox,
+            queue_id: opening.queue_id,
+            sender_sk: opening.sender_sk,
+        });
         self.state = LinkState::Established;
+        Ok(())
+    }
+
+    /// 出站队列（还没拿到对方队列时报错）。
+    pub fn out_queue(&self) -> anyhow::Result<&OutQueue> {
+        self.out
+            .as_ref()
+            .ok_or_else(|| anyhow!("peer queue not known yet"))
     }
 }
 
@@ -273,7 +336,7 @@ mod tests {
             mailbox: hex_encode(&[7u8; 32]),
             queue_id: [1u8; 16],
             owner_ek: [2u8; 32],
-            sender_auth: [3u8; 32],
+            sender_sk: [3u8; 32],
             ticket: None,
         }
     }
@@ -302,7 +365,7 @@ mod tests {
     }
 
     #[test]
-    fn link_state_machine() {
+    fn link_handshake_and_opening() {
         let (mut owner, invite) = Link::owner(&sample().mailbox);
         assert_eq!(owner.state, LinkState::Invited);
         assert!(!owner.e2e.is_established());
@@ -310,12 +373,22 @@ mod tests {
         let mut joiner = Link::joiner(&invite).unwrap();
         assert_eq!(joiner.state, LinkState::Joining);
         assert!(joiner.e2e.is_established());
+        assert!(joiner.out_queue().is_ok());
 
-        let first = joiner.e2e.encrypt(b"hello").unwrap();
-        assert_eq!(owner.e2e.decrypt(&first).unwrap(), b"hello");
-        owner.mark_established();
+        // 首条消息 = E2E 加密的 opening。
+        let opening = joiner.opening("bob-mailbox").unwrap();
+        let first = joiner.e2e.encrypt(&opening).unwrap();
+        let plain = owner.e2e.decrypt(&first).unwrap();
+        owner.absorb_opening(&plain).unwrap();
         assert_eq!(owner.state, LinkState::Established);
+        assert_eq!(owner.out_queue().unwrap().mailbox, "bob-mailbox");
         assert_eq!(owner.e2e.session_id(), joiner.e2e.session_id());
+
+        // owner 用对方的 sender 私钥签名才能写对方的队列。
+        let out = owner.out_queue().unwrap().clone();
+        let sig = sign_send(&out.queue_id, b"reply", &SigningKey::from_bytes(&out.sender_sk));
+        let sender_pub: [u8; 32] = *SigningKey::from_bytes(&out.sender_sk).verifying_key().as_bytes();
+        assert!(verify(&sender_pub, DOMAIN_SEND, &out.queue_id, Some(b"reply"), &sig));
     }
 
     #[test]
