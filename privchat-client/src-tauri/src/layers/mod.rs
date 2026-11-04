@@ -18,6 +18,7 @@
 //! ```
 
 pub mod app;
+pub mod connection;
 pub mod crypto;
 pub mod mailbox;
 pub mod store;
