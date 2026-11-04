@@ -496,7 +496,11 @@ async fn cmd_ping(home: &Path, mailbox: &str, from: Option<&str>) -> Result<()> 
             payload: None,
             nonce: None,
             msg: None,
-        },
+                    queue: None,
+            sender_auth: None,
+            owner_auth: None,
+            sig: None,
+},
     )
     .await;
     endpoint.close().await;

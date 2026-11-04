@@ -271,6 +271,147 @@ async fn handle_request(
         Op::Fetch => handle_fetch(handler, remote_id, req).await,
         Op::Sync => handle_sync(handler, req).await,
         Op::SyncAck => handle_sync_ack(handler, req).await,
+        Op::QueueCreate => handle_queue_create(handler, req).await,
+        Op::QueueSend => handle_queue_send(handler, req).await,
+        Op::QueueGet => handle_queue_get(handler, req).await,
+        Op::QueueDelete => handle_queue_delete(handler, req).await,
+    }
+}
+
+/// 队列操作的签名域分隔。
+const QUEUE_SEND_DOMAIN: &[u8] = b"privchat/queue/send/v1";
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for i in (0..bytes.len()).step_by(2) {
+        out.push((hex_val(bytes[i])? << 4) | hex_val(bytes[i + 1])?);
+    }
+    Some(out)
+}
+
+/// 用 Ed25519 公钥（32B）验签；`msg` 由调用方拼好域分隔。
+fn verify_sig(pubkey: &[u8], msg: &[u8], sig_hex: &str) -> bool {
+    let Ok(pk) = <[u8; 32]>::try_from(pubkey) else {
+        return false;
+    };
+    let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(&pk) else {
+        return false;
+    };
+    let Some(sig_bytes) = hex_decode(sig_hex) else {
+        return false;
+    };
+    let Ok(sig_arr) = <[u8; 64]>::try_from(sig_bytes.as_slice()) else {
+        return false;
+    };
+    let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
+    vk.verify_strict(msg, &sig).is_ok()
+}
+
+/// 创建接收队列：先到先得，已存在直接拒绝。
+async fn handle_queue_create(handler: &MailboxHandler, req: MailboxRequest) -> MailboxResponse {
+    let (Some(queue), Some(sender_auth), Some(owner_auth)) =
+        (req.queue, req.sender_auth, req.owner_auth)
+    else {
+        return err("queue_create missing fields");
+    };
+    if queue.len() != 32 || sender_auth.len() != 64 || owner_auth.len() != 64 {
+        return err("queue_create: bad field length");
+    }
+    let (Some(sender), Some(owner)) = (hex_decode(&sender_auth), hex_decode(&owner_auth)) else {
+        return err("queue_create: bad hex");
+    };
+    match handler
+        .store
+        .create_queue(&queue, &sender, &owner, now_ms())
+        .await
+    {
+        Ok(true) => ok(),
+        Ok(false) => err("queue exists"),
+        Err(e) => err(&format!("queue_create failed: {e}")),
+    }
+}
+
+/// 投递：发送方必须用队列登记的 sender key 对 `domain || queue || payload` 签名。
+async fn handle_queue_send(handler: &MailboxHandler, req: MailboxRequest) -> MailboxResponse {
+    let (Some(queue), Some(payload), Some(sig)) = (req.queue, req.payload, req.sig) else {
+        return err("queue_send missing fields");
+    };
+    let Some((sender_auth, _)) = handler.store.queue_auth(&queue).await.unwrap_or(None) else {
+        return err("queue not found");
+    };
+    let mut msg = QUEUE_SEND_DOMAIN.to_vec();
+    msg.extend_from_slice(queue.as_bytes());
+    msg.extend_from_slice(&payload);
+    if !verify_sig(&sender_auth, &msg, &sig) {
+        return err("queue_send: bad signature");
+    }
+    match handler.store.push_queue(&queue, &payload, now_ms()).await {
+        Ok(_) => ok(),
+        Err(e) => err(&format!("queue_send failed: {e}")),
+    }
+}
+
+/// 取走：只有 owner key 能取（签名覆盖 `domain || queue`）。
+async fn handle_queue_get(handler: &MailboxHandler, req: MailboxRequest) -> MailboxResponse {
+    let (Some(queue), Some(sig)) = (req.queue, req.sig) else {
+        return err("queue_get missing fields");
+    };
+    let Some((_, owner_auth)) = handler.store.queue_auth(&queue).await.unwrap_or(None) else {
+        return err("queue not found");
+    };
+    let mut msg = b"privchat/queue/get/v1".to_vec();
+    msg.extend_from_slice(queue.as_bytes());
+    if !verify_sig(&owner_auth, &msg, &sig) {
+        return err("queue_get: bad signature");
+    }
+    match handler.store.take_queue(&queue).await {
+        Ok(rows) => MailboxResponse {
+            ok: true,
+            error: None,
+            messages: Some(
+                rows.into_iter()
+                    .map(|(seq, payload)| StoredMessage {
+                        msg_id: seq.to_string(),
+                        to_peer_id: queue.clone(),
+                        msg: payload,
+                    })
+                    .collect(),
+            ),
+            peers: None,
+        },
+        Err(e) => err(&format!("queue_get failed: {e}")),
+    }
+}
+
+/// 删除队列：owner key 签名。
+async fn handle_queue_delete(handler: &MailboxHandler, req: MailboxRequest) -> MailboxResponse {
+    let (Some(queue), Some(sig)) = (req.queue, req.sig) else {
+        return err("queue_delete missing fields");
+    };
+    let Some((_, owner_auth)) = handler.store.queue_auth(&queue).await.unwrap_or(None) else {
+        return err("queue not found");
+    };
+    let mut msg = b"privchat/queue/delete/v1".to_vec();
+    msg.extend_from_slice(queue.as_bytes());
+    if !verify_sig(&owner_auth, &msg, &sig) {
+        return err("queue_delete: bad signature");
+    }
+    match handler.store.delete_queue(&queue).await {
+        Ok(_) => ok(),
+        Err(e) => err(&format!("queue_delete failed: {e}")),
     }
 }
 
@@ -403,6 +544,10 @@ async fn broadcast(
             ids,
             payload: None,
             nonce: None,
+            queue: None,
+            sender_auth: None,
+            owner_auth: None,
+            sig: None,
         },
     );
 }
@@ -512,6 +657,10 @@ fn spawn_peer_exchange(
                             payload: None,
                             nonce: None,
                             msg: Some(msg.clone()),
+                            queue: None,
+                            sender_auth: None,
+                            owner_auth: None,
+                            sig: None,
                         };
                         let _ = sync_with_retry(&endpoint, peer, &request).await;
                     }

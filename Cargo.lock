@@ -4246,6 +4246,7 @@ name = "privchat-mailbox"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ed25519-dalek",
  "iroh",
  "privchat-common",
  "privchat-onion",

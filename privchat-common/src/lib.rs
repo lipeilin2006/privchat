@@ -78,6 +78,17 @@ pub struct MailboxRequest {
     /// sync 广播的完整消息。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub msg: Option<StoredMessage>,
+    /// 单向队列 id（16 字节，hex）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue: Option<String>,
+    /// 队列创建时登记的 sender 公钥 / owner 公钥（hex）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_auth: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_auth: Option<String>,
+    /// 队列操作签名（hex，Ed25519）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sig: Option<String>,
 }
 
 impl MailboxRequest {
@@ -91,6 +102,82 @@ impl MailboxRequest {
             payload: Some(payload),
             nonce: Some(nonce),
             msg: None,
+            queue: None,
+            sender_auth: None,
+            owner_auth: None,
+            sig: None,
+        }
+    }
+
+    /// 创建接收队列。
+    pub fn queue_create(queue: &str, sender_auth: &str, owner_auth: &str) -> Self {
+        Self {
+            op: Op::QueueCreate,
+            to: None,
+            for_peer: None,
+            id: None,
+            ids: None,
+            payload: None,
+            nonce: None,
+            msg: None,
+            queue: Some(queue.to_string()),
+            sender_auth: Some(sender_auth.to_string()),
+            owner_auth: Some(owner_auth.to_string()),
+            sig: None,
+        }
+    }
+
+    /// 向队列投递（`sig` 覆盖 `queue || payload`）。
+    pub fn queue_send(queue: &str, payload: Vec<u8>, sig: &str) -> Self {
+        Self {
+            op: Op::QueueSend,
+            to: None,
+            for_peer: None,
+            id: None,
+            ids: None,
+            payload: Some(payload),
+            nonce: None,
+            msg: None,
+            queue: Some(queue.to_string()),
+            sender_auth: None,
+            owner_auth: None,
+            sig: Some(sig.to_string()),
+        }
+    }
+
+    /// 取走队列消息（`sig` 覆盖 `queue`）。
+    pub fn queue_get(queue: &str, sig: &str) -> Self {
+        Self {
+            op: Op::QueueGet,
+            to: None,
+            for_peer: None,
+            id: None,
+            ids: None,
+            payload: None,
+            nonce: None,
+            msg: None,
+            queue: Some(queue.to_string()),
+            sender_auth: None,
+            owner_auth: None,
+            sig: Some(sig.to_string()),
+        }
+    }
+
+    /// 删除队列（`sig` 覆盖 `queue`）。
+    pub fn queue_delete(queue: &str, sig: &str) -> Self {
+        Self {
+            op: Op::QueueDelete,
+            to: None,
+            for_peer: None,
+            id: None,
+            ids: None,
+            payload: None,
+            nonce: None,
+            msg: None,
+            queue: Some(queue.to_string()),
+            sender_auth: None,
+            owner_auth: None,
+            sig: Some(sig.to_string()),
         }
     }
 
@@ -105,6 +192,10 @@ impl MailboxRequest {
             payload: None,
             nonce: None,
             msg: None,
+            queue: None,
+            sender_auth: None,
+            owner_auth: None,
+            sig: None,
         }
     }
 
@@ -118,6 +209,10 @@ impl MailboxRequest {
             payload: None,
             nonce: None,
             msg: None,
+            queue: None,
+            sender_auth: None,
+            owner_auth: None,
+            sig: None,
         }
     }
 }
@@ -132,6 +227,14 @@ pub enum Op {
     Peers,
     Sync,
     SyncAck,
+    /// 创建单向接收队列（邀请创建方调用）。
+    QueueCreate,
+    /// 向队列投递一条密文（发送方需用 sender key 签名）。
+    QueueSend,
+    /// 取走队列里的全部消息（只有 owner key 能取）。
+    QueueGet,
+    /// 删除队列及其消息（只有 owner key 能删）。
+    QueueDelete,
 }
 
 /// 节点 → 请求方响应。
@@ -213,7 +316,6 @@ pub async fn make_endpoint(secret_key: iroh::SecretKey) -> Result<Endpoint> {
         .bind()
         .await?)
 }
-
 
 // ===================== 明文填充（抗长度分析） =====================
 //

@@ -49,7 +49,11 @@ impl MailboxClient {
                 payload: None,
                 nonce: None,
                 msg: None,
-            },
+                            queue: None,
+                sender_auth: None,
+                owner_auth: None,
+                sig: None,
+},
         )
         .await?;
         if response.ok {
