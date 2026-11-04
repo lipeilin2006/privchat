@@ -66,3 +66,47 @@ pub(super) fn elect_active(entries: &mut Vec<SessionEntry>) {
         e.active = i == 0;
     }
 }
+
+/// 从数据库恢复全部会话，并按 session_id 选出各自的主会话。
+///
+/// 反序列化失败的条目直接丢弃（例如旧版本状态），不影响其余会话。
+pub(super) fn load_map(
+    store: &crate::layers::store::Store,
+    identities: &HashMap<String, Vec<u8>>,
+) -> HashMap<(String, String), Vec<SessionEntry>> {
+    let mut map: HashMap<(String, String), Vec<SessionEntry>> = HashMap::new();
+    let rows = match store.load_sessions() {
+        Ok(rows) => rows,
+        Err(e) => {
+            eprintln!("[app] failed to load sessions: {e}");
+            return map;
+        }
+    };
+    for (sid, local_id, peer_id, role, active, state) in rows {
+        let Some(secret_bytes) = identities.get(&local_id) else {
+            continue;
+        };
+        let Ok(secret) = iroh::SecretKey::try_from(secret_bytes.as_slice()) else {
+            continue;
+        };
+        let Some(role) = SessionRole::from_str(&role) else {
+            continue;
+        };
+        match crypto::Ratchet::from_bytes(&secret, &peer_id, &state) {
+            Ok(ratchet) => map
+                .entry((local_id, peer_id))
+                .or_default()
+                .push(SessionEntry {
+                    id: sid,
+                    role,
+                    ratchet,
+                    active,
+                }),
+            Err(e) => eprintln!("[app] discarded incompatible session state: {e}"),
+        }
+    }
+    for entries in map.values_mut() {
+        elect_active(entries);
+    }
+    map
+}

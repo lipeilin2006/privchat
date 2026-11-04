@@ -7,7 +7,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Result};
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
 
-use super::session::{session_rows, SessionEntry, SessionMap, SessionRole};
+use super::session::{elect_active, session_rows, SessionEntry, SessionMap, SessionRole};
 use super::*;
 
 /// 发送 worker 所需的最小状态：仅传需要的字段克隆，避免把整个 `App`

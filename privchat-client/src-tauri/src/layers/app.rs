@@ -114,7 +114,7 @@ mod session;
 
 use outbox::{run_send_worker, SendCtx, SendJob};
 use poll::PollApp;
-use session::{elect_active, SessionEntry, SessionMap, SessionRole};
+use session::SessionMap;
 
 type SendQueues = Arc<Mutex<HashMap<(String, String), mpsc::UnboundedSender<SendJob>>>>;
 
@@ -250,38 +250,7 @@ impl App {
         let mailbox_write_count = Arc::new(AtomicUsize::new(store.load_mailbox_write_count()?));
 
         // 会话：从磁盘恢复（需要各专属身份私钥还原 root₀ 与链状态）。
-        let identities = store.load_identities()?;
-        let mut session_map: HashMap<(String, String), Vec<SessionEntry>> = HashMap::new();
-        for (sid, local_id, peer_id, role, active, state) in store.load_sessions()? {
-            let Some(secret_bytes) = identities.get(&local_id) else {
-                continue;
-            };
-            let Ok(secret) = iroh::SecretKey::try_from(secret_bytes.as_slice()) else {
-                continue;
-            };
-            let Some(role) = SessionRole::from_str(&role) else {
-                continue;
-            };
-            match crypto::Ratchet::from_bytes(&secret, &peer_id, &state) {
-                Ok(ratchet) => {
-                    session_map
-                        .entry((local_id, peer_id))
-                        .or_default()
-                        .push(SessionEntry {
-                            id: sid,
-                            role,
-                            ratchet,
-                            active,
-                        })
-                }
-                Err(e) => {
-                    eprintln!("[app] discarded incompatible session state: {e}");
-                }
-            }
-        }
-        for entries in session_map.values_mut() {
-            elect_active(entries);
-        }
+        let session_map = session::load_map(&store, &store.load_identities()?);
         let sessions = Arc::new(Mutex::new(session_map));
         let send_queues = Arc::new(Mutex::new(HashMap::new()));
         let mailbox_poll_started = Arc::new(AtomicBool::new(false));
@@ -609,6 +578,20 @@ impl App {
         Ok(summary)
     }
 
+    /// 为「新联系人」挑一个本端专属身份：
+    /// 优先复用已生成、但还没绑定任何联系人的邀请身份；没有就新建一个。
+    async fn take_local_identity(&self) -> Result<String> {
+        let contacts = self.contacts.lock().await;
+        let mut pending = self.pending.lock().await;
+        let idx = pending
+            .iter()
+            .position(|id| !contacts.values().any(|c| c.local_id == *id));
+        match idx {
+            Some(i) => Ok(pending.remove(i)),
+            None => self.transport.create_identity().await,
+        }
+    }
+
     /// 通过邀请串（纯 peer_id 或完整票据）建立好友关系，返回对方 peer_id。
     ///
     /// 本端为对方生成/复用一个新的专属身份作为本地身份；若已有待绑定邀请
@@ -619,22 +602,7 @@ impl App {
         let (invite_peer, spk, invite_ticket) = crypto::parse_invite(invite)?;
         let _remote = self.transport.parse_peer_id(&invite_peer)?;
 
-        // 复用未被占用的待绑定邀请身份；无则新建。
-        let local_id = {
-            let contacts = self.contacts.lock().await;
-            let mut pending = self.pending.lock().await;
-            let mut idx = None;
-            for (i, id) in pending.iter().enumerate() {
-                if !contacts.values().any(|c| c.local_id == *id) {
-                    idx = Some(i);
-                    break;
-                }
-            }
-            match idx {
-                Some(i) => pending.remove(i),
-                None => self.transport.create_identity().await?,
-            }
-        };
+        let local_id = self.take_local_identity().await?;
 
         // 邀请里带票据就用票据拨号（免 DNS）；否则按 peer_id 走 DNS 发现。
         let dial = invite_ticket.as_deref().unwrap_or(&invite_peer);
