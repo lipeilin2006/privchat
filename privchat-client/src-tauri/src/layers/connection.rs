@@ -19,8 +19,6 @@ const PREFIX: &str = "px1:";
 pub const DOMAIN_SEND: &[u8] = b"privchat/queue/send/v1";
 pub const DOMAIN_GET: &[u8] = b"privchat/queue/get/v1";
 pub const DOMAIN_DELETE: &[u8] = b"privchat/queue/delete/v1";
-/// 换 sender 公钥：签 `queue_id || new_sender_pub`，由 owner 签发。
-pub const DOMAIN_REKEY: &[u8] = b"privchat/queue/rekey/v1";
 
 /// 邀请：告诉对方「往哪条队列写、用什么 key 写、用哪把 E2E 公钥」。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -169,14 +167,6 @@ impl QueueKeys {
     pub fn owner_pub_hex(&self) -> String {
         hex_encode(self.owner.verifying_key().as_bytes())
     }
-}
-
-/// 对「换 sender 公钥」签名（owner 签发，绑定新公钥）。
-pub fn sign_rekey(queue_id: &[u8; 16], new_sender_pub: &[u8], owner: &SigningKey) -> String {
-    let mut msg = DOMAIN_REKEY.to_vec();
-    msg.extend_from_slice(queue_id);
-    msg.extend_from_slice(new_sender_pub);
-    hex_encode(&owner.sign(&msg).to_bytes())
 }
 
 /// 对「往队列写」签名（覆盖 domain || queue_id || payload）。

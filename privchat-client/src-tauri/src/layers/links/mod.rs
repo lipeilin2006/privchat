@@ -34,6 +34,7 @@ pub trait QueueApi: Send + Sync {
         queue: &'a str,
         sender_pub: &'a str,
         owner_pub: &'a str,
+        ttl_ms: Option<u64>,
     ) -> BoxFut<'a, ()>;
 
     fn send<'a>(
@@ -58,16 +59,6 @@ pub trait QueueApi: Send + Sync {
         conn_id: &'a str,
         mailbox: &'a str,
         queue: &'a str,
-        sig: &'a str,
-    ) -> BoxFut<'a, ()>;
-
-    /// 换队列的 sender 公钥（吊销旧邀请）。
-    fn rekey<'a>(
-        &'a self,
-        conn_id: &'a str,
-        mailbox: &'a str,
-        queue: &'a str,
-        sender_pub: &'a str,
         sig: &'a str,
     ) -> BoxFut<'a, ()>;
 }
@@ -175,9 +166,15 @@ impl QueueApi for IrohQueues {
         queue: &'a str,
         sender_pub: &'a str,
         owner_pub: &'a str,
+        ttl_ms: Option<u64>,
     ) -> BoxFut<'a, ()> {
         Box::pin(async move {
-            let req = MailboxRequest::queue_create(queue, sender_pub, owner_pub);
+            let req = match ttl_ms {
+                Some(ttl) if ttl > 0 => {
+                    MailboxRequest::queue_create_invite(queue, sender_pub, owner_pub, ttl)
+                }
+                _ => MailboxRequest::queue_create(queue, sender_pub, owner_pub),
+            };
             let resp = self.call(conn_id, mailbox, &req).await?;
             Self::check(resp, "queue_create").map(|_| ())
         })
@@ -231,21 +228,6 @@ impl QueueApi for IrohQueues {
             Self::check(resp, "queue_delete").map(|_| ())
         })
     }
-
-    fn rekey<'a>(
-        &'a self,
-        conn_id: &'a str,
-        mailbox: &'a str,
-        queue: &'a str,
-        sender_pub: &'a str,
-        sig: &'a str,
-    ) -> BoxFut<'a, ()> {
-        Box::pin(async move {
-            let req = MailboxRequest::queue_rekey(queue, sender_pub, sig);
-            let resp = self.call(conn_id, mailbox, &req).await?;
-            Self::check(resp, "queue_rekey").map(|_| ())
-        })
-    }
 }
 
 pub struct LinkManager {
@@ -256,12 +238,14 @@ pub struct LinkManager {
     pool: Mutex<Vec<String>>,
 }
 
+/// 邀请有效期：10 分钟。轮换出来的队列不带这个限制。
+const INVITE_TTL_MS: u64 = 10 * 60 * 1000;
+
 /// 每多少条消息轮换一次入站队列。
 const ROTATE_EVERY: u32 = 500;
-/// 帧类型：0 = 文本，1 = 队列轮换通知，2 = 换 sender 密钥（吊销邀请）。
+/// 帧类型：0 = 文本，1 = 队列轮换通知。
 const FRAME_TEXT: u8 = 0;
 const FRAME_ROTATE: u8 = 1;
-const FRAME_REVOKE: u8 = 2;
 
 impl LinkManager {
     pub async fn set_pool(&self, mailboxes: Vec<String>) {
@@ -343,6 +327,7 @@ impl LinkManager {
                 &connection::hex_encode(&link.in_queue),
                 &link.owner_keys.sender_pub_hex(),
                 &link.owner_keys.owner_pub_hex(),
+                Some(INVITE_TTL_MS),
             )
             .await?;
         self.persist(&conn_id, &link)?;
@@ -435,6 +420,7 @@ impl LinkManager {
                 &connection::hex_encode(&queue_id),
                 &keys.sender_pub_hex(),
                 &keys.owner_pub_hex(),
+                None,
             )
             .await?;
 
@@ -505,63 +491,6 @@ impl LinkManager {
             link.user_rotate = true;
         }
         self.maybe_rotate(conn_id).await
-    }
-
-    /// 吊销邀请：换掉本端入站队列的 sender 私钥，旧邀请立刻失效。
-    ///
-    /// 1) 先用 owner 签名在节点上换登记的公钥（旧写权限到此为止）
-    /// 2) 再通过 E2E 把新私钥告诉对方，对方的出站队列换新钥匙
-    pub async fn revoke_invite(&self, conn_id: &str) -> Result<()> {
-        let mut links = self.links.lock().await;
-        let link = links
-            .get_mut(conn_id)
-            .ok_or_else(|| anyhow!("unknown connection {conn_id}"))?;
-        let out = link
-            .out
-            .clone()
-            .ok_or_else(|| anyhow!("connection not paired yet"))?;
-
-        let new_keys = QueueKeys::generate();
-        let new_sender_pub_hex = new_keys.sender_pub_hex();
-        let new_sender_pub = connection::hex_decode(&new_sender_pub_hex)?;
-
-        // 1) 节点侧换公钥
-        let owner_sig =
-            connection::sign_rekey(&link.in_queue, &new_sender_pub, &link.owner_keys.owner);
-        self.api
-            .rekey(
-                conn_id,
-                &link.in_mailbox,
-                &connection::hex_encode(&link.in_queue),
-                &new_sender_pub_hex,
-                &owner_sig,
-            )
-            .await?;
-
-        // 2) 通过旧出站队列把新私钥交给对方（E2E 加密，中继看不到）
-        let mut frame = Vec::with_capacity(33);
-        frame.push(FRAME_REVOKE);
-        frame.extend_from_slice(&new_keys.sender.to_bytes());
-        let blob = link.e2e.encrypt(&privchat_common::pad_plaintext(&frame))?;
-        let sig = connection::sign_send(
-            &out.queue_id,
-            &blob,
-            &SigningKey::from_bytes(&out.sender_sk),
-        );
-        self.api
-            .send(
-                conn_id,
-                &out.mailbox,
-                &connection::hex_encode(&out.queue_id),
-                blob,
-                &sig,
-            )
-            .await?;
-
-        // 3) 本地也换成新钥匙
-        link.owner_keys.sender = new_keys.sender;
-        self.persist(conn_id, link)?;
-        Ok(())
     }
 
     /// 取走并解密本连接入站队列（含轮换中的旧队列）的全部消息。
@@ -657,17 +586,6 @@ impl LinkManager {
                     }
                     Err(e) => eprintln!("[links] bad rotate frame: {e}"),
                 },
-                Some(FRAME_REVOKE) => {
-                    // 对方换了入站队列的写密钥，本端跟着换。
-                    if plain.len() >= 33 {
-                        if let Ok(bytes) = <[u8; 32]>::try_from(&plain[1..33]) {
-                            if let Some(out) = link.out.as_mut() {
-                                out.sender_sk = bytes;
-                            }
-                            self.persist(conn_id, link)?;
-                        }
-                    }
-                }
                 _ => eprintln!("[links] unknown frame type"),
             }
         }

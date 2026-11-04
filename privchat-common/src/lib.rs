@@ -71,6 +71,9 @@ pub struct MailboxRequest {
     /// 队列读/删的签名（hex）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sig: Option<String>,
+    /// 队列的邀请有效期（毫秒，0/缺省 = 长期）。只对建队列有意义。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_ms: Option<u64>,
     /// `QueueSend` 的密文消息体。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload: Option<Vec<u8>>,
@@ -84,6 +87,7 @@ impl Default for MailboxRequest {
             sender_auth: None,
             owner_auth: None,
             sig: None,
+            ttl_ms: None,
             payload: None,
         }
     }
@@ -95,7 +99,20 @@ impl MailboxRequest {
         Self::default()
     }
 
-    /// 创建接收队列。
+    /// 建队列并设置邀请有效期（毫秒；0 = 长期）。
+    pub fn queue_create_invite(
+        queue: &str,
+        sender_auth: &str,
+        owner_auth: &str,
+        ttl_ms: u64,
+    ) -> Self {
+        Self {
+            ttl_ms: Some(ttl_ms),
+            ..Self::queue_create(queue, sender_auth, owner_auth)
+        }
+    }
+
+    /// 创建接收队列（长期有效）。
     pub fn queue_create(queue: &str, sender_auth: &str, owner_auth: &str) -> Self {
         Self {
             op: Op::QueueCreate,
@@ -127,17 +144,6 @@ impl MailboxRequest {
         }
     }
 
-    /// 换 sender 公钥（`sig` 覆盖 `queue || new_sender_pub`，由 owner 签发）。
-    pub fn queue_rekey(queue: &str, sender_auth: &str, sig: &str) -> Self {
-        Self {
-            op: Op::QueueRekey,
-            queue: Some(queue.to_string()),
-            sender_auth: Some(sender_auth.to_string()),
-            sig: Some(sig.to_string()),
-            ..Self::default()
-        }
-    }
-
     /// 取走队列消息（`sig` 覆盖 `queue`）。
     pub fn queue_get(queue: &str, sig: &str) -> Self {
         Self {
@@ -161,8 +167,6 @@ pub enum Op {
     QueueGet,
     /// 删除队列及其消息（只有 owner key 能删）。
     QueueDelete,
-    /// 换掉队列的 sender 公钥（只有 owner key 能换），用于吊销旧邀请。
-    QueueRekey,
 }
 
 /// 节点 → 请求方响应。

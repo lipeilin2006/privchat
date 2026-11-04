@@ -62,7 +62,8 @@ impl MailboxStore {
                  queue_id TEXT PRIMARY KEY,
                  sender_auth BLOB NOT NULL,
                  owner_auth BLOB NOT NULL,
-                 created INTEGER NOT NULL
+                 created INTEGER NOT NULL,
+                 expires INTEGER NOT NULL DEFAULT 0
              );
              CREATE TABLE IF NOT EXISTS queue_msgs (
                  queue_id TEXT NOT NULL,
@@ -73,6 +74,18 @@ impl MailboxStore {
              );
 ",
         )?;
+        // 旧库补 expires 列（0 = 永不过期，老队列照旧能用）。
+        let has_expires: i64 = conn.query_row(
+            "SELECT count(*) FROM pragma_table_info('queues') WHERE name = 'expires'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_expires == 0 {
+            conn.execute(
+                "ALTER TABLE queues ADD COLUMN expires INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             path,
@@ -90,6 +103,7 @@ impl MailboxStore {
         sender_auth: &[u8],
         owner_auth: &[u8],
         now: u64,
+        expires: u64,
     ) -> Result<bool> {
         let conn = self.conn.lock().await;
         let queues: i64 = conn.query_row("SELECT COUNT(*) FROM queues", [], |row| row.get(0))?;
@@ -100,9 +114,15 @@ impl MailboxStore {
             ));
         }
         let inserted = conn.execute(
-            "INSERT OR IGNORE INTO queues (queue_id, sender_auth, owner_auth, created)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![queue_id, sender_auth, owner_auth, now as i64],
+            "INSERT OR IGNORE INTO queues (queue_id, sender_auth, owner_auth, created, expires)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                queue_id,
+                sender_auth,
+                owner_auth,
+                now as i64,
+                expires as i64
+            ],
         )?;
         Ok(inserted == 1)
     }
@@ -120,23 +140,18 @@ impl MailboxStore {
         Ok(row)
     }
 
-    /// 换掉队列登记的 sender 公钥（吊销旧邀请时用）。
-    pub(crate) async fn update_queue_sender(
-        &self,
-        queue_id: &str,
-        sender_auth: &[u8],
-    ) -> Result<usize> {
-        let conn = self.conn.lock().await;
-        let changed = conn.execute(
-            "UPDATE queues SET sender_auth = ?2 WHERE queue_id = ?1",
-            params![queue_id, sender_auth],
-        )?;
-        Ok(changed)
-    }
-
     /// 往队列追加一条密文，返回序号。
     pub(crate) async fn push_queue(&self, queue_id: &str, payload: &[u8], now: u64) -> Result<i64> {
         let conn = self.conn.lock().await;
+        // 邀请有效期：没用过的队列到点就不让写了；写过一次就转成长期可用。
+        let expires: i64 = conn.query_row(
+            "SELECT expires FROM queues WHERE queue_id = ?1",
+            params![queue_id],
+            |row| row.get(0),
+        )?;
+        if expires != 0 && now as i64 > expires {
+            return Err(anyhow!("invite expired"));
+        }
         // 单队列限额：条数 + 总字节（防灌满）
         let (count, bytes): (i64, i64) = conn.query_row(
             "SELECT COUNT(*), COALESCE(SUM(LENGTH(payload)), 0) FROM queue_msgs WHERE queue_id = ?1",
@@ -158,6 +173,12 @@ impl MailboxStore {
             "INSERT INTO queue_msgs (queue_id, seq, payload, time) VALUES (?1, ?2, ?3, ?4)",
             params![queue_id, seq, payload, now as i64],
         )?;
+        if expires != 0 {
+            conn.execute(
+                "UPDATE queues SET expires = 0 WHERE queue_id = ?1",
+                params![queue_id],
+            )?;
+        }
         Ok(seq)
     }
 

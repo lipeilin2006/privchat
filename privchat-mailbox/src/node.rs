@@ -225,7 +225,6 @@ async fn handle_request(handler: &MailboxHandler, payload: &[u8]) -> MailboxResp
         Op::QueueSend => handle_queue_send(handler, req).await,
         Op::QueueGet => handle_queue_get(handler, req).await,
         Op::QueueDelete => handle_queue_delete(handler, req).await,
-        Op::QueueRekey => handle_queue_rekey(handler, req).await,
     }
 }
 
@@ -261,6 +260,7 @@ async fn handle_queue_create(handler: &MailboxHandler, req: MailboxRequest) -> M
     if !handler.create_limiter.allow() {
         return err("queue_create rate limited, retry later");
     }
+    let ttl_ms = req.ttl_ms.unwrap_or(0);
     let (Some(queue), Some(sender_auth), Some(owner_auth)) =
         (req.queue, req.sender_auth, req.owner_auth)
     else {
@@ -274,7 +274,7 @@ async fn handle_queue_create(handler: &MailboxHandler, req: MailboxRequest) -> M
     };
     match handler
         .store
-        .create_queue(&queue, &sender, &owner, now_ms())
+        .create_queue(&queue, &sender, &owner, now_ms(), now_ms() + ttl_ms)
         .await
     {
         Ok(true) => ok(),
@@ -337,36 +337,6 @@ async fn handle_queue_get(handler: &MailboxHandler, req: MailboxRequest) -> Mail
             ),
         },
         Err(e) => err(&format!("queue_get failed: {e}")),
-    }
-}
-
-/// 换 sender 公钥：owner key 签名，签的是「队列 id + 新公钥」，防止被改成别人的。
-async fn handle_queue_rekey(handler: &MailboxHandler, req: MailboxRequest) -> MailboxResponse {
-    let (Some(queue), Some(sender_auth), Some(sig)) = (req.queue, req.sender_auth, req.sig) else {
-        return err("queue_rekey missing fields");
-    };
-    let Some(qid) = queue_bytes(&queue) else {
-        return err("queue_rekey: bad queue id");
-    };
-    if sender_auth.len() != 64 {
-        return err("queue_rekey: bad sender key");
-    }
-    let Ok(new_sender) = hex_decode(&sender_auth) else {
-        return err("queue_rekey: bad hex");
-    };
-    let Some((_, owner_auth)) = handler.store.queue_auth(&queue).await.unwrap_or(None) else {
-        return err("queue not found");
-    };
-    let mut msg = b"privchat/queue/rekey/v1".to_vec();
-    msg.extend_from_slice(&qid);
-    msg.extend_from_slice(&new_sender);
-    if !verify_sig(&owner_auth, &msg, &sig) {
-        return err("queue_rekey: bad signature");
-    }
-    match handler.store.update_queue_sender(&queue, &new_sender).await {
-        Ok(1) => ok(),
-        Ok(_) => err("queue not found"),
-        Err(e) => err(&format!("queue_rekey failed: {e}")),
     }
 }
 

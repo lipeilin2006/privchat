@@ -140,7 +140,7 @@ async fn queue_capacity_limits() {
     let store = MailboxStore::open_with_limits(dir.join("mb.db"), 0, 2, 1024, 10).expect("open");
     let q = "00112233445566778899aabbccddeeff";
     assert!(store
-        .create_queue(q, &[1u8; 32], &[2u8; 32], 0)
+        .create_queue(q, &[1u8; 32], &[2u8; 32], 0, 0)
         .await
         .expect("create"));
     assert!(store.push_queue(q, b"a", 0).await.is_ok());
@@ -167,7 +167,7 @@ async fn purge_expired_removes_old_messages() {
 
     let queue = "00112233445566778899aabbccddeeff";
     store
-        .create_queue(queue, &[1u8; 32], &[2u8; 32], 1_000)
+        .create_queue(queue, &[1u8; 32], &[2u8; 32], 1_000, 0)
         .await
         .expect("create");
     store
@@ -201,7 +201,7 @@ async fn queue_capacity_is_capped() {
     for i in 0..2u8 {
         let q = format!("{:032x}", i);
         assert!(store
-            .create_queue(&q, &[1u8; 32], &[2u8; 32], 1)
+            .create_queue(&q, &[1u8; 32], &[2u8; 32], 1, 0)
             .await
             .expect("create under cap"));
     }
@@ -211,100 +211,50 @@ async fn queue_capacity_is_capped() {
             &[1u8; 32],
             &[2u8; 32],
             1,
+            0,
         )
         .await;
     assert!(over.is_err(), "create beyond cap must be rejected");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// 吊销邀请：owner 换掉 sender 公钥后，旧私钥写不进去，新私钥正常。
+/// 邀请 10 分钟有效期：没写过的队列到点作废，写过一次就转长期。
 #[tokio::test]
-async fn queue_rekey_invalidates_old_sender_key() {
-    let dir = std::env::temp_dir().join(format!("privchat-rekey-{}", std::process::id()));
+async fn invite_expires_after_ten_minutes_unless_used() {
+    let dir = std::env::temp_dir().join(format!("privchat-invite-ttl-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let store = MailboxStore::open(dir.join("mb.db"), 0).expect("open");
-    let handler = MailboxHandler::new(store);
+    let store = MailboxStore::open(dir.join("ttl.db"), 0).expect("open");
 
-    use ed25519_dalek::Signer;
-    let old_sender =
-        ed25519_dalek::SigningKey::from_bytes(&iroh::SecretKey::generate().to_bytes());
-    let new_sender =
-        ed25519_dalek::SigningKey::from_bytes(&iroh::SecretKey::generate().to_bytes());
-    let owner = ed25519_dalek::SigningKey::from_bytes(&iroh::SecretKey::generate().to_bytes());
-    let queue = "101112131415161718191a1b1c1d1e1f";
-    let qid: [u8; 16] = hex_decode(queue).unwrap().as_slice().try_into().unwrap();
+    let used = "aaaabbbbccccddddeeeeffff00001111";
+    store
+        .create_queue(used, &[1u8; 32], &[2u8; 32], 1_000, 1_000 + 600_000)
+        .await
+        .expect("create used queue");
+    // 有效期内写一条
+    store
+        .push_queue(used, b"first", 1_000 + 599_000)
+        .await
+        .expect("write within ttl");
+    // 写过一次之后不再受有效期限制
+    store
+        .push_queue(used, b"later", 1_000 + 10_000_000)
+        .await
+        .expect("activated queue must not expire");
 
-    let resp = handle_request(
-        &handler,
-        &serde_json::to_vec(&MailboxRequest::queue_create(
-            queue,
-            &hex_of(old_sender.verifying_key().as_bytes()),
-            &hex_of(owner.verifying_key().as_bytes()),
-        ))
-        .unwrap(),
-    )
-    .await;
-    assert!(resp.ok, "create: {:?}", resp.error);
+    let unused = "11112222333344445555666677778888";
+    store
+        .create_queue(unused, &[1u8; 32], &[2u8; 32], 1_000, 1_000 + 600_000)
+        .await
+        .expect("create unused queue");
+    let err = store
+        .push_queue(unused, b"late", 1_000 + 600_001)
+        .await
+        .expect_err("unused invite must expire");
+    assert!(
+        err.to_string().contains("invite expired"),
+        "unexpected error: {err}"
+    );
 
-    // owner 签名换公钥：签名必须绑定新公钥，否则能被替换成任意 key。
-    let new_pub = new_sender.verifying_key().as_bytes().to_vec();
-    let mut msg = b"privchat/queue/rekey/v1".to_vec();
-    msg.extend_from_slice(&qid);
-    msg.extend_from_slice(&new_pub);
-    let sig = hex_of(&owner.sign(&msg).to_bytes());
-    let resp = handle_request(
-        &handler,
-        &serde_json::to_vec(&MailboxRequest::queue_rekey(
-            queue,
-            &hex_of(&new_pub),
-            &sig,
-        ))
-        .unwrap(),
-    )
-    .await;
-    assert!(resp.ok, "rekey: {:?}", resp.error);
-
-    // 旧私钥写的消息被拒。
-    let payload = b"old".to_vec();
-    let mut send_msg = b"privchat/queue/send/v1".to_vec();
-    send_msg.extend_from_slice(&qid);
-    send_msg.extend_from_slice(&payload);
-    let old_sig = hex_of(&old_sender.sign(&send_msg).to_bytes());
-    let resp = handle_request(
-        &handler,
-        &serde_json::to_vec(&MailboxRequest::queue_send(queue, payload, &old_sig)).unwrap(),
-    )
-    .await;
-    assert!(!resp.ok, "old sender key must be rejected after rekey");
-
-    // 新私钥可以写。
-    let payload = b"new".to_vec();
-    let mut send_msg = b"privchat/queue/send/v1".to_vec();
-    send_msg.extend_from_slice(&qid);
-    send_msg.extend_from_slice(&payload);
-    let new_sig = hex_of(&new_sender.sign(&send_msg).to_bytes());
-    let resp = handle_request(
-        &handler,
-        &serde_json::to_vec(&MailboxRequest::queue_send(queue, payload, &new_sig)).unwrap(),
-    )
-    .await;
-    assert!(resp.ok, "new sender key should work: {:?}", resp.error);
-
-    // 拿 sender 身份去换公钥应该被拒（只有 owner 能换）。
-    let mut msg = b"privchat/queue/rekey/v1".to_vec();
-    msg.extend_from_slice(&qid);
-    msg.extend_from_slice(&new_pub);
-    let wrong_sig = hex_of(&new_sender.sign(&msg).to_bytes());
-    let resp = handle_request(
-        &handler,
-        &serde_json::to_vec(&MailboxRequest::queue_rekey(
-            queue,
-            &hex_of(&new_pub),
-            &wrong_sig,
-        ))
-        .unwrap(),
-    )
-    .await;
-    assert!(!resp.ok, "only owner may rekey");
+    let _ = std::fs::remove_dir_all(&dir);
 }

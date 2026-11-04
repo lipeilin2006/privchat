@@ -304,7 +304,6 @@ fn build_and_run() {
             set_auto_lock_minutes,
             create_connection,
             accept_connection,
-            revoke_invite,
             send_on_connection,
             poll_connection,
             list_connections,
