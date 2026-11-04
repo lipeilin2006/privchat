@@ -1,0 +1,8 @@
+# Android 15+ 的 16KB page size 设备要求 ELF 段按 16KB 对齐。
+# 不设置时 aarch64 的 .so 是 4KB 对齐，包又开了 extractNativeLibs=false，
+# 在 16KB 设备上会加载失败——表现就是点开图标闪退。
+[target.aarch64-linux-android]
+rustflags = [
+  "-C", "link-arg=-Wl,-z,max-page-size=16384",
+  "-C", "link-arg=-Wl,-z,common-page-size=16384",
+]

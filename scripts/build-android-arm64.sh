@@ -167,10 +167,29 @@ if [ "$NO_SIGN" -eq 0 ]; then
     echo "[build] ERROR: apksigner not found" >&2
     exit 1
   fi
+  # 签名前必须 zipalign：extractNativeLibs=false 的包会把 .so 直接从 apk 映射，
+  # 16KB page 设备要求 16KB 对齐（老设备 4KB 也满足 16KB 边界）。
+  ZIPALIGN="$(dirname "$APKSIGNER")/zipalign"
+  SIGN_SRC="$UNSIGNED"
+  if [ -x "$ZIPALIGN" ]; then
+    ALIGNED="$ARCH_DIR/.privchat-android-arm64-aligned.apk"
+    if ! "$ZIPALIGN" -p -f 16 "$UNSIGNED" "$ALIGNED" 2>/dev/null; then
+      echo "[build] zipalign 16K failed, falling back to 4K" >&2
+      "$ZIPALIGN" -p -f 4 "$UNSIGNED" "$ALIGNED"
+    fi
+    SIGN_SRC="$ALIGNED"
+  else
+    echo "[build] WARN: zipalign not found, apk left unaligned" >&2
+  fi
   echo "[build] signing with $APKSIGNER"
   "$APKSIGNER" sign --ks "$SIGN_KS" --ks-key-alias "$SIGN_ALIAS" \
     --ks-pass "pass:$SIGN_PASS" --key-pass "pass:$SIGN_PASS" \
-    --out "$ARCH_DIR/privchat-android-arm64.apk" "$UNSIGNED"
+    --out "$ARCH_DIR/privchat-android-arm64.apk" "$SIGN_SRC"
+  if [ -n "${ALIGNED:-}" ]; then
+    rm -f "$ALIGNED"
+    "$ZIPALIGN" -c -p 16 "$ARCH_DIR/privchat-android-arm64.apk" >/dev/null 2>&1 \
+      && echo "[build] zipalign: 16K ok" || echo "[build] WARN: apk not 16K aligned" >&2
+  fi
   "$APKSIGNER" verify --print-certs "$ARCH_DIR/privchat-android-arm64.apk" | head -5 || true
   echo "[build] -> $ARCH_DIR/privchat-android-arm64.apk"
 else
