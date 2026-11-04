@@ -270,6 +270,10 @@ const FILE_CHUNK_ONION: usize = 8 * 1024 - 64;
 const FILE_CHUNK_DIRECT: usize = 24 * 1024;
 /// 文件名/MIME 的长度上限。
 const FILE_META_MAX: usize = 64;
+/// 单个文件最多分多少片（防对端用 1 字节分片刷爆计数）。
+const FILE_MAX_CHUNKS: u16 = 1024;
+/// 每条连接同时拼装的文件数上限（4 × 2MB = 8MB 最坏情况）。
+const FILE_MAX_PARTIALS: usize = 4;
 
 /// 收到的消息帧。
 #[derive(Debug)]
@@ -754,35 +758,8 @@ impl LinkManager {
                 },
                 Some(FRAME_FILE) => {
                     if let Some(frame) = parse_file_chunk(&plain[1..]) {
-                        let partial =
-                            link.incoming
-                                .entry(frame.id)
-                                .or_insert_with(|| PartialFile {
-                                    name: String::new(),
-                                    mime: String::new(),
-                                    total: frame.total,
-                                    next: 0,
-                                    data: Vec::new(),
-                                });
-                        if frame.seq == 0 {
-                            partial.name = frame.name;
-                            partial.mime = frame.mime;
-                            partial.total = frame.total;
-                            partial.data.clear();
-                            partial.next = 0;
-                        }
-                        if frame.seq == partial.next {
-                            partial.data.extend_from_slice(&frame.data);
-                            partial.next += 1;
-                        }
-                        if partial.next == partial.total {
-                            if let Some(done) = link.incoming.remove(&frame.id) {
-                                out.push(ReceivedFrame::File {
-                                    name: done.name,
-                                    mime: done.mime,
-                                    data: done.data,
-                                });
-                            }
+                        if let Some(done) = accept_file_chunk(link, frame) {
+                            out.push(done);
                         }
                     }
                 }
@@ -955,6 +932,66 @@ fn draining_from_json(text: &str) -> Vec<DrainingQueue> {
             })
         })
         .collect()
+}
+
+/// 收一片附件：做上限检查，拼完返回整条消息。
+///
+/// 上限：
+/// - 分片数 ≤ FILE_MAX_CHUNKS
+/// - 单文件总字节 ≤ MAX_FILE_BYTES（2MB）
+/// - 每条连接同时拼装 ≤ FILE_MAX_PARTIALS 个文件
+fn accept_file_chunk(link: &mut Link, frame: FileChunk) -> Option<ReceivedFrame> {
+    if frame.total == 0 || frame.total > FILE_MAX_CHUNKS {
+        return None;
+    }
+    if !link.incoming.contains_key(&frame.id) && link.incoming.len() >= FILE_MAX_PARTIALS {
+        eprintln!("[links] too many in-flight files, dropping {}", hex_tag(&frame.id));
+        return None;
+    }
+    let partial = link
+        .incoming
+        .entry(frame.id)
+        .or_insert_with(|| PartialFile {
+            name: String::new(),
+            mime: String::new(),
+            total: frame.total,
+            next: 0,
+            data: Vec::new(),
+        });
+    if frame.seq == 0 {
+        partial.name = frame.name;
+        partial.mime = frame.mime;
+        partial.total = frame.total;
+        partial.data.clear();
+        partial.next = 0;
+    }
+    if frame.seq != partial.next {
+        return None;
+    }
+    if partial.data.len() + frame.data.len() > MAX_FILE_BYTES {
+        eprintln!(
+            "[links] file {} exceeds {} bytes, dropping",
+            hex_tag(&frame.id),
+            MAX_FILE_BYTES
+        );
+        link.incoming.remove(&frame.id);
+        return None;
+    }
+    partial.data.extend_from_slice(&frame.data);
+    partial.next += 1;
+    if partial.next == partial.total {
+        let done = link.incoming.remove(&frame.id)?;
+        return Some(ReceivedFrame::File {
+            name: done.name,
+            mime: done.mime,
+            data: done.data,
+        });
+    }
+    None
+}
+
+fn hex_tag(id: &[u8; 16]) -> String {
+    id.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 struct FileChunk {

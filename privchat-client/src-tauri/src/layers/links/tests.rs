@@ -452,3 +452,65 @@ async fn file_transfer_roundtrip() {
         other => panic!("expected file frame, got {other:?}"),
     }
 }
+
+/// 附件拼装上限：超 2MB、分片过多、同时拼太多，都要被丢掉。
+#[test]
+fn file_assembly_respects_limits() {
+    let (mut link, _invite) = crate::layers::connection::Link::create("mb");
+
+    let frame = |id: [u8; 16], seq: u16, total: u16, len: usize| FileChunk {
+        id,
+        seq,
+        total,
+        name: "x".into(),
+        mime: "application/octet-stream".into(),
+        data: vec![0u8; len],
+    };
+
+    // 1MB × 3 片 = 3MB，超过 2MB 上限 → 拼到第三片时整份丢掉
+    let big = [1u8; 16];
+    assert!(accept_file_chunk(&mut link, frame(big, 0, 3, 1024 * 1024)).is_none());
+    assert!(accept_file_chunk(&mut link, frame(big, 1, 3, 1024 * 1024)).is_none());
+    assert!(accept_file_chunk(&mut link, frame(big, 2, 3, 1024 * 1024)).is_none());
+    assert!(
+        link.incoming.is_empty(),
+        "oversized file must be dropped"
+    );
+
+    // 分片数超上限（1024）直接拒
+    let many = [2u8; 16];
+    assert!(accept_file_chunk(&mut link, frame(many, 0, 2000, 10)).is_none());
+    assert!(link.incoming.is_empty());
+
+    // 同时拼装超过 4 个文件 → 第 5 个被拒
+    for i in 0..4u8 {
+        let mut id = [0u8; 16];
+        id[0] = i;
+        assert!(accept_file_chunk(&mut link, frame(id, 0, 2, 100)).is_none());
+    }
+    assert_eq!(link.incoming.len(), 4);
+    let mut extra = [9u8; 16];
+    extra[0] = 9;
+    assert!(accept_file_chunk(&mut link, frame(extra, 0, 2, 100)).is_none());
+    assert_eq!(link.incoming.len(), 4, "5th partial must be rejected");
+
+    // 清掉之前占位的半截文件，正常的小文件还是能拼完
+    link.incoming.clear();
+    let ok = [7u8; 16];
+    assert!(accept_file_chunk(&mut link, frame(ok, 0, 2, 100)).is_none());
+    assert!(accept_file_chunk(&mut link, frame(ok, 1, 2, 100)).is_some());
+}
+
+/// 发送端也不许超过 2MB。
+#[tokio::test]
+async fn send_file_rejects_oversized() {
+    let api = Arc::new(MemQueues::default());
+    let a = manager(api.clone() as Arc<dyn QueueApi>, "file-big").await;
+    let (_, _invite) = a.create("m1").await.expect("create");
+    // 没配对也会先撞上大小检查
+    let too_big = vec![0u8; MAX_FILE_BYTES + 1];
+    assert!(a
+        .send_file("whatever", "big.bin", "application/octet-stream", &too_big)
+        .await
+        .is_err());
+}
