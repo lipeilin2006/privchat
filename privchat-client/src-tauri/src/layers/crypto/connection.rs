@@ -53,8 +53,9 @@ pub struct Connection {
     own_ek_pub: [u8; 32],
     /// 对端连接公钥（Owner 在收到首条消息后才知道）。
     peer_ek: Option<[u8; 32]>,
-    /// 根密钥；Owner 在握手前为 None。
-    root: Option<[u8; 32]>,
+    /// 是否已完成配对。**不保留 root**：派生完两条链就丢弃，
+    /// 这样拿到会话状态也无法反推历史消息（前向保密）。
+    established: bool,
     send_ck: [u8; 32],
     recv_ck: [u8; 32],
     send_n: u32,
@@ -74,7 +75,7 @@ impl Connection {
             own_ek: ek,
             own_ek_pub: ek_pub,
             peer_ek: None,
-            root: None,
+            established: false,
             send_ck: [0u8; 32],
             recv_ck: [0u8; 32],
             send_n: 0,
@@ -92,17 +93,18 @@ impl Connection {
     pub fn pair_with(&mut self, peer_ek_pub: &[u8; 32]) -> Result<()> {
         let root = kdf_root(&dh(&self.own_ek, peer_ek_pub)?);
         let (send_ck, recv_ck) = chains_by_order(&root, &self.own_ek_pub, peer_ek_pub);
-        self.root = Some(root);
         self.peer_ek = Some(*peer_ek_pub);
         self.send_ck = send_ck;
         self.recv_ck = recv_ck;
         self.sid = session_id(&self.own_ek_pub, peer_ek_pub);
+        self.established = true;
+        // root 只在本次调用里用，函数返回即丢弃。
         Ok(())
     }
 
     /// 是否已建立（Owner 收到首条消息前为 false）。
     pub fn is_established(&self) -> bool {
-        self.root.is_some()
+        self.established
     }
 
     /// 会话 ID：两边算出来一致。
@@ -112,7 +114,7 @@ impl Connection {
 
     /// 加密一条消息。
     pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>> {
-        if self.root.is_none() {
+        if !self.established {
             return Err(anyhow!("connection not established yet"));
         }
         let (next_ck, mk) = kdf_ck(&self.send_ck);
@@ -170,6 +172,7 @@ impl Connection {
     /// 序列化会话状态（不含任何长期密钥——本协议就没有长期密钥）。
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(200 + self.skipped.len() * 36);
+        out.push(2); // 状态格式版本
         out.push(match self.role {
             Role::Owner => 0,
             Role::Joiner => 1,
@@ -183,13 +186,7 @@ impl Connection {
             }
             None => out.push(0),
         }
-        match self.root {
-            Some(root) => {
-                out.push(1);
-                out.extend_from_slice(&root);
-            }
-            None => out.push(0),
-        }
+        out.push(u8::from(self.established));
         out.extend_from_slice(&self.send_ck);
         out.extend_from_slice(&self.recv_ck);
         out.extend_from_slice(&self.send_n.to_le_bytes());
@@ -213,6 +210,10 @@ impl Connection {
             pos = end;
             Ok(slice)
         };
+        let version = *take(1)?.first().unwrap();
+        if version != 2 {
+            return Err(anyhow!("unsupported connection state version {version}"));
+        }
         let role = match *take(1)?.first().unwrap() {
             0 => Role::Owner,
             1 => Role::Joiner,
@@ -225,11 +226,7 @@ impl Connection {
         } else {
             None
         };
-        let root = if *take(1)?.first().unwrap() == 1 {
-            Some(take(32)?.try_into().unwrap())
-        } else {
-            None
-        };
+        let established = *take(1)?.first().unwrap() == 1;
         let send_ck: [u8; 32] = take(32)?.try_into().unwrap();
         let recv_ck: [u8; 32] = take(32)?.try_into().unwrap();
         let send_n = u32::from_le_bytes(take(4)?.try_into().unwrap());
@@ -256,7 +253,7 @@ impl Connection {
             own_ek,
             own_ek_pub,
             peer_ek,
-            root,
+            established,
             send_ck,
             recv_ck,
             send_n,
