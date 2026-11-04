@@ -501,11 +501,20 @@ pub async fn run() -> Result<()> {
     // 首次启动兜底：缺失的配置文件落盘，方便用户后续编辑。
     ensure_config_files(&data_dir, ttl_secs, &role)?;
 
-    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+    let mut endpoint_builder = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
         .secret_key(secret_key.clone())
-        .alpns(vec![ALPN.to_vec()])
-        .bind()
-        .await?;
+        .alpns(vec![ALPN.to_vec()]);
+    // 公网部署常用：固定监听地址/端口，客户端可以直接拨。
+    // 不设则随机端口，只能靠 relay + 发现服务找到。
+    if let Ok(bind) = std::env::var("PRIVCHAT_MAILBOX_BIND") {
+        let addr: std::net::SocketAddr = bind
+            .parse()
+            .map_err(|e| anyhow!("PRIVCHAT_MAILBOX_BIND 不是合法地址 {bind}: {e}"))?;
+        endpoint_builder = endpoint_builder
+            .bind_addr(addr)
+            .map_err(|e| anyhow!("bind_addr {addr} 失败: {e}"))?;
+    }
+    let endpoint = endpoint_builder.bind().await?;
 
     let mailbox_handler = MailboxHandler {
         store: store.clone(),
@@ -563,6 +572,9 @@ pub async fn run() -> Result<()> {
     println!("  ttl     : {} secs (0 = never expire)", ttl_secs);
     println!("  data_dir: {}", data_dir.display());
     println!("  role    : {role} (mailbox={serve_mailbox}, onion_relay={serve_onion})");
+    if let Ok(bind) = std::env::var("PRIVCHAT_MAILBOX_BIND") {
+        println!("  bind    : {bind}");
+    }
 
     // 保持进程常驻。
     std::future::pending::<()>().await;

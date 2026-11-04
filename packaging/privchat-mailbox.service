@@ -1,0 +1,34 @@
+[Unit]
+Description=PrivChat mailbox node
+Documentation=https://github.com/lipeilin2006/privchat
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=privchat
+Group=privchat
+EnvironmentFile=-/etc/privchat/mailbox.env
+ExecStart=/usr/local/bin/privchat-mailbox
+Restart=always
+RestartSec=3
+# 数据落在 StateDirectory 里（/var/lib/privchat-mailbox）
+StateDirectory=privchat-mailbox
+StateDirectoryMode=0700
+
+# 只读根 + 私有 tmp，只放开数据目录
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadWritePaths=/var/lib/privchat-mailbox
+
+# 只需要网络 + UDP socket，不要任何特权能力
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target
