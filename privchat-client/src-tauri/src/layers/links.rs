@@ -45,9 +45,9 @@ impl LinkManager {
         })
     }
 
-    /// 建连接：在 mailbox 上创建接收队列，返回邀请串。
-    pub async fn create(&self, mailbox: &str) -> Result<String> {
-        let (link, invite) = Link::owner(mailbox);
+    /// 建连接：在 mailbox 上创建接收队列，返回 `(conn_id, 邀请串)`。
+    pub async fn create(&self, mailbox: &str) -> Result<(String, String)> {
+        let (link, invite) = Link::create(mailbox);
         let endpoint = self.endpoint_for("new").await?;
         MailboxClient::queue_create(
             &endpoint,
@@ -60,38 +60,20 @@ impl LinkManager {
 
         let conn_id = unique_conn_id();
         self.persist(&conn_id, &link)?;
-        self.links.lock().await.insert(conn_id, link);
-        Ok(invite.encode())
+        self.links.lock().await.insert(conn_id.clone(), link);
+        Ok((conn_id, invite.encode()))
     }
 
-    /// 接受邀请：建自己的队列，并把 opening 发到对方队列。
-    pub async fn join(&self, invite_text: &str) -> Result<String> {
-        let invite = Invite::decode(invite_text)?;
-        let mut link = Link::joiner(&invite)?;
-        let endpoint = self.endpoint_for("new").await?;
-        let out = link
-            .out_queue()
-            .map_err(|_| anyhow!("invite has no out queue"))?
-            .clone();
-        let mailbox = out.mailbox.clone();
-        MailboxClient::queue_create(
-            &endpoint,
-            &mailbox,
-            &connection::hex_encode(&link.in_queue),
-            &link.owner_keys.sender_pub_hex(),
-            &link.owner_keys.owner_pub_hex(),
-        )
-        .await?;
-
-        let opening = link.opening(&mailbox)?;
-        let blob = link.e2e.encrypt(&opening)?;
-        send_blob(&endpoint, &out, &blob).await?;
-
-        let conn_id = unique_conn_id();
-        link.state = LinkState::Joining;
-        self.persist(&conn_id, &link)?;
-        self.links.lock().await.insert(conn_id.clone(), link);
-        Ok(conn_id)
+    /// 互扫到对方的邀请后配对。
+    pub async fn accept(&self, conn_id: &str, invite_text: &str) -> Result<()> {
+        let their = Invite::decode(invite_text)?;
+        let mut links = self.links.lock().await;
+        let link = links
+            .get_mut(conn_id)
+            .ok_or_else(|| anyhow!("unknown connection {conn_id}"))?;
+        link.accept(&their)?;
+        self.persist(conn_id, link)?;
+        Ok(())
     }
 
     /// 发一条消息（必须有出站队列）。
@@ -100,7 +82,10 @@ impl LinkManager {
         let link = links
             .get_mut(conn_id)
             .ok_or_else(|| anyhow!("unknown connection {conn_id}"))?;
-        let out = link.out_queue()?.clone();
+        let out = link
+            .out
+            .clone()
+            .ok_or_else(|| anyhow!("connection not paired yet"))?;
         let blob = link.e2e.encrypt(plaintext)?;
         self.persist(conn_id, link)?;
         drop(links);
@@ -135,11 +120,8 @@ impl LinkManager {
         for row in rows {
             match link.e2e.decrypt(&row.msg) {
                 Ok(plain) => {
-                    if state == LinkState::Invited && link.state == LinkState::Invited {
-                        link.absorb_opening(&plain)?;
-                    } else {
-                        out.push(plain);
-                    }
+                    let _ = state;
+                    out.push(plain);
                 }
                 Err(e) => eprintln!("[links] decrypt failed: {e}"),
             }
@@ -163,22 +145,17 @@ impl LinkManager {
 
     fn persist(&self, conn_id: &str, link: &Link) -> Result<()> {
         let (owner_sk, _) = link.owner_keys.to_bytes();
-        let out = link.out_queue().ok();
+        let out = link.out.clone();
         let row = ConnRow {
             conn_id: conn_id.to_string(),
             name: None,
-            role: if link.state == LinkState::Invited {
-                "owner"
-            } else {
-                "joiner"
-            }
-            .to_string(),
+            role: "peer".to_string(),
             state: state_str(link.state).to_string(),
             in_queue: connection::hex_encode(&link.in_queue),
             in_mailbox: link.in_mailbox.clone(),
-            out_queue: out.map(|q| connection::hex_encode(&q.queue_id)),
-            out_mailbox: out.map(|q| q.mailbox.clone()),
-            out_sender_sk: out.map(|q| q.sender_sk.to_vec()),
+            out_queue: out.as_ref().map(|q| connection::hex_encode(&q.queue_id)),
+            out_mailbox: out.as_ref().map(|q| q.mailbox.clone()),
+            out_sender_sk: out.as_ref().map(|q| q.sender_sk.to_vec()),
             owner_sk: owner_sk.to_vec(),
             e2e_state: link.e2e.to_bytes(),
             created: 0,
@@ -218,8 +195,7 @@ async fn send_blob(endpoint: &Endpoint, out: &OutQueue, blob: &[u8]) -> Result<(
 
 fn state_str(state: LinkState) -> &'static str {
     match state {
-        LinkState::Invited => "invited",
-        LinkState::Joining => "joining",
+        LinkState::Pending => "pending",
         LinkState::Established => "established",
         LinkState::Closed => "closed",
     }
@@ -227,8 +203,7 @@ fn state_str(state: LinkState) -> &'static str {
 
 fn state_from_str(s: &str) -> LinkState {
     match s {
-        "invited" => LinkState::Invited,
-        "joining" => LinkState::Joining,
+        "pending" | "invited" | "joining" => LinkState::Pending,
         "established" => LinkState::Established,
         _ => LinkState::Closed,
     }
@@ -260,13 +235,6 @@ fn row_to_link(row: &ConnRow) -> Result<Link> {
         _ => None,
     };
     Ok(Link {
-        invite: Invite {
-            mailbox: row.in_mailbox.clone(),
-            queue_id: in_queue,
-            owner_ek: [0u8; 32],
-            sender_sk: [0u8; 32],
-            ticket: None,
-        },
         owner_keys: QueueKeys::from_bytes([0u8; 32], owner_sk),
         in_queue,
         in_mailbox: row.in_mailbox.clone(),

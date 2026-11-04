@@ -66,11 +66,11 @@ pub struct Connection {
 }
 
 impl Connection {
-    /// 邀请创建方：生成连接密钥，返回 `(自己, 邀请里要带的公钥)`。
-    pub fn owner() -> (Self, [u8; 32]) {
+    /// 生成一对连接密钥，但还不知道对端公钥（等互扫拿到对方的邀请）。
+    pub fn unpaired() -> (Self, [u8; 32]) {
         let (ek, ek_pub) = new_ek();
         let conn = Self {
-            role: Role::Owner,
+            role: Role::Joiner, // 配对后按公钥序决定方向，role 不再参与
             own_ek: ek,
             own_ek_pub: ek_pub,
             peer_ek: None,
@@ -85,24 +85,19 @@ impl Connection {
         (conn, ek_pub)
     }
 
-    /// 邀请接受方：用邀请里的 Owner 公钥派生 root。
-    pub fn joiner(owner_ek_pub: &[u8; 32]) -> Result<Self> {
-        let (ek, ek_pub) = new_ek();
-        let root = kdf_root(&dh(&ek, owner_ek_pub)?);
-        let (send_ck, recv_ck) = chains(&root, Role::Joiner);
-        Ok(Self {
-            role: Role::Joiner,
-            own_ek: ek,
-            own_ek_pub: ek_pub,
-            peer_ek: Some(*owner_ek_pub),
-            root: Some(root),
-            send_ck,
-            recv_ck,
-            send_n: 0,
-            recv_n: 0,
-            skipped: Vec::new(),
-            sid: session_id(owner_ek_pub, &ek_pub),
-        })
+    /// 拿到对方邀请里的连接公钥后完成配对：双方算出的 root 相同。
+    ///
+    /// 互扫场景下两边都主动配对，所以方向按公钥字典序定，
+    /// 不需要「谁先发」的握手消息。
+    pub fn pair_with(&mut self, peer_ek_pub: &[u8; 32]) -> Result<()> {
+        let root = kdf_root(&dh(&self.own_ek, peer_ek_pub)?);
+        let (send_ck, recv_ck) = chains_by_order(&root, &self.own_ek_pub, peer_ek_pub);
+        self.root = Some(root);
+        self.peer_ek = Some(*peer_ek_pub);
+        self.send_ck = send_ck;
+        self.recv_ck = recv_ck;
+        self.sid = session_id(&self.own_ek_pub, peer_ek_pub);
+        Ok(())
     }
 
     /// 是否已建立（Owner 收到首条消息前为 false）。
@@ -157,20 +152,6 @@ impl Connection {
 
     fn decrypt_inner(&mut self, blob: &[u8]) -> Result<Vec<u8>> {
         let hdr = parse_header(blob)?;
-
-        // Owner 首条消息：用对端的连接公钥完成握手。
-        if self.root.is_none() {
-            if self.role != Role::Owner {
-                return Err(anyhow!("only owner can complete handshake"));
-            }
-            let root = kdf_root(&dh(&self.own_ek, &hdr.ek)?);
-            let (send_ck, recv_ck) = chains(&root, Role::Owner);
-            self.root = Some(root);
-            self.send_ck = send_ck;
-            self.recv_ck = recv_ck;
-            self.peer_ek = Some(hdr.ek);
-            self.sid = session_id(&hdr.ek, &self.own_ek_pub);
-        }
 
         let mk = self.message_key(hdr.n)?;
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&mk));
@@ -370,16 +351,17 @@ fn kdf_root(shared: &[u8; 32]) -> [u8; 32] {
     out
 }
 
-/// 按角色分方向：Joiner 发的是 j2o，Owner 发的是 o2j。
-fn chains(root: &[u8; 32], role: Role) -> ([u8; 32], [u8; 32]) {
+/// 按公钥字典序分方向：小者发 j2o，大者发 o2j。
+fn chains_by_order(root: &[u8; 32], own: &[u8; 32], peer: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
     let hk = Hkdf::<Sha256>::new(None, root);
     let mut j2o = [0u8; 32];
     let mut o2j = [0u8; 32];
     hk.expand(INFO_J2O, &mut j2o).expect("hkdf");
     hk.expand(INFO_O2J, &mut o2j).expect("hkdf");
-    match role {
-        Role::Joiner => (j2o, o2j),
-        Role::Owner => (o2j, j2o),
+    if own < peer {
+        (j2o, o2j)
+    } else {
+        (o2j, j2o)
     }
 }
 
@@ -408,30 +390,31 @@ mod tests {
     use super::*;
 
     fn pair() -> (Connection, Connection) {
-        let (owner, owner_pub) = Connection::owner();
-        let joiner = Connection::joiner(&owner_pub).expect("joiner");
-        (owner, joiner)
+        let (mut a, a_pub) = Connection::unpaired();
+        let (mut b, b_pub) = Connection::unpaired();
+        a.pair_with(&b_pub).unwrap();
+        b.pair_with(&a_pub).unwrap();
+        (a, b)
     }
 
     #[test]
-    fn handshake_and_roundtrip() {
-        let (mut owner, mut joiner) = pair();
-        assert!(!owner.is_established());
-        assert!(owner.encrypt(b"too early").is_err());
+    fn pairing_and_roundtrip() {
+        let (mut a, mut b) = pair();
+        assert!(a.is_established());
+        assert_eq!(a.session_id(), b.session_id());
 
-        let first = joiner.encrypt(b"hello").unwrap();
-        assert_eq!(owner.decrypt(&first).unwrap(), b"hello");
-        assert!(owner.is_established());
-        assert_eq!(owner.session_id(), joiner.session_id());
-
-        let reply = owner.encrypt(b"hi back").unwrap();
-        assert_eq!(joiner.decrypt(&reply).unwrap(), b"hi back");
+        // 双方立刻都能发。
+        let m1 = a.encrypt(b"hello").unwrap();
+        assert_eq!(b.decrypt(&m1).unwrap(), b"hello");
+        let m2 = b.encrypt(b"hi back").unwrap();
+        assert_eq!(a.decrypt(&m2).unwrap(), b"hi back");
     }
 
     #[test]
     fn tamper_seal_and_replay_rejected() {
         let (mut owner, mut joiner) = pair();
         let first = joiner.encrypt(b"one").unwrap();
+        let _ = &first;
         let mut bad = first.clone();
         let last = bad.len() - 1;
         bad[last] ^= 1;
@@ -443,9 +426,6 @@ mod tests {
     #[test]
     fn out_of_order_within_window() {
         let (mut owner, mut joiner) = pair();
-        let head = joiner.encrypt(b"init").unwrap();
-        assert_eq!(owner.decrypt(&head).unwrap(), b"init");
-
         let m1 = joiner.encrypt(b"m1").unwrap();
         let m2 = joiner.encrypt(b"m2").unwrap();
         assert_eq!(owner.decrypt(&m2).unwrap(), b"m2");
@@ -456,7 +436,7 @@ mod tests {
     fn third_party_cannot_open() {
         let (_owner, mut joiner) = pair();
         let first = joiner.encrypt(b"secret").unwrap();
-        let (other, _pub) = Connection::owner();
+        let (other, _pub) = Connection::unpaired();
         let mut other = other;
         assert!(other.decrypt(&first).is_err());
     }
