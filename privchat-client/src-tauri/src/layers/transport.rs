@@ -4,7 +4,8 @@
 //! 本层只做一件事：按需创建一条「临时拨号身份」（独立 SecretKey + Endpoint），
 //! 用它去连 mailbox，让节点看到的 TLS 身份随连接变化，减少跨连接关联。
 //!
-//! 身份落库只是为了同一进程内复用；重启后连接会拿新身份。
+//! 身份只在内存里：进程重启后一律换新，不落库、不恢复
+//! （以前每条连接的身份都写进库、启动时全部重建端点，越用越慢）。
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -16,56 +17,35 @@ use tokio::sync::RwLock;
 
 use crate::layers::store::Store;
 
-/// 单个身份：SecretKey + 独立 Endpoint。
+/// 单个身份：独立 Endpoint（密钥用完即弃，不必留）。
 struct Identity {
-    secret: SecretKey,
     endpoint: Endpoint,
 }
 
 /// L1：身份/端点管理器。
 #[derive(Clone)]
 pub struct Transport {
-    store: Arc<Store>,
     use_relay: bool,
     identities: Arc<RwLock<HashMap<String, Arc<Identity>>>>,
 }
 
 impl Transport {
     /// 生产模式：使用 n0 默认 relay（便于 NAT 后拨号）。
-    pub async fn start(store: Arc<Store>) -> Result<Self> {
-        Self::start_inner(store, true).await
+    pub async fn start(_store: Arc<Store>) -> Result<Self> {
+        Self::start_inner(true).await
     }
 
     /// 测试模式：禁用 relay、绑定回环固定端口。
-    pub async fn start_no_relay(store: Arc<Store>) -> Result<Self> {
-        Self::start_inner(store, false).await
+    pub async fn start_no_relay(_store: Arc<Store>) -> Result<Self> {
+        Self::start_inner(false).await
     }
 
-    async fn start_inner(store: Arc<Store>, use_relay: bool) -> Result<Self> {
-        let transport = Self {
-            store,
+    async fn start_inner(use_relay: bool) -> Result<Self> {
+        // 身份是临时的：这里没有需要恢复的东西。
+        Ok(Self {
             use_relay,
             identities: Arc::new(RwLock::new(HashMap::new())),
-        };
-
-        // 恢复已持久化的身份（并行建端点：每个都要等 relay，串行会累加）。
-        let mut identities = transport.identities.write().await;
-        let mut set = tokio::task::JoinSet::new();
-        for (local_id, secret_bytes) in transport.store.load_identities()? {
-            if let Ok(secret) = SecretKey::try_from(secret_bytes.as_slice()) {
-                set.spawn(async move {
-                    let id = build_identity(secret, use_relay).await?;
-                    Ok::<_, anyhow::Error>((local_id, Arc::new(id)))
-                });
-            }
-        }
-        while let Some(res) = set.join_next().await {
-            if let Ok(Ok((local_id, id))) = res {
-                identities.insert(local_id, id);
-            }
-        }
-        drop(identities);
-        Ok(transport)
+        })
     }
 
     /// 指定身份的 Endpoint（拨号 mailbox 用）。
@@ -78,24 +58,24 @@ impl Transport {
             .ok_or_else(|| anyhow::anyhow!("no identity endpoint for {local_id}"))
     }
 
-    /// 新建一条临时拨号身份，落库后返回 local_id（即 peer_id）。
+    /// 新建一条临时拨号身份，返回 local_id（即 peer_id）。
     pub async fn create_identity(&self) -> Result<String> {
         let secret = SecretKey::generate();
         let local_id = secret.public().to_string();
         let id = build_identity(secret, self.use_relay).await?;
-        self.store.save_identity(
-            &local_id,
-            &id.secret.to_bytes(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0),
-        )?;
         self.identities
             .write()
             .await
             .insert(local_id.clone(), Arc::new(id));
         Ok(local_id)
+    }
+
+    /// 用完即弃：关掉端点并从表里移除（一次性拨号用，别再攒 socket）。
+    pub async fn forget(&self, local_id: &str) {
+        let id = self.identities.write().await.remove(local_id);
+        if let Some(id) = id {
+            id.endpoint.close().await;
+        }
     }
 
     /// 关闭全部端点。
@@ -122,7 +102,7 @@ async fn build_identity(secret: SecretKey, use_relay: bool) -> Result<Identity> 
         // relay 不可达（离线/被墙）时不阻塞启动。
         let _ = tokio::time::timeout(std::time::Duration::from_secs(8), endpoint.online()).await;
     }
-    Ok(Identity { secret, endpoint })
+    Ok(Identity { endpoint })
 }
 
 /// 测试模式下由密钥派生固定端口，保证重启后同一身份仍可拨号。

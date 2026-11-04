@@ -26,7 +26,12 @@ pub(crate) struct MailboxStore {
     max_queue_msgs: usize,
     /// 单队列总字节上限。
     max_queue_bytes: usize,
+    /// 节点上队列总数的上限（空的队列也算，防被人拿 create 刷爆库）。
+    max_queues: usize,
 }
+
+/// 节点默认最多留多少个队列。
+const DEFAULT_MAX_QUEUES: usize = 50_000;
 
 impl std::fmt::Debug for MailboxStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -39,7 +44,7 @@ impl std::fmt::Debug for MailboxStore {
 impl MailboxStore {
     /// 打开（或创建）当前版本 SQLite 库并建立表结构。
     pub(crate) fn open(path: PathBuf, ttl_secs: u64) -> Result<Self> {
-        Self::open_with_limits(path, ttl_secs, 1000, 64 * 1024 * 1024)
+        Self::open_with_limits(path, ttl_secs, 1000, 64 * 1024 * 1024, DEFAULT_MAX_QUEUES)
     }
 
     /// 指定队列限额打开（测试或运营自定义用）。
@@ -48,6 +53,7 @@ impl MailboxStore {
         ttl_secs: u64,
         max_queue_msgs: usize,
         max_queue_bytes: usize,
+        max_queues: usize,
     ) -> Result<Self> {
         let conn = SqlConn::open(&path)?;
         conn.execute_batch(
@@ -73,6 +79,7 @@ impl MailboxStore {
             ttl_secs,
             max_queue_msgs,
             max_queue_bytes,
+            max_queues,
         })
     }
 
@@ -85,6 +92,13 @@ impl MailboxStore {
         now: u64,
     ) -> Result<bool> {
         let conn = self.conn.lock().await;
+        let queues: i64 = conn.query_row("SELECT COUNT(*) FROM queues", [], |row| row.get(0))?;
+        if queues as usize >= self.max_queues {
+            return Err(anyhow!(
+                "node queue capacity reached ({} queues)",
+                self.max_queues
+            ));
+        }
         let inserted = conn.execute(
             "INSERT OR IGNORE INTO queues (queue_id, sender_auth, owner_auth, created)
              VALUES (?1, ?2, ?3, ?4)",
@@ -173,7 +187,7 @@ impl MailboxStore {
         let cutoff = now_ms.saturating_sub(self.ttl_secs * 1000);
         let conn = self.conn.lock().await;
         let deleted = conn.execute(
-            "DELETE FROM messages WHERE time < ?1",
+            "DELETE FROM queue_msgs WHERE time < ?1",
             params![cutoff as i64],
         )?;
         Ok(deleted)

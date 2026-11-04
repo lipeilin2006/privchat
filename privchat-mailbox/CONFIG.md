@@ -59,6 +59,9 @@ P2 设计意图：**首跳中继与终点 mailbox 应由不同运营者部署**�
 | `PRIVCHAT_MAILBOX_TTL_SECS` | 覆盖 `config.json` 的 `ttl_secs` |
 | `PRIVCHAT_MAILBOX_ONION_PEERS` | 洋葱转发白名单（逗号分隔 peer_id）；未设则不限制 |
 
+单队列限额（默认 1000 条 / 64 MiB）与节点队列总数上限（默认 5 万）
+写在代码里；`open_with_limits` 供测试与自建运营自定义。
+
 ## 客户端侧
 
 - 每条队列绑定一台 mailbox；未配置 mailbox 时无法建连接

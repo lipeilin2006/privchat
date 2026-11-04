@@ -91,7 +91,7 @@ impl App {
         let time = now_ms();
         let _ = self.store.append_conn_message(&ConnMessage {
             conn_id: conn_id.to_string(),
-            msg_id: format!("me-{time}"),
+            msg_id: next_msg_id("me", time),
             sender: "me".into(),
             text: text.to_string(),
             time,
@@ -108,7 +108,7 @@ impl App {
             let time = now_ms() + i as u64;
             let _ = self.store.append_conn_message(&ConnMessage {
                 conn_id: conn_id.to_string(),
-                msg_id: format!("peer-{time}"),
+                msg_id: next_msg_id("peer", time),
                 sender: "peer".into(),
                 text: text.clone(),
                 time,
@@ -189,8 +189,11 @@ impl App {
         let local_id = self.transport.create_identity().await?;
         let endpoint = self.transport.endpoint_for(&local_id).await?;
         let started = std::time::Instant::now();
-        super::mailbox::MailboxClient::ping(&endpoint, peer_id).await?;
-        Ok(started.elapsed().as_millis() as u64)
+        let result = super::mailbox::MailboxClient::ping(&endpoint, peer_id).await;
+        let elapsed = started.elapsed().as_millis() as u64;
+        // 检测是一次性的：端点用完就关，别每点一次攒一个 socket。
+        self.transport.forget(&local_id).await;
+        result.map(|_| elapsed)
     }
 
     pub fn get_auto_lock_minutes(&self) -> Result<u64> {
@@ -210,6 +213,13 @@ impl App {
     pub async fn close(&self) {
         self.transport.close().await;
     }
+}
+
+/// 同一毫秒连发两条也不会撞主键：时间戳 + 进程内自增。
+fn next_msg_id(prefix: &str, time: u64) -> String {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{prefix}-{time}-{seq}")
 }
 
 fn now_ms() -> u64 {

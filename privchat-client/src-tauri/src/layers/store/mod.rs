@@ -19,7 +19,6 @@
 //! settings      (key PK, value)                  —— 应用级设置（键值对）
 //! ```
 //!
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -27,7 +26,6 @@ use anyhow::{anyhow, Result};
 use rusqlite::{params, Connection};
 
 mod connections;
-mod identities;
 mod settings;
 
 pub use connections::{ConnMessage, ConnRow};
@@ -51,10 +49,6 @@ impl Store {
              PRAGMA foreign_keys=ON;
              CREATE TABLE IF NOT EXISTS mailbox_peers (
                  peer_id TEXT PRIMARY KEY
-             );
-             CREATE TABLE IF NOT EXISTS identities (
-                 local_id TEXT PRIMARY KEY,
-                 secret BLOB NOT NULL
              );
              CREATE TABLE IF NOT EXISTS connections (
                  conn_id TEXT PRIMARY KEY,
@@ -245,44 +239,6 @@ mod tests {
             store2.load_setting("theme").unwrap().as_deref(),
             Some("light")
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn identities_roundtrip_encrypted_file() {
-        let dir = temp_dir("idents");
-        let store = Store::open(&dir, KEY).expect("open");
-
-        let secret: [u8; 32] = [0x77; 32];
-        store
-            .save_identity("local1", &secret, 1_000)
-            .expect("save identity");
-        store
-            .save_identity("local2", &[0x11; 32], 2_000)
-            .expect("save identity2");
-
-        let loaded = store.load_identities().expect("load identities");
-        assert_eq!(loaded.len(), 2);
-        assert_eq!(loaded["local1"].as_slice(), &secret);
-        assert_eq!(loaded["local2"].as_slice(), &[0x11; 32]);
-
-        store.delete_identity("local1").expect("delete identity");
-        let after = store.load_identities().expect("reload");
-        assert_eq!(after.len(), 1);
-        assert!(after.contains_key("local2"));
-
-        // 落盘不含明文私钥字节（整库加密）。
-        let raw = std::fs::read(dir.join("privchat.db")).unwrap();
-        assert!(
-            !raw.windows(32).any(|w| w == &secret[..]),
-            "plaintext secret must not appear in db file"
-        );
-
-        // 重开后持久化仍在。
-        drop(store);
-        let store2 = Store::open(&dir, KEY).expect("reopen");
-        assert_eq!(store2.load_identities().unwrap().len(), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

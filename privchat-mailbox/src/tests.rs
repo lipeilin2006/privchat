@@ -137,7 +137,7 @@ async fn queue_capacity_limits() {
     let dir = std::env::temp_dir().join(format!("privchat-qcap-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let store = MailboxStore::open_with_limits(dir.join("mb.db"), 0, 2, 1024).expect("open");
+    let store = MailboxStore::open_with_limits(dir.join("mb.db"), 0, 2, 1024, 10).expect("open");
     let q = "00112233445566778899aabbccddeeff";
     assert!(store
         .create_queue(q, &[1u8; 32], &[2u8; 32], 0)
@@ -154,4 +154,65 @@ async fn queue_capacity_limits() {
     let got = store.take_queue(q).await.expect("take");
     assert_eq!(got.len(), 2);
     assert!(store.push_queue(q, b"d", 0).await.is_ok());
+}
+
+/// TTL 清理必须真的删掉队列里的过期密文（表名写错会让它一直静默失败）。
+#[tokio::test]
+async fn purge_expired_removes_old_messages() {
+    let dir = std::env::temp_dir().join(format!("privchat-ttl-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = MailboxStore::open_with_limits(dir.join("ttl.db"), 60, 1000, 1 << 20, 10)
+        .expect("open store");
+
+    let queue = "00112233445566778899aabbccddeeff";
+    store
+        .create_queue(queue, &[1u8; 32], &[2u8; 32], 1_000)
+        .await
+        .expect("create");
+    store
+        .push_queue(queue, b"old", 1_000)
+        .await
+        .expect("push old");
+    store
+        .push_queue(queue, b"fresh", 100_000)
+        .await
+        .expect("push fresh");
+
+    // 60 秒 TTL：把 1 秒时写入的那条清掉，100 秒的那条留下。
+    let removed = store.purge_expired(101_000).await.expect("purge");
+    assert_eq!(removed, 1, "expired message must be deleted");
+
+    let left = store.take_queue(queue).await.expect("take");
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].1, b"fresh");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 队列总数有上限：光刷 create 不能把节点磁盘刷满。
+#[tokio::test]
+async fn queue_capacity_is_capped() {
+    let dir = std::env::temp_dir().join(format!("privchat-qcap-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let store =
+        MailboxStore::open_with_limits(dir.join("q.db"), 0, 1000, 1 << 20, 2).expect("open");
+
+    for i in 0..2u8 {
+        let q = format!("{:032x}", i);
+        assert!(store
+            .create_queue(&q, &[1u8; 32], &[2u8; 32], 1)
+            .await
+            .expect("create under cap"));
+    }
+    let over = store
+        .create_queue(
+            "00000000000000000000000000000009",
+            &[1u8; 32],
+            &[2u8; 32],
+            1,
+        )
+        .await;
+    assert!(over.is_err(), "create beyond cap must be rejected");
+    let _ = std::fs::remove_dir_all(&dir);
 }
