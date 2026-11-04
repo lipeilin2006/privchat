@@ -58,7 +58,7 @@ impl AppState {
         key: [u8; 32],
     ) -> Result<(), String> {
         #[cfg(target_os = "android")]
-        android_ctx::init();
+        crate::android_ctx::init();
         let app = Arc::new(
             App::start(self.data_dir(), key)
                 .await

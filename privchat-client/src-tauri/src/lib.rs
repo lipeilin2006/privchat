@@ -12,7 +12,7 @@ use tauri::Manager;
 use tokio::sync::Mutex;
 
 #[cfg(target_os = "android")]
-mod android_ctx {
+pub(crate) mod android_ctx {
     use std::ffi::c_void;
     use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
     use std::sync::Mutex;
