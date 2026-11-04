@@ -28,7 +28,30 @@ pub(crate) struct Diagnostics {
 
 #[tauri::command]
 pub(crate) async fn vault_status(state: State<'_, AppState>) -> Result<VaultStatus, String> {
+    crate::diag::trace("cmd vault_status");
     Ok(status(&state))
+}
+
+/// 上一轮启动的日志（崩溃现场）；正常退出时为空。
+#[tauri::command]
+pub(crate) fn boot_prev_log() -> String {
+    crate::diag::read_prev()
+}
+
+/// 本轮启动到目前为止的日志。
+#[tauri::command]
+pub(crate) fn boot_current_log() -> String {
+    crate::diag::read_current()
+}
+
+#[tauri::command]
+pub(crate) fn boot_trace(msg: String) {
+    crate::diag::trace(&msg);
+}
+
+#[tauri::command]
+pub(crate) fn boot_prev_log_clear() {
+    crate::diag::clear_prev();
 }
 
 #[tauri::command]
@@ -44,7 +67,7 @@ pub(crate) async fn create_vault(
         return Err("密码不能为空".into());
     }
     let vault = Vault::create(
-        &state.data_dir(),
+        &state.data_dir()?,
         &password,
         crate::layers::vault::DEFAULT_ITERATIONS,
     )
@@ -76,7 +99,7 @@ pub(crate) async fn unlock_vault(
     if !status(&state).initialized {
         return Err("vault not initialized".into());
     }
-    let vault = match Vault::unlock(&state.data_dir(), &password) {
+    let vault = match Vault::unlock(&state.data_dir()?, &password) {
         Ok(vault) => {
             if let Ok(mut guard) = state.unlock_guard.lock() {
                 guard.failures = 0;
@@ -137,7 +160,7 @@ pub(crate) async fn change_vault_password(
         return Err("新密码不能为空".into());
     }
     Vault::change_password_atomic(
-        &state.data_dir(),
+        &state.data_dir()?,
         &old_password,
         &new_password,
         crate::layers::vault::DEFAULT_ITERATIONS,
@@ -347,6 +370,7 @@ pub(crate) async fn rename_connection(
 
 #[tauri::command]
 pub(crate) fn exit_app(app_handle: tauri::AppHandle) {
+    crate::diag::trace("cmd exit_app");
     app_handle.exit(0);
 }
 

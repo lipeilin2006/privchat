@@ -44,6 +44,8 @@ export default function App() {
       } catch {
         setVaultState("locked");
       }
+      // 走到这里说明 UI 真的起来了，下一轮启动就不会误报「上次崩溃」。
+      api.bootTrace("ui mounted").catch(() => {});
     })();
   }, []);
 

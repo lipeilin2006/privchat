@@ -1,6 +1,7 @@
 //! PrivChat 桌面/移动客户端入口：Tauri 应用装配。
 
 pub mod commands;
+pub mod diag;
 pub mod layers;
 pub mod state;
 
@@ -138,9 +139,14 @@ fn resolve_data_dir(app: &tauri::AppHandle) -> Result<PathBuf, Box<dyn std::erro
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    diag::install_panic_hook();
+    diag::trace("run() enter");
     // 提前初始化 ndk_context，避免 iroh 在后台线程 panic（release 为 panic=abort）。
     #[cfg(target_os = "android")]
-    android_ctx::init();
+    {
+        android_ctx::init();
+        diag::trace("ndk_context init");
+    }
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_app::init());
@@ -155,7 +161,10 @@ pub fn run() {
             unlock_guard: std::sync::Mutex::new(UnlockGuard::default()),
         })
         .setup(|app| {
+            diag::trace("setup: resolve data dir");
             let dir = resolve_data_dir(app.handle())?;
+            diag::set_dir(dir.clone());
+            diag::trace(&format!("setup: data_dir={}", dir.display()));
             *app.state::<AppState>().data_dir.lock().unwrap() = Some(dir);
             Ok(())
         })
@@ -181,7 +190,11 @@ pub fn run() {
             list_connections,
             connection_history,
             rename_connection,
-            exit_app
+            exit_app,
+            boot_prev_log,
+            boot_current_log,
+            boot_trace,
+            boot_prev_log_clear
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

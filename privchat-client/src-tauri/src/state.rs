@@ -33,13 +33,14 @@ pub(crate) struct AppState {
 }
 
 impl AppState {
-    /// 取已解析的数据目录（setup 完成后必然已设置）。
-    pub(crate) fn data_dir(&self) -> PathBuf {
+    /// 取已解析的数据目录；setup 还没跑完时返回错误而不是 panic
+    /// （安卓上 WebView 的 JS 有可能比 setup 先跑起来）。
+    pub(crate) fn data_dir(&self) -> Result<PathBuf, String> {
         self.data_dir
             .lock()
-            .unwrap()
+            .map_err(|_| "应用状态异常".to_string())?
             .clone()
-            .expect("data_dir not set")
+            .ok_or_else(|| "应用还没准备好，请重试".to_string())
     }
 
     /// 检查应用层是否已启动；未解锁/未启动时报错，防止在无密钥时误用存储。
@@ -59,8 +60,9 @@ impl AppState {
     ) -> Result<(), String> {
         #[cfg(target_os = "android")]
         crate::android_ctx::init();
+        crate::diag::trace("app: start_with_key");
         let app = Arc::new(
-            App::start(self.data_dir(), key)
+            App::start(self.data_dir()?, key)
                 .await
                 .map_err(|e| e.to_string())?,
         );
@@ -95,7 +97,10 @@ pub(crate) fn status(state: &AppState) -> VaultStatus {
         .map(|until| until.saturating_duration_since(Instant::now()).as_secs())
         .unwrap_or(0);
     VaultStatus {
-        initialized: Vault::is_initialized(&state.data_dir()),
+        initialized: state
+            .data_dir()
+            .map(|dir| Vault::is_initialized(&dir))
+            .unwrap_or(false),
         unlocked: state.require_app().is_ok(),
         locked_until_secs,
     }

@@ -27,6 +27,15 @@ class MainActivity : TauriActivity() {
 
   override fun onWebViewCreate(webView: WebView) {
     super.onWebViewCreate(webView)
+    // 这段是纯布局微调，任何异常都不该让 App 起不来。
+    try {
+      installInsetsListener(webView)
+    } catch (t: Throwable) {
+      android.util.Log.w("privchat", "insets listener skipped", t)
+    }
+  }
+
+  private fun installInsetsListener(webView: WebView) {
     ViewCompat.setOnApplyWindowInsetsListener(webView) { view, insets ->
       val systemBars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
       val imeBottom = insets.getInsets(WindowInsetsCompat.Type.ime()).bottom

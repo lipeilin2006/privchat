@@ -1223,3 +1223,32 @@ body {
 .scroll {
   padding-bottom: 110px;
 }
+
+/* 启动诊断：上一轮崩溃留下的日志，默认折叠 */
+.boot-diag {
+  width: 100%;
+  max-width: 520px;
+  margin-top: 18px;
+  font-size: 12px;
+  color: var(--tg-theme-hint-color, #8a8a8a);
+}
+
+.boot-diag summary {
+  cursor: pointer;
+  user-select: none;
+  padding: 6px 0;
+}
+
+.boot-diag pre {
+  margin: 6px 0 0;
+  padding: 10px;
+  max-height: 40vh;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  border-radius: 10px;
+  background: rgba(127, 127, 127, 0.12);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  line-height: 1.45;
+}
