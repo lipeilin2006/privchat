@@ -1,10 +1,11 @@
-//! 连接管理：把 `connection::Link` 与 mailbox 的队列原语接起来。
+//! 连接管理：把 `connection::Link` 与 mailbox 队列原语接起来。
 //!
-//! 一条连接 = 两条单向队列；本模块负责建队列、发消息、轮询解密与落库。
-//! 队列的读写权限由签名保证，和 TLS 身份无关，所以每个连接用一条**临时**
-//! 拨号身份即可（每次启动重新生成，反而少了长期关联）。
+//! 队列权限靠签名（与 TLS 身份无关），所以网络层被抽成 [`QueueApi`]：
+//! 生产实现走 iroh + mailbox，测试实现走内存。这样连接流程可以离线跑通。
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -18,16 +19,115 @@ use crate::layers::mailbox::MailboxClient;
 use crate::layers::store::{ConnRow, Store};
 use crate::layers::transport::Transport;
 
-pub struct LinkManager {
+pub type BoxFut<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
+
+/// 队列操作的抽象：生产走 mailbox，测试走内存。
+pub trait QueueApi: Send + Sync {
+    fn create<'a>(
+        &'a self,
+        conn_id: &'a str,
+        mailbox: &'a str,
+        queue: &'a str,
+        sender_pub: &'a str,
+        owner_pub: &'a str,
+    ) -> BoxFut<'a, ()>;
+
+    fn send<'a>(
+        &'a self,
+        conn_id: &'a str,
+        mailbox: &'a str,
+        queue: &'a str,
+        payload: Vec<u8>,
+        sig: &'a str,
+    ) -> BoxFut<'a, ()>;
+
+    fn get<'a>(
+        &'a self,
+        conn_id: &'a str,
+        mailbox: &'a str,
+        queue: &'a str,
+        sig: &'a str,
+    ) -> BoxFut<'a, Vec<Vec<u8>>>;
+}
+
+/// 生产实现：每个连接一条临时拨号端点（队列权限靠签名，不靠 TLS 身份）。
+pub struct IrohQueues {
     transport: Transport,
-    store: Arc<Store>,
-    links: Mutex<HashMap<String, Link>>,
-    /// 每个连接一条临时拨号端点（队列权限靠签名，不靠 TLS 身份）。
     endpoints: Mutex<HashMap<String, Endpoint>>,
 }
 
+impl IrohQueues {
+    pub fn new(transport: Transport) -> Self {
+        Self {
+            transport,
+            endpoints: Mutex::new(HashMap::new()),
+        }
+    }
+
+    async fn endpoint(&self, conn_id: &str) -> Result<Endpoint> {
+        let mut map = self.endpoints.lock().await;
+        if let Some(ep) = map.get(conn_id) {
+            return Ok(ep.clone());
+        }
+        let local_id = self.transport.create_identity().await?;
+        let ep = self.transport.endpoint_for(&local_id).await?;
+        map.insert(conn_id.to_string(), ep.clone());
+        Ok(ep)
+    }
+}
+
+impl QueueApi for IrohQueues {
+    fn create<'a>(
+        &'a self,
+        conn_id: &'a str,
+        mailbox: &'a str,
+        queue: &'a str,
+        sender_pub: &'a str,
+        owner_pub: &'a str,
+    ) -> BoxFut<'a, ()> {
+        Box::pin(async move {
+            let ep = self.endpoint(conn_id).await?;
+            MailboxClient::queue_create(&ep, mailbox, queue, sender_pub, owner_pub).await
+        })
+    }
+
+    fn send<'a>(
+        &'a self,
+        conn_id: &'a str,
+        mailbox: &'a str,
+        queue: &'a str,
+        payload: Vec<u8>,
+        sig: &'a str,
+    ) -> BoxFut<'a, ()> {
+        Box::pin(async move {
+            let ep = self.endpoint(conn_id).await?;
+            MailboxClient::queue_send(&ep, mailbox, queue, payload, sig).await
+        })
+    }
+
+    fn get<'a>(
+        &'a self,
+        conn_id: &'a str,
+        mailbox: &'a str,
+        queue: &'a str,
+        sig: &'a str,
+    ) -> BoxFut<'a, Vec<Vec<u8>>> {
+        Box::pin(async move {
+            let ep = self.endpoint(conn_id).await?;
+            let rows = MailboxClient::queue_get(&ep, mailbox, queue, sig).await?;
+            Ok(rows.into_iter().map(|m| m.msg).collect())
+        })
+    }
+}
+
+pub struct LinkManager {
+    store: Arc<Store>,
+    api: Arc<dyn QueueApi>,
+    links: Mutex<HashMap<String, Link>>,
+}
+
 impl LinkManager {
-    pub async fn load(transport: Transport, store: Arc<Store>) -> Result<Self> {
+    pub async fn load(store: Arc<Store>, api: Arc<dyn QueueApi>) -> Result<Self> {
         let mut links = HashMap::new();
         for row in store.load_connections()? {
             match row_to_link(&row) {
@@ -38,33 +138,31 @@ impl LinkManager {
             }
         }
         Ok(Self {
-            transport,
             store,
+            api,
             links: Mutex::new(links),
-            endpoints: Mutex::new(HashMap::new()),
         })
     }
 
     /// 建连接：在 mailbox 上创建接收队列，返回 `(conn_id, 邀请串)`。
     pub async fn create(&self, mailbox: &str) -> Result<(String, String)> {
         let (link, invite) = Link::create(mailbox);
-        let endpoint = self.endpoint_for("new").await?;
-        MailboxClient::queue_create(
-            &endpoint,
-            mailbox,
-            &connection::hex_encode(&link.in_queue),
-            &link.owner_keys.sender_pub_hex(),
-            &link.owner_keys.owner_pub_hex(),
-        )
-        .await?;
-
         let conn_id = unique_conn_id();
+        self.api
+            .create(
+                &conn_id,
+                mailbox,
+                &connection::hex_encode(&link.in_queue),
+                &link.owner_keys.sender_pub_hex(),
+                &link.owner_keys.owner_pub_hex(),
+            )
+            .await?;
         self.persist(&conn_id, &link)?;
         self.links.lock().await.insert(conn_id.clone(), link);
         Ok((conn_id, invite.encode()))
     }
 
-    /// 互扫到对方的邀请后配对。
+    /// 互扫到对方邀请后配对。
     pub async fn accept(&self, conn_id: &str, invite_text: &str) -> Result<()> {
         let their = Invite::decode(invite_text)?;
         let mut links = self.links.lock().await;
@@ -76,7 +174,7 @@ impl LinkManager {
         Ok(())
     }
 
-    /// 发一条消息（必须有出站队列）。
+    /// 发一条消息（必须先配对）。
     pub async fn send(&self, conn_id: &str, plaintext: &[u8]) -> Result<()> {
         let mut links = self.links.lock().await;
         let link = links
@@ -89,49 +187,51 @@ impl LinkManager {
         let blob = link.e2e.encrypt(plaintext)?;
         self.persist(conn_id, link)?;
         drop(links);
-        let endpoint = self.endpoint(conn_id).await?;
-        send_blob(&endpoint, &out, &blob).await
+
+        let sig = connection::sign_send(
+            &out.queue_id,
+            &blob,
+            &SigningKey::from_bytes(&out.sender_sk),
+        );
+        self.api
+            .send(
+                conn_id,
+                &out.mailbox,
+                &connection::hex_encode(&out.queue_id),
+                blob,
+                &sig,
+            )
+            .await
     }
 
     /// 取走并解密本连接入站队列的全部消息。
     pub async fn poll(&self, conn_id: &str) -> Result<Vec<Vec<u8>>> {
-        let (mailbox, queue, sig, state) = {
+        let (mailbox, queue, sig) = {
             let links = self.links.lock().await;
             let link = links
                 .get(conn_id)
                 .ok_or_else(|| anyhow!("unknown connection {conn_id}"))?;
             (
                 link.in_mailbox.clone(),
-                link.in_queue,
+                connection::hex_encode(&link.in_queue),
                 connection::sign_get(&link.in_queue, &link.owner_keys.owner),
-                link.state,
             )
         };
-        let endpoint = self.endpoint(conn_id).await?;
-        let rows =
-            MailboxClient::queue_get(&endpoint, &mailbox, &connection::hex_encode(&queue), &sig)
-                .await?;
+        let blobs = self.api.get(conn_id, &mailbox, &queue, &sig).await?;
 
         let mut out = Vec::new();
         let mut links = self.links.lock().await;
         let link = links
             .get_mut(conn_id)
             .ok_or_else(|| anyhow!("unknown connection {conn_id}"))?;
-        for row in rows {
-            match link.e2e.decrypt(&row.msg) {
-                Ok(plain) => {
-                    let _ = state;
-                    out.push(plain);
-                }
+        for blob in blobs {
+            match link.e2e.decrypt(&blob) {
+                Ok(plain) => out.push(plain),
                 Err(e) => eprintln!("[links] decrypt failed: {e}"),
             }
         }
         self.persist(conn_id, link)?;
         Ok(out)
-    }
-
-    pub async fn ids(&self) -> Vec<String> {
-        self.links.lock().await.keys().cloned().collect()
     }
 
     /// 全部连接：`(conn_id, 备注, 状态)`。
@@ -156,7 +256,6 @@ impl LinkManager {
         self.links.lock().await.get(conn_id).map(|l| l.state)
     }
 
-    /// 给连接备注（只是显示名，不影响任何密钥）。
     pub fn rename(&self, conn_id: &str, name: Option<&str>) -> Result<()> {
         self.store.rename_connection(conn_id, name)
     }
@@ -181,34 +280,6 @@ impl LinkManager {
         };
         self.store.save_connection(&row)
     }
-
-    async fn endpoint_for(&self, _tag: &str) -> Result<Endpoint> {
-        let local_id = self.transport.create_identity().await?;
-        self.transport.endpoint_for(&local_id).await
-    }
-
-    async fn endpoint(&self, conn_id: &str) -> Result<Endpoint> {
-        let mut map = self.endpoints.lock().await;
-        if let Some(ep) = map.get(conn_id) {
-            return Ok(ep.clone());
-        }
-        let local_id = self.transport.create_identity().await?;
-        let ep = self.transport.endpoint_for(&local_id).await?;
-        map.insert(conn_id.to_string(), ep.clone());
-        Ok(ep)
-    }
-}
-
-async fn send_blob(endpoint: &Endpoint, out: &OutQueue, blob: &[u8]) -> Result<()> {
-    let sig = connection::sign_send(&out.queue_id, blob, &SigningKey::from_bytes(&out.sender_sk));
-    MailboxClient::queue_send(
-        endpoint,
-        &out.mailbox,
-        &connection::hex_encode(&out.queue_id),
-        blob.to_vec(),
-        &sig,
-    )
-    .await
 }
 
 fn state_str(state: LinkState) -> &'static str {
@@ -253,9 +324,9 @@ fn row_to_link(row: &ConnRow) -> Result<Link> {
         _ => None,
     };
     Ok(Link {
-        owner_keys: QueueKeys::from_bytes([0u8; 32], owner_sk),
         in_queue,
         in_mailbox: row.in_mailbox.clone(),
+        owner_keys: QueueKeys::from_bytes([0u8; 32], owner_sk),
         out,
         e2e,
         state: state_from_str(&row.state),
@@ -266,4 +337,147 @@ fn unique_conn_id() -> String {
     let mut b = [0u8; 16];
     rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut b);
     connection::hex_encode(&b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layers::store::Store;
+    use std::sync::Mutex as StdMutex;
+
+    #[derive(Default)]
+    struct MemQueues {
+        queues: StdMutex<HashMap<String, MemQueue>>,
+    }
+
+    struct MemQueue {
+        sender_pub: [u8; 32],
+        owner_pub: [u8; 32],
+        msgs: Vec<Vec<u8>>,
+    }
+
+    impl QueueApi for MemQueues {
+        fn create<'a>(
+            &'a self,
+            _conn_id: &'a str,
+            _mailbox: &'a str,
+            queue: &'a str,
+            sender_pub: &'a str,
+            owner_pub: &'a str,
+        ) -> BoxFut<'a, ()> {
+            Box::pin(async move {
+                let sender: [u8; 32] = connection::hex_decode(sender_pub)?
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| anyhow!("bad sender"))?;
+                let owner: [u8; 32] = connection::hex_decode(owner_pub)?
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| anyhow!("bad owner"))?;
+                let mut q = self.queues.lock().unwrap();
+                if q.contains_key(queue) {
+                    return Err(anyhow!("queue exists"));
+                }
+                q.insert(
+                    queue.to_string(),
+                    MemQueue {
+                        sender_pub: sender,
+                        owner_pub: owner,
+                        msgs: Vec::new(),
+                    },
+                );
+                Ok(())
+            })
+        }
+
+        fn send<'a>(
+            &'a self,
+            _conn_id: &'a str,
+            _mailbox: &'a str,
+            queue: &'a str,
+            payload: Vec<u8>,
+            sig: &'a str,
+        ) -> BoxFut<'a, ()> {
+            Box::pin(async move {
+                let qid: [u8; 16] = connection::hex_decode(queue)?
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| anyhow!("bad queue"))?;
+                let mut q = self.queues.lock().unwrap();
+                let item = q.get_mut(queue).ok_or_else(|| anyhow!("no queue"))?;
+                if !connection::verify(
+                    &item.sender_pub,
+                    connection::DOMAIN_SEND,
+                    &qid,
+                    Some(&payload),
+                    sig,
+                ) {
+                    return Err(anyhow!("bad signature"));
+                }
+                item.msgs.push(payload);
+                Ok(())
+            })
+        }
+
+        fn get<'a>(
+            &'a self,
+            _conn_id: &'a str,
+            _mailbox: &'a str,
+            queue: &'a str,
+            sig: &'a str,
+        ) -> BoxFut<'a, Vec<Vec<u8>>> {
+            Box::pin(async move {
+                let qid: [u8; 16] = connection::hex_decode(queue)?
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| anyhow!("bad queue"))?;
+                let mut q = self.queues.lock().unwrap();
+                let item = q.get_mut(queue).ok_or_else(|| anyhow!("no queue"))?;
+                if !connection::verify(&item.owner_pub, connection::DOMAIN_GET, &qid, None, sig) {
+                    return Err(anyhow!("bad signature"));
+                }
+                Ok(std::mem::take(&mut item.msgs))
+            })
+        }
+    }
+
+    async fn manager(api: Arc<dyn QueueApi>, dir: &str) -> LinkManager {
+        let path =
+            std::env::temp_dir().join(format!("privchat-links-{dir}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        let store = Arc::new(Store::open(&path, [3u8; 32]).unwrap());
+        LinkManager::load(store, api).await.expect("load links")
+    }
+
+    fn futures_block_on<F: Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
+    #[tokio::test]
+    async fn mutual_scan_end_to_end() {
+        let api = Arc::new(MemQueues::default());
+        let a = manager(api.clone() as Arc<dyn QueueApi>, "a").await;
+        let b = manager(api as Arc<dyn QueueApi>, "b").await;
+
+        let (a_id, a_invite) = a.create("mb").await.expect("a create");
+        let (b_id, b_invite) = b.create("mb").await.expect("b create");
+        a.accept(&a_id, &b_invite).await.expect("a accept");
+        b.accept(&b_id, &a_invite).await.expect("b accept");
+
+        a.send(&a_id, b"hello from a").await.expect("a send");
+        let got = b.poll(&b_id).await.expect("b poll");
+        assert_eq!(got, vec![b"hello from a".to_vec()]);
+
+        b.send(&b_id, b"hi from b").await.expect("b send");
+        let got = a.poll(&a_id).await.expect("a poll");
+        assert_eq!(got, vec![b"hi from b".to_vec()]);
+
+        // 取回即删。
+        assert!(a.poll(&a_id).await.unwrap().is_empty());
+    }
 }

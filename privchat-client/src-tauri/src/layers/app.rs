@@ -291,8 +291,9 @@ impl App {
         // 会话：从磁盘恢复（需要各专属身份私钥还原 root₀ 与链状态）。
         let session_map = session::load_map(&store, &store.load_identities()?);
         let sessions = Arc::new(Mutex::new(session_map));
+        let queue_api = Arc::new(crate::layers::links::IrohQueues::new(transport.clone()));
         let links = Arc::new(
-            crate::layers::links::LinkManager::load(transport.clone(), store.clone()).await?,
+            crate::layers::links::LinkManager::load(store.clone(), queue_api).await?,
         );
         let send_queues = Arc::new(Mutex::new(HashMap::new()));
         let mailbox_poll_started = Arc::new(AtomicBool::new(false));
