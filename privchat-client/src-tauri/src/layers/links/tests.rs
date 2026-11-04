@@ -99,6 +99,42 @@ impl QueueApi for MemQueues {
         })
     }
 
+    fn rekey<'a>(
+        &'a self,
+        _conn_id: &'a str,
+        _mailbox: &'a str,
+        queue: &'a str,
+        sender_pub: &'a str,
+        sig: &'a str,
+    ) -> BoxFut<'a, ()> {
+        Box::pin(async move {
+            let qid: [u8; 16] = connection::hex_decode(queue)?
+                .as_slice()
+                .try_into()
+                .map_err(|_| anyhow!("bad queue"))?;
+            let new_pub: [u8; 32] = connection::hex_decode(sender_pub)?
+                .as_slice()
+                .try_into()
+                .map_err(|_| anyhow!("bad sender pub"))?;
+            let mut q = self.queues.lock().unwrap();
+            let item = q.get_mut(queue).ok_or_else(|| anyhow!("no queue"))?;
+            let mut msg = connection::DOMAIN_REKEY.to_vec();
+            msg.extend_from_slice(&qid);
+            msg.extend_from_slice(&new_pub);
+            let sig_bytes = connection::hex_decode(sig)?;
+            let sig_arr: [u8; 64] = sig_bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| anyhow!("bad sig"))?;
+            let vk = ed25519_dalek::VerifyingKey::from_bytes(&item.owner_pub)
+                .map_err(|_| anyhow!("bad owner key"))?;
+            vk.verify_strict(&msg, &ed25519_dalek::Signature::from_bytes(&sig_arr))
+                .map_err(|_| anyhow!("bad signature"))?;
+            item.sender_pub = new_pub;
+            Ok(())
+        })
+    }
+
     fn get<'a>(
         &'a self,
         _conn_id: &'a str,
@@ -376,4 +412,34 @@ async fn connection_created_timestamp_survives_reload() {
     let links = reloaded.links.lock().await;
     let link = links.get(&id).expect("link restored");
     assert!(link.created > 0, "created timestamp must be persisted");
+}
+
+/// 吊销邀请：节点上换成新 sender 公钥，旧邀请的私钥立刻写不进去；
+/// 对方收到 E2E 帧后换新钥匙，收发恢复。
+#[tokio::test]
+async fn revoke_invite_invalidates_old_write_key() {
+    let api = Arc::new(MemQueues::default());
+    let a = manager(api.clone() as Arc<dyn QueueApi>, "rev-a").await;
+    let b = manager(api.clone() as Arc<dyn QueueApi>, "rev-b").await;
+
+    let (a_id, a_invite) = a.create("m1").await.expect("a create");
+    let (b_id, b_invite) = b.create("m1").await.expect("b create");
+    a.accept(&a_id, &b_invite).await.expect("a accept");
+    b.accept(&b_id, &a_invite).await.expect("b accept");
+
+    b.send(&b_id, b"before").await.expect("send before revoke");
+    assert_eq!(a.poll(&a_id).await.unwrap(), vec![b"before".to_vec()]);
+
+    a.revoke_invite(&a_id).await.expect("revoke");
+
+    // 对方还没拿到新钥匙：用旧私钥再写会被节点拒绝。
+    assert!(
+        b.send(&b_id, b"stale").await.is_err(),
+        "old sender key must stop working after revoke"
+    );
+
+    // 对方拉一次，收到吊销帧，换上新钥匙后收发恢复。
+    let _ = b.poll(&b_id).await.expect("b poll picks revoke frame");
+    b.send(&b_id, b"after").await.expect("send with new key");
+    assert_eq!(a.poll(&a_id).await.unwrap(), vec![b"after".to_vec()]);
 }

@@ -15,6 +15,7 @@ export const api = {
     invoke("accept_connection", { connId, invite }),
   sendOnConnection: (connId, text) =>
     invoke("send_on_connection", { connId, text }),
+  revokeInvite: (connId) => invoke("revoke_invite", { connId }),
   pollConnection: (connId) => invoke("poll_connection", { connId }),
   listConnections: () => invoke("list_connections"),
   connectionHistory: (connId) => invoke("connection_history", { connId }),

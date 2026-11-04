@@ -359,6 +359,11 @@ impl App {
         self.links.create(&mailbox).await
     }
 
+    /// 吊销邀请：换掉本端入站队列的写密钥，旧邀请立即失效。
+    pub async fn revoke_invite(&self, conn_id: &str) -> Result<()> {
+        self.links.revoke_invite(conn_id).await
+    }
+
     /// 互扫到对方邀请后配对。
     pub async fn accept_connection(&self, conn_id: &str, invite: &str) -> Result<()> {
         self.links.accept(conn_id, invite).await

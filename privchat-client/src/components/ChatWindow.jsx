@@ -1,12 +1,14 @@
 import { useEffect, useRef, useState } from "react";
 import { Placeholder } from "@telegram-apps/telegram-ui";
-import { ArrowLeft, CheckCheck, SendHorizontal } from "lucide-react";
+import { ArrowLeft, CheckCheck, SendHorizontal, ShieldOff } from "lucide-react";
 import wallpaper from "../assets/wallpaper.png";
 import { t } from "../i18n";
 import { avatarColor, fmtTime, initials } from "../utils/format";
 
-export default function ChatWindow({ conversation, messages, onBack, onSend }) {
+export default function ChatWindow({ conversation, messages, onBack, onSend, onRevoke }) {
   const [text, setText] = useState("");
+  const [confirmRevoke, setConfirmRevoke] = useState(false);
+  const [revoking, setRevoking] = useState(false);
   const bodyRef = useRef(null);
 
   useEffect(() => {
@@ -45,7 +47,48 @@ export default function ChatWindow({ conversation, messages, onBack, onSend }) {
           <div className="chat-head-name">{conversation.title}</div>
           <div className="chat-head-sub">{t("online")}</div>
         </div>
+        <button
+          className="round-btn"
+          onClick={() => setConfirmRevoke(true)}
+          aria-label={t("revokeInvite")}
+          title={t("revokeInvite")}
+        >
+          <ShieldOff size={18} />
+        </button>
       </header>
+
+      {confirmRevoke && (
+        <div className="confirm-mask" onClick={() => !revoking && setConfirmRevoke(false)}>
+          <div className="confirm-sheet" onClick={(e) => e.stopPropagation()}>
+            <div className="confirm-title">{t("revokeInvite")}</div>
+            <div className="confirm-text">{t("revokeHint")}</div>
+            <div className="confirm-actions">
+              <button
+                className="confirm-btn"
+                disabled={revoking}
+                onClick={() => setConfirmRevoke(false)}
+              >
+                {t("cancel")}
+              </button>
+              <button
+                className="confirm-btn danger"
+                disabled={revoking}
+                onClick={async () => {
+                  setRevoking(true);
+                  try {
+                    await onRevoke?.();
+                    setConfirmRevoke(false);
+                  } finally {
+                    setRevoking(false);
+                  }
+                }}
+              >
+                {t("confirmOk")}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       <div className="chat-body" ref={bodyRef}>
         {messages.length > 0 && <div className="date-sep">{t("today")}</div>}

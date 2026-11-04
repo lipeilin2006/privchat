@@ -120,6 +120,20 @@ impl MailboxStore {
         Ok(row)
     }
 
+    /// 换掉队列登记的 sender 公钥（吊销旧邀请时用）。
+    pub(crate) async fn update_queue_sender(
+        &self,
+        queue_id: &str,
+        sender_auth: &[u8],
+    ) -> Result<usize> {
+        let conn = self.conn.lock().await;
+        let changed = conn.execute(
+            "UPDATE queues SET sender_auth = ?2 WHERE queue_id = ?1",
+            params![queue_id, sender_auth],
+        )?;
+        Ok(changed)
+    }
+
     /// 往队列追加一条密文，返回序号。
     pub(crate) async fn push_queue(&self, queue_id: &str, payload: &[u8], now: u64) -> Result<i64> {
         let conn = self.conn.lock().await;

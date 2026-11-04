@@ -127,6 +127,17 @@ impl MailboxRequest {
         }
     }
 
+    /// 换 sender 公钥（`sig` 覆盖 `queue || new_sender_pub`，由 owner 签发）。
+    pub fn queue_rekey(queue: &str, sender_auth: &str, sig: &str) -> Self {
+        Self {
+            op: Op::QueueRekey,
+            queue: Some(queue.to_string()),
+            sender_auth: Some(sender_auth.to_string()),
+            sig: Some(sig.to_string()),
+            ..Self::default()
+        }
+    }
+
     /// 取走队列消息（`sig` 覆盖 `queue`）。
     pub fn queue_get(queue: &str, sig: &str) -> Self {
         Self {
@@ -150,6 +161,8 @@ pub enum Op {
     QueueGet,
     /// 删除队列及其消息（只有 owner key 能删）。
     QueueDelete,
+    /// 换掉队列的 sender 公钥（只有 owner key 能换），用于吊销旧邀请。
+    QueueRekey,
 }
 
 /// 节点 → 请求方响应。

@@ -341,6 +341,19 @@ pub(crate) async fn accept_connection(
         .map_err(|e| e.to_string())
 }
 
+/// 吊销邀请：旧二维码/邀请串失效，对方通过 E2E 自动换新钥匙。
+#[tauri::command]
+pub(crate) async fn revoke_invite(
+    conn_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    state
+        .require_app()?
+        .revoke_invite(&conn_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// 新协议：发消息。
 #[tauri::command]
 pub(crate) async fn send_on_connection(

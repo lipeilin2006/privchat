@@ -332,6 +332,14 @@ export default function App() {
                 messages={history[activePeer] || []}
                 onBack={() => setPage("chats")}
                 onSend={(text) => send(activePeer, text)}
+                onRevoke={async () => {
+                  try {
+                    await api.revokeInvite(activePeer);
+                    notify(t("revokeDone"));
+                  } catch (e) {
+                    notify(String(e), "err");
+                  }
+                }}
               />
             )}
 
