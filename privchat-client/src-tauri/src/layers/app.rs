@@ -337,14 +337,9 @@ impl App {
                     self.transport.spk_public(&local_id).await,
                 ) {
                     // 生产邀请不带地址（避免泄漏 IP/relay），靠 DNS 发现。
-                    (Ok(secret), Ok(spk_pk)) => {
-                        let opks = self
-                            .transport
-                            .opks_public(&local_id, 4)
-                            .await
-                            .unwrap_or_default();
-                        crypto::encode_invite(&secret, &spk_pk, None, &opks)
-                    }
+                    // 邀请串要能塞进二维码：只带 IK + SPK + 签名（~176 字符）。
+                    // OPK 公钥不走邀请，留给 mailbox 目录按需取（见 P3）。
+                    (Ok(secret), Ok(spk_pk)) => crypto::encode_invite(&secret, &spk_pk, None, &[]),
                     _ => String::new(),
                 }
             }

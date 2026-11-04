@@ -1,18 +1,18 @@
-//! 邀请串：`pc1:` + hex(IK || SPK || sig || ticket || OPK 列表)。
+//! 邀请串：`pc1:` + base64url(IK || SPK || sig || ticket || OPK 列表)。
 //!
 //! 签名覆盖 `IK || SPK || OPK 列表`，收方验签后即可确认这些密钥都属于该 IK。
 
 use anyhow::{anyhow, Result};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use ed25519_dalek::SigningKey;
-
-use super::hex::{hex_decode, hex_encode};
 
 /// 邀请串前缀。
 const INVITE_PREFIX: &str = "pc1:";
 /// 邀请串签名的域分隔前缀。
 const INFO_INVITE: &[u8] = b"privchat/invite/v1";
 
-/// 邀请串 = `pc1:` + hex(
+/// 邀请串 = `pc1:` + base64url(
 ///   IK(32) || SPK(32) || sig(64) ||
 ///   u16 ticket_len || ticket ||
 ///   u16 opk_count || (u64 id || 32B opk_pub)*
@@ -47,7 +47,7 @@ pub fn encode_invite(
         body.extend_from_slice(&id.to_le_bytes());
         body.extend_from_slice(pk);
     }
-    format!("{INVITE_PREFIX}{}", hex_encode(&body))
+    format!("{INVITE_PREFIX}{}", URL_SAFE_NO_PAD.encode(&body))
 }
 
 /// 解析并验证邀请串，返回 `(peer_id(hex), SPK_pub, ticket, OPK 列表)`。
@@ -58,7 +58,9 @@ pub fn parse_invite(
         .trim()
         .strip_prefix(INVITE_PREFIX)
         .ok_or_else(|| anyhow!("invite must start with {INVITE_PREFIX}"))?;
-    let bytes = hex_decode(raw)?;
+    let bytes = URL_SAFE_NO_PAD
+        .decode(raw)
+        .map_err(|_| anyhow!("invite is not valid base64"))?;
     if bytes.len() < 130 {
         return Err(anyhow!("bad invite length: {}", bytes.len()));
     }
@@ -106,5 +108,5 @@ pub fn parse_invite(
     msg.extend_from_slice(&signed);
     vk.verify_strict(&msg, &ed25519_dalek::Signature::from_bytes(&sig))
         .map_err(|_| anyhow!("invite signature verification failed"))?;
-    Ok((hex_encode(&ik), spk, ticket, opks))
+    Ok((super::hex::hex_encode(&ik), spk, ticket, opks))
 }

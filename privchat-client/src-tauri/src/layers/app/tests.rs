@@ -7,7 +7,9 @@ const TEST_KEY: [u8; 32] = [0x42; 32];
 /// 返回 `(peer_id, invite)`。
 async fn new_invite(app: &App) -> (String, String) {
     let invite = app.self_ticket().await;
-    let (peer, _spk, _, opks) = crypto::parse_invite(&invite).expect("parse invite");
+    let (peer, _spk, _, _) = crypto::parse_invite(&invite).expect("parse invite");
+    // 正式邀请不带 OPK；测试里手动补上，保持 OPK 路径可验证。
+    let opks = app.transport.opks_public(&peer, 4).await.expect("opks");
     let secret = app.transport.secret_for(&peer).await.expect("secret");
     let spk_pk = app.transport.spk_public(&peer).await.expect("spk");
     let ticket = app.transport.ticket_for(&peer).await;
@@ -722,6 +724,24 @@ async fn concurrent_first_send_converges_on_one_active_session() {
     bob.close().await;
     let _ = std::fs::remove_dir_all(&dir_a);
     let _ = std::fs::remove_dir_all(&dir_b);
+}
+
+/// 邀请串长度受二维码约束：只带 IK + SPK + 签名，控制在 200 字符内。
+#[tokio::test]
+async fn invite_fits_in_qr_code() {
+    let dir = std::env::temp_dir().join(format!("privchat-qr-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (app, _rx) = App::start_no_relay(dir.clone(), TEST_KEY)
+        .await
+        .expect("start");
+    let invite = app.self_ticket().await;
+    assert!(
+        invite.len() <= 200,
+        "invite too long for a comfortable QR code: {} chars",
+        invite.len()
+    );
+    app.close().await;
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// OPK 一次性：发起方用掉一把、响应方解出后删掉一把。
