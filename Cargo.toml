@@ -10,7 +10,11 @@
 codegen-units = 1
 lto = true
 opt-level = 3
-panic = "abort"
+# 必须是 unwind，不能是 abort：
+# 1. iroh-dns 在安卓上靠 catch_unwind 兜住「ndk_context 没初始化」的 panic，
+#    换成 abort 就是第一次 DNS 查询直接死；
+# 2. 客户端 run() 也用 catch_unwind 接启动期 panic，弹 Toast 而不是静默闪退。
+panic = "unwind"
 strip = true
 
 [workspace]

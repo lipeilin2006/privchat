@@ -4165,7 +4165,6 @@ dependencies = [
  "iroh",
  "iroh-tickets",
  "jni 0.21.1",
- "ndk-context",
  "pbkdf2",
  "privchat-common",
  "privchat-mailbox",

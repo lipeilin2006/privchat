@@ -19,6 +19,8 @@ pub(crate) mod android_ctx {
     use std::sync::Mutex;
 
     static JAVA_VM: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+    /// `getApplicationContext()` 的全局引用，进程期间一直有效。
+    static APP_CTX: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
     static INIT_DONE: AtomicBool = AtomicBool::new(false);
     static INIT_LOCK: Mutex<()> = Mutex::new(());
 
@@ -32,7 +34,8 @@ pub(crate) mod android_ctx {
         jni::JNIVersion::V6.into()
     }
 
-    /// 幂等地初始化 `ndk_context`；失败可重试。
+    /// 幂等地拿到 application context（给 files_dir / toast 用）。
+    /// 不初始化 ndk_context——那个归 tao。
     pub fn init() {
         if INIT_DONE.load(Ordering::SeqCst) {
             return;
@@ -102,10 +105,84 @@ pub(crate) mod android_ctx {
         let global = Box::new(global);
         let global_ptr = global.as_raw().cast();
         Box::leak(global);
-        unsafe {
-            ndk_context::initialize_android_context(jvm_ptr, global_ptr);
-        }
+        APP_CTX.store(global_ptr, Ordering::SeqCst);
+        // 注意：这里**不能**调 ndk_context::initialize_android_context。
+        // tao 在事件循环里自己会调，而它内部是 assert!(previous.is_none())，
+        // 谁先调第二个人就 panic —— 安卓上一启动就闪退就是这么来的。
+        // tao 初始化之后，iroh 的 DNS 直接用 ndk_context 就好了。
         true
+    }
+
+    /// 应用私有文件目录（`/data/user/0/<包名>/files`）。
+    /// Tauri 的 path 插件拿不到时用它兜底。
+    pub fn files_dir() -> Option<std::path::PathBuf> {
+        let jvm_ptr = JAVA_VM.load(Ordering::SeqCst);
+        let ctx_ptr = APP_CTX.load(Ordering::SeqCst);
+        if jvm_ptr.is_null() || ctx_ptr.is_null() {
+            return None;
+        }
+        let Ok(vm) = (unsafe { jni::JavaVM::from_raw(jvm_ptr.cast()) }) else {
+            return None;
+        };
+        let Ok(mut env) = vm.attach_current_thread() else {
+            return None;
+        };
+        let ctx = unsafe { jni::objects::JObject::from_raw(ctx_ptr.cast()) };
+        let file = env
+            .call_method(&ctx, "getFilesDir", "()Ljava/io/File;", &[])
+            .ok()?
+            .l()
+            .ok()?;
+        let path = env
+            .call_method(&file, "getAbsolutePath", "()Ljava/lang/String;", &[])
+            .ok()?
+            .l()
+            .ok()?;
+        let text: String = env
+            .get_string(&jni::objects::JString::from(path))
+            .ok()?
+            .into();
+        Some(std::path::PathBuf::from(text))
+    }
+
+    /// 用系统 Toast 把一句话显示到屏幕上——启动失败时这是唯一能看见的出口。
+    pub fn toast(msg: &str) {
+        let jvm_ptr = JAVA_VM.load(Ordering::SeqCst);
+        let ctx_ptr = APP_CTX.load(Ordering::SeqCst);
+        if jvm_ptr.is_null() || ctx_ptr.is_null() {
+            return;
+        }
+        let Ok(vm) = (unsafe { jni::JavaVM::from_raw(jvm_ptr.cast()) }) else {
+            return;
+        };
+        let Ok(mut env) = vm.attach_current_thread() else {
+            return;
+        };
+        let ctx = unsafe { jni::objects::JObject::from_raw(ctx_ptr.cast()) };
+        let Ok(text) = env.new_string(msg) else {
+            return;
+        };
+        let Ok(cls) = env.find_class("android/widget/Toast") else {
+            return;
+        };
+        let args = [
+            jni::objects::JValue::Object(&ctx),
+            jni::objects::JValue::Object(&text),
+            jni::objects::JValue::Int(1),
+        ];
+        let Some(toast) = env
+            .call_static_method(
+                cls,
+                "makeText",
+                "(Landroid/content/Context;Ljava/lang/CharSequence;I)Landroid/widget/Toast;",
+                &args,
+            )
+            .ok()
+            .and_then(|v| v.l().ok())
+        else {
+            return;
+        };
+        let _ = env.call_method(&toast, "show", "()V", &[]);
     }
 }
 
@@ -123,7 +200,23 @@ fn resolve_data_dir(app: &tauri::AppHandle) -> Result<PathBuf, Box<dyn std::erro
     let base = {
         #[cfg(mobile)]
         {
-            app.path().app_data_dir()?
+            // app_data_dir 走的是 JNI 里的 path 插件，失败时用 Application
+            // 的 getFilesDir 兜底，别因为拿不到目录就把进程崩了。
+            match app.path().app_data_dir() {
+                Ok(dir) => dir,
+                Err(err) => {
+                    diag::trace(&format!("app_data_dir failed: {err}"));
+                    #[cfg(target_os = "android")]
+                    match android_ctx::files_dir() {
+                        Some(dir) => dir,
+                        None => return Err(Box::new(err)),
+                    }
+                    #[cfg(not(target_os = "android"))]
+                    {
+                        return Err(Box::new(err));
+                    }
+                }
+            }
         }
         #[cfg(not(mobile))]
         {
@@ -141,12 +234,31 @@ fn resolve_data_dir(app: &tauri::AppHandle) -> Result<PathBuf, Box<dyn std::erro
 pub fn run() {
     diag::install_panic_hook();
     diag::trace("run() enter");
-    // 提前初始化 ndk_context，避免 iroh 在后台线程 panic（release 为 panic=abort）。
+    // 提前初始化 ndk_context，避免 iroh 在后台线程 panic。
     #[cfg(target_os = "android")]
     {
         android_ctx::init();
         diag::trace("ndk_context init");
     }
+    // 启动失败时不要静默消失：留下日志，并在手机上弹一句原因。
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(build_and_run));
+    if let Err(payload) = outcome {
+        let msg = panic_message(payload.as_ref());
+        diag::trace(&format!("run() aborted: {msg}"));
+        #[cfg(target_os = "android")]
+        android_ctx::toast(&format!("PrivChat 启动失败：{msg}"));
+    }
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|text| (*text).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".to_string())
+}
+
+fn build_and_run() {
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_app::init());
