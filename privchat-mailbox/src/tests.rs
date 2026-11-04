@@ -1,4 +1,6 @@
 use super::*;
+use crate::store::MailboxStore;
+use rusqlite::params;
 
 fn temp_db(name: &str) -> PathBuf {
     let dir =
