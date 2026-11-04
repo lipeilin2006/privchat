@@ -26,7 +26,7 @@ use std::sync::Mutex;
 use anyhow::{anyhow, Result};
 use rusqlite::{params, Connection};
 
-pub use connections::ConnRow;
+pub use connections::{ConnMessage, ConnRow};
 mod connections;
 mod contacts;
 mod identities;
@@ -103,6 +103,14 @@ impl Store {
                  e2e_state BLOB NOT NULL,
                  created INTEGER NOT NULL,
                  last_used INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS conn_messages (
+                 conn_id TEXT NOT NULL,
+                 msg_id TEXT NOT NULL,
+                 sender TEXT NOT NULL,
+                 text TEXT NOT NULL,
+                 time INTEGER NOT NULL,
+                 PRIMARY KEY (conn_id, msg_id)
              );
              CREATE TABLE IF NOT EXISTS sessions (
                  session_id TEXT PRIMARY KEY,

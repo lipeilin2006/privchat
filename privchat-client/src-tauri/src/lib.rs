@@ -573,6 +573,126 @@ async fn set_mailbox_write_count(count: usize, state: State<'_, AppState>) -> Re
         .map_err(|e| e.to_string())
 }
 
+/// 前端用的连接摘要。
+#[derive(serde::Serialize)]
+struct ConnectionSummary {
+    conn_id: String,
+    name: Option<String>,
+    state: String,
+}
+
+/// 前端用的连接消息。
+#[derive(serde::Serialize)]
+struct ConnectionMessage {
+    id: String,
+    from: String,
+    text: String,
+    time: u64,
+}
+
+/// 新协议：生成邀请（同时在该 mailbox 上创建接收队列）。
+#[tauri::command]
+async fn create_connection(
+    mailbox: String,
+    state: State<'_, AppState>,
+) -> Result<(String, String), String> {
+    state
+        .require_app()?
+        .create_connection(&mailbox)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// 新协议：扫到对方邀请后配对。
+#[tauri::command]
+async fn accept_connection(
+    conn_id: String,
+    invite: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    state
+        .require_app()?
+        .accept_connection(&conn_id, &invite)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// 新协议：发消息。
+#[tauri::command]
+async fn send_on_connection(
+    conn_id: String,
+    text: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    state
+        .require_app()?
+        .send_on_connection(&conn_id, &text)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// 新协议：手动拉一次。
+#[tauri::command]
+async fn poll_connection(
+    conn_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<String>, String> {
+    state
+        .require_app()?
+        .poll_connection(&conn_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// 新协议：连接列表。
+#[tauri::command]
+async fn list_connections(state: State<'_, AppState>) -> Result<Vec<ConnectionSummary>, String> {
+    let app = state.require_app()?;
+    Ok(app
+        .list_connections()
+        .await
+        .into_iter()
+        .map(|(conn_id, name, state)| ConnectionSummary {
+            conn_id,
+            name,
+            state: format!("{state:?}").to_lowercase(),
+        })
+        .collect())
+}
+
+/// 新协议：某连接的历史消息。
+#[tauri::command]
+async fn connection_history(
+    conn_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<ConnectionMessage>, String> {
+    let app = state.require_app()?;
+    Ok(app
+        .connection_history(&conn_id)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|m| ConnectionMessage {
+            id: m.msg_id,
+            from: m.sender,
+            text: m.text,
+            time: m.time,
+        })
+        .collect())
+}
+
+/// 新协议：给连接改备注（只是显示名）。
+#[tauri::command]
+async fn rename_connection(
+    conn_id: String,
+    name: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    state
+        .require_app()?
+        .rename_connection(&conn_id, name.as_deref())
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn exit_app(app_handle: tauri::AppHandle) {
     app_handle.exit(0);
@@ -658,6 +778,13 @@ pub fn run() {
             get_auto_lock_minutes,
             set_auto_lock_minutes,
             set_mailbox_write_count,
+            create_connection,
+            accept_connection,
+            send_on_connection,
+            poll_connection,
+            list_connections,
+            connection_history,
+            rename_connection,
             exit_app
         ])
         .build(tauri::generate_context!())

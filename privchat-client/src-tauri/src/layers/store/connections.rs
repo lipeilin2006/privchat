@@ -143,3 +143,50 @@ impl Store {
         Ok(())
     }
 }
+
+/// 连接里的一条消息。
+#[derive(Debug, Clone)]
+pub struct ConnMessage {
+    pub conn_id: String,
+    pub msg_id: String,
+    /// "me" / "peer"
+    pub sender: String,
+    pub text: String,
+    pub time: u64,
+}
+
+impl Store {
+    /// 追加一条连接消息（按 msg_id 幂等）。
+    pub fn append_conn_message(&self, m: &ConnMessage) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO conn_messages (conn_id, msg_id, sender, text, time)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![m.conn_id, m.msg_id, m.sender, m.text, m.time as i64],
+        )?;
+        Ok(())
+    }
+
+    /// 读某连接的消息（按时间升序）。
+    pub fn conn_messages(&self, conn_id: &str, limit: usize) -> Result<Vec<ConnMessage>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT conn_id, msg_id, sender, text, time FROM conn_messages
+             WHERE conn_id = ?1 ORDER BY time, rowid LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![conn_id, limit as i64], |row| {
+            Ok(ConnMessage {
+                conn_id: row.get(0)?,
+                msg_id: row.get(1)?,
+                sender: row.get(2)?,
+                text: row.get(3)?,
+                time: row.get::<_, i64>(4)? as u64,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+}

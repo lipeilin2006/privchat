@@ -643,20 +643,64 @@ impl App {
         self.links.accept(conn_id, invite).await
     }
 
-    /// 新协议：在连接上发一条文本。
+    /// 新协议：在连接上发一条文本（顺带入库）。
     pub async fn send_on_connection(&self, conn_id: &str, text: &str) -> Result<()> {
-        self.links.send(conn_id, text.as_bytes()).await
+        self.links.send(conn_id, text.as_bytes()).await?;
+        let time = now_ms();
+        let _ = self.store.append_conn_message(&crate::layers::store::ConnMessage {
+            conn_id: conn_id.to_string(),
+            msg_id: format!("me-{time}"),
+            sender: "me".into(),
+            text: text.to_string(),
+            time,
+        });
+        Ok(())
     }
 
-    /// 新协议：取走并解密该连接的全部待收消息。
+    /// 新协议：取走并解密该连接的全部待收消息（入库后返回文本）。
     pub async fn poll_connection(&self, conn_id: &str) -> Result<Vec<String>> {
-        Ok(self
-            .links
-            .poll(conn_id)
-            .await?
-            .into_iter()
-            .map(|b| String::from_utf8_lossy(&b).into_owned())
-            .collect())
+        let blobs = self.links.poll(conn_id).await?;
+        let mut out = Vec::new();
+        for (i, blob) in blobs.into_iter().enumerate() {
+            let text = String::from_utf8_lossy(&blob).into_owned();
+            let time = now_ms() + i as u64;
+            let _ = self.store.append_conn_message(&crate::layers::store::ConnMessage {
+                conn_id: conn_id.to_string(),
+                msg_id: format!("peer-{time}"),
+                sender: "peer".into(),
+                text: text.clone(),
+                time,
+            });
+            out.push(text);
+        }
+        Ok(out)
+    }
+
+    /// 新协议：读某连接的历史消息。
+    pub fn connection_history(
+        &self,
+        conn_id: &str,
+    ) -> Result<Vec<crate::layers::store::ConnMessage>> {
+        self.store.conn_messages(conn_id, 500)
+    }
+
+    /// 新协议：轮询全部已建立连接（后台任务用）。
+    pub async fn poll_all_connections(&self) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for (conn_id, _, state) in self.links.list().await {
+            if state != crate::layers::connection::LinkState::Established {
+                continue;
+            }
+            match self.poll_connection(&conn_id).await {
+                Ok(texts) => {
+                    for text in texts {
+                        out.push((conn_id.clone(), text));
+                    }
+                }
+                Err(e) => eprintln!("[app] poll {conn_id} failed: {e}"),
+            }
+        }
+        out
     }
 
     /// 新协议：全部连接（id + 备注 + 状态）。
