@@ -261,6 +261,8 @@ async fn handle_queue_create(handler: &MailboxHandler, req: MailboxRequest) -> M
         return err("queue_create rate limited, retry later");
     }
     let ttl_ms = req.ttl_ms.unwrap_or(0);
+    // ttl=0 表示长期有效，不能算成「now + 0」（那等于立刻过期）。
+    let expires = if ttl_ms == 0 { 0 } else { now_ms() + ttl_ms };
     let (Some(queue), Some(sender_auth), Some(owner_auth)) =
         (req.queue, req.sender_auth, req.owner_auth)
     else {
@@ -274,7 +276,7 @@ async fn handle_queue_create(handler: &MailboxHandler, req: MailboxRequest) -> M
     };
     match handler
         .store
-        .create_queue(&queue, &sender, &owner, now_ms(), now_ms() + ttl_ms)
+        .create_queue(&queue, &sender, &owner, now_ms(), expires)
         .await
     {
         Ok(true) => ok(),

@@ -258,3 +258,47 @@ async fn invite_expires_after_ten_minutes_unless_used() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 回归：不带 ttl 建的队列必须长期有效（曾把 ttl=0 算成 now+0，立刻过期）。
+#[tokio::test]
+async fn queue_create_without_ttl_never_expires() {
+    let dir = std::env::temp_dir().join(format!("privchat-notll-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = MailboxStore::open(dir.join("mb.db"), 0).expect("open");
+    let handler = MailboxHandler::new(store);
+
+    use ed25519_dalek::Signer;
+    let sender = ed25519_dalek::SigningKey::from_bytes(&iroh::SecretKey::generate().to_bytes());
+    let owner = ed25519_dalek::SigningKey::from_bytes(&iroh::SecretKey::generate().to_bytes());
+    let queue = "aaaabbbbccccddddeeeeffff11112222";
+    let qid: [u8; 16] = hex_decode(queue).unwrap().as_slice().try_into().unwrap();
+
+    let resp = handle_request(
+        &handler,
+        &serde_json::to_vec(&MailboxRequest::queue_create(
+            queue,
+            &hex_of(sender.verifying_key().as_bytes()),
+            &hex_of(owner.verifying_key().as_bytes()),
+        ))
+        .unwrap(),
+    )
+    .await;
+    assert!(resp.ok, "create: {:?}", resp.error);
+
+    let payload = b"later".to_vec();
+    let mut msg = b"privchat/queue/send/v1".to_vec();
+    msg.extend_from_slice(&qid);
+    msg.extend_from_slice(&payload);
+    let sig = hex_of(&sender.sign(&msg).to_bytes());
+    let resp = handle_request(
+        &handler,
+        &serde_json::to_vec(&MailboxRequest::queue_send(queue, payload, &sig)).unwrap(),
+    )
+    .await;
+    assert!(
+        resp.ok,
+        "long-lived queue must accept sends: {:?}",
+        resp.error
+    );
+}
