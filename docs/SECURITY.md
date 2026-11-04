@@ -125,8 +125,14 @@ root0 = HKDF(dh1 || dh2 || dh3, "privchat/session/root/v1")
 主会话也一致；其余会话保留为只读，继续尝试解密，不丢消息。收消息时先试
 主会话再试其余，都失败才按「本端是响应方」新建一段。
 
-**边界**：SPK 目前不轮换，且没有一次性预密钥（OPK）。要覆盖「IK+SPK
-同时泄漏后的新会话」还需要 OPK 池与轮换策略（见 SESSION_DESIGN）。
+**一次性预密钥（OPK）**：每个 `local_id` 在创建时生成 8 把 OPK，邀请串里
+带 4 把（公钥，随邀请一起被 IK 签名）。发起方建会话时取一把做第四组 DH
+`dh4 = DH(EK, OPK)`，并把 `opk_id` 写进消息头；响应方按 id 取出私钥派生，
+**解出首条消息后立刻删除**。于是即便 IK+SPK 同时泄漏，没用过的 OPK 仍然
+保护新会话（攻击者拿不到那组的私钥）。
+
+**边界**：SPK 目前不轮换，OPK 池也只有 8 把、用完不会自动补货（需要重新
+生成邀请）。完整方案见 SESSION_DESIGN 的 P3。
 
 ### 3.8 每消息身份签名（v7）
 
@@ -167,7 +173,7 @@ root0 = HKDF(dh1 || dh2 || dh3, "privchat/session/root/v1")
 | 项 | 取值 |
 |---|---|
 | 消息加密 | ChaCha20-Poly1305（AEAD，头部作为 AAD）+ 每条 Ed25519 签名 |
-| 密钥协商 | X3DH：DH(IK,SPK) + DH(EK,IK) + DH(EK,SPK)，HKDF-SHA256 |
+| 密钥协商 | X3DH：DH(IK,SPK) + DH(EK,IK) + DH(EK,SPK) [+ DH(EK,OPK)]，HKDF-SHA256 |
 | 密钥交换 | X25519（Ed25519 身份转 Montgomery） |
 | 棘轮 | 双棘轮，跳窗 200，skipped 池上限 1000；X3DH 建会话；消息签名（v7） |
 | 洋葱层密钥 | HKDF-SHA256，info=`privchat/onion/key/v1`，AAD=`privchat/onion/v1` |

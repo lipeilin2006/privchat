@@ -7,11 +7,14 @@ const TEST_KEY: [u8; 32] = [0x42; 32];
 /// 返回 `(peer_id, invite)`。
 async fn new_invite(app: &App) -> (String, String) {
     let invite = app.self_ticket().await;
-    let (peer, _spk, _) = crypto::parse_invite(&invite).expect("parse invite");
+    let (peer, _spk, _, opks) = crypto::parse_invite(&invite).expect("parse invite");
     let secret = app.transport.secret_for(&peer).await.expect("secret");
     let spk_pk = app.transport.spk_public(&peer).await.expect("spk");
     let ticket = app.transport.ticket_for(&peer).await;
-    (peer, crypto::encode_invite(&secret, &spk_pk, Some(&ticket)))
+    (
+        peer,
+        crypto::encode_invite(&secret, &spk_pk, Some(&ticket), &opks),
+    )
 }
 
 /// 全栈集成：两个客户端各自完整走 L4->L1->L4，通过真实 QUIC 交换消息，
@@ -525,9 +528,10 @@ async fn mailbox_grid_sync_end_to_end() {
     let spk_sk = x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng);
     let spk_pk = x25519_dalek::PublicKey::from(&spk_sk).to_bytes();
     let mut ratchet_a =
-        crypto::Ratchet::new_initiator(&alice_key, &bob_id, &spk_pk).expect("ratchet a");
+        crypto::Ratchet::new_initiator(&alice_key, &bob_id, &spk_pk, None).expect("ratchet a");
     let mut ratchet_b =
-        crypto::Ratchet::new_responder(&bob_key, &alice_id, &spk_sk.to_bytes()).expect("ratchet b");
+        crypto::Ratchet::new_responder(&bob_key, &alice_id, &spk_sk.to_bytes(), None)
+            .expect("ratchet b");
     let blob = ratchet_a
         .encrypt(&serde_json::to_vec(&plain).unwrap())
         .expect("encrypt");
@@ -597,9 +601,9 @@ fn msg_id_is_deterministic_and_direction_unique() {
     .unwrap();
     let alice_spk = x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng);
     let alice_spk_pk = x25519_dalek::PublicKey::from(&alice_spk).to_bytes();
-    let mut a = crypto::Ratchet::new_initiator(&alice, &bob_id, &alice_spk_pk).unwrap();
+    let mut a = crypto::Ratchet::new_initiator(&alice, &bob_id, &alice_spk_pk, None).unwrap();
     // 双方各自作为发起方（并发发起在会话层合并，这里只验证 msg_id 方向不撞）。
-    let mut b = crypto::Ratchet::new_initiator(&bob, &alice_id, &alice_spk_pk).unwrap();
+    let mut b = crypto::Ratchet::new_initiator(&bob, &alice_id, &alice_spk_pk, None).unwrap();
     let blob_a = a.encrypt(&plain).unwrap();
     let blob_b = b.encrypt(&plain).unwrap();
 
@@ -716,6 +720,69 @@ async fn concurrent_first_send_converges_on_one_active_session() {
 
     alice.close().await;
     bob.close().await;
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
+
+/// OPK 一次性：发起方用掉一把、响应方解出后删掉一把。
+#[tokio::test]
+async fn session_consumes_one_time_prekey() {
+    let dir_a = std::env::temp_dir().join(format!("privchat-opk-a-{}", std::process::id()));
+    let dir_b = std::env::temp_dir().join(format!("privchat-opk-b-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+
+    let (alice, _rx_a) = App::start_no_relay(dir_a.clone(), TEST_KEY)
+        .await
+        .expect("start a");
+    let (bob, mut rx_b) = App::start_no_relay(dir_b.clone(), TEST_KEY)
+        .await
+        .expect("start b");
+    let (alice_for_bob, alice_invite) = new_invite(&alice).await;
+    let (bob_for_alice, bob_invite) = new_invite(&bob).await;
+    let bob_id = alice.connect_peer(&bob_invite, None).await.expect("a->b");
+    let _ = bob.connect_peer(&alice_invite, None).await.expect("b->a");
+
+    // 邀请里带了 4 把 OPK，发起会话会先用掉一把。
+    let before = alice
+        .contacts
+        .lock()
+        .await
+        .get(&bob_id)
+        .map(|c| c.peer_opks.len())
+        .unwrap_or(0);
+    assert_eq!(before, 4, "invite should carry 4 OPKs");
+
+    let bob_local = bob_for_alice.clone();
+    let bob_opks_before = bob.store.count_unused_opks(&bob_local).expect("count");
+
+    alice
+        .send_message(&bob_id, "opk hello")
+        .await
+        .expect("send");
+    let env = rx_b.recv().await.expect("bob envelope");
+    let msg = bob.handle_incoming(env).await.expect("recv").expect("text");
+    assert_eq!(msg.text, "opk hello");
+
+    let after = alice
+        .contacts
+        .lock()
+        .await
+        .get(&bob_id)
+        .map(|c| c.peer_opks.len())
+        .unwrap_or(0);
+    assert_eq!(after, 3, "initiator should consume one peer OPK");
+
+    let bob_opks_after = bob.store.count_unused_opks(&bob_local).expect("count");
+    assert_eq!(
+        bob_opks_before - 1,
+        bob_opks_after,
+        "responder should delete the used OPK"
+    );
+
+    alice.close().await;
+    bob.close().await;
+    let _ = alice_for_bob;
     let _ = std::fs::remove_dir_all(&dir_a);
     let _ = std::fs::remove_dir_all(&dir_b);
 }

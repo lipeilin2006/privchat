@@ -6,8 +6,8 @@ impl Store {
     /// 联系人表整表读入内存（peer_id → Contact）。
     pub fn load_contacts(&self) -> Result<HashMap<String, Contact>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt =
-            conn.prepare("SELECT peer_id, local_id, name, ticket, peer_spk FROM contacts")?;
+        let mut stmt = conn
+            .prepare("SELECT peer_id, local_id, name, ticket, peer_spk, peer_opks FROM contacts")?;
         let rows = stmt.query_map([], |row| {
             Ok(Contact {
                 peer_id: row.get(0)?,
@@ -15,6 +15,10 @@ impl Store {
                 name: row.get(2)?,
                 ticket: row.get(3)?,
                 peer_spk: row.get(4)?,
+                peer_opks: row
+                    .get::<_, Option<String>>(5)?
+                    .and_then(|json| serde_json::from_str(&json).ok())
+                    .unwrap_or_default(),
             })
         })?;
         let mut out = HashMap::new();
@@ -29,11 +33,18 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM contacts", [])?;
         let mut stmt = conn.prepare(
-            "INSERT INTO contacts (peer_id, local_id, name, ticket, peer_spk)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO contacts (peer_id, local_id, name, ticket, peer_spk, peer_opks)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         )?;
         for c in contacts.values() {
-            stmt.execute(params![c.peer_id, c.local_id, c.name, c.ticket, c.peer_spk])?;
+            stmt.execute(params![
+                c.peer_id,
+                c.local_id,
+                c.name,
+                c.ticket,
+                c.peer_spk,
+                serde_json::to_string(&c.peer_opks).ok()
+            ])?;
         }
         Ok(())
     }

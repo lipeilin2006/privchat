@@ -29,6 +29,7 @@ use rusqlite::{params, Connection};
 mod contacts;
 mod identities;
 mod messages;
+mod opks;
 mod sessions;
 mod settings;
 
@@ -58,7 +59,8 @@ impl Store {
                  local_id TEXT NOT NULL,
                  name TEXT,
                  ticket TEXT,
-                 peer_spk BLOB
+                 peer_spk BLOB,
+                 peer_opks TEXT
              );
              CREATE TABLE IF NOT EXISTS messages (
                  peer_id TEXT NOT NULL,
@@ -74,6 +76,12 @@ impl Store {
              CREATE TABLE IF NOT EXISTS identities (
                  local_id TEXT PRIMARY KEY,
                  secret BLOB NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS opks (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 local_id TEXT NOT NULL,
+                 sk BLOB NOT NULL,
+                 used INTEGER NOT NULL DEFAULT 0
              );
              CREATE TABLE IF NOT EXISTS identity_spk (
                  local_id TEXT PRIMARY KEY,
@@ -142,6 +150,7 @@ mod tests {
                 name: Some("Alice".to_string()),
                 ticket: Some("ticket1".to_string()),
                 peer_spk: None,
+                peer_opks: Vec::new(),
             },
         );
         contacts

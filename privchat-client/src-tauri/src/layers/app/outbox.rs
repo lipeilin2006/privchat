@@ -145,7 +145,37 @@ impl SendCtx {
                     .as_slice()
                     .try_into()
                     .map_err(|_| anyhow!("stored peer SPK has bad length"))?;
-                let ratchet = crypto::Ratchet::new_initiator(&secret, peer_id, &peer_spk)?;
+                // 有对方 OPK 就做 4-DH，用完从联系人里删掉（一次性）。
+                let opk = {
+                    let contacts = self.contacts.lock().await;
+                    contacts
+                        .get(peer_id)
+                        .and_then(|c| c.peer_opks.first().cloned())
+                };
+                let opk_key: Option<([u8; 32], u64)> = match &opk {
+                    Some((id, pk)) => Some((
+                        pk.as_slice()
+                            .try_into()
+                            .map_err(|_| anyhow!("stored peer OPK has bad length"))?,
+                        *id,
+                    )),
+                    None => None,
+                };
+                let ratchet = crypto::Ratchet::new_initiator(
+                    &secret,
+                    peer_id,
+                    &peer_spk,
+                    opk_key.as_ref().map(|(pk, id)| (pk, *id)),
+                )?;
+                if let Some((id, _)) = opk {
+                    let mut contacts = self.contacts.lock().await;
+                    if let Some(contact) = contacts.get_mut(peer_id) {
+                        contact.peer_opks.retain(|(opk_id, _)| *opk_id != id);
+                    }
+                    drop(contacts);
+                    let contacts = self.contacts.lock().await.clone();
+                    let _ = self.store.save_contacts(&contacts);
+                }
                 let ek = ratchet
                     .own_ek()
                     .ok_or_else(|| anyhow!("initiator session has no EK"))?;

@@ -61,6 +61,7 @@ pub(super) mod invite;
 pub(super) mod ratchet;
 pub(super) mod x3dh;
 
+pub use header::header_opk_id;
 pub use hex::{hex_decode, hex_encode};
 pub use invite::{encode_invite, parse_invite};
 pub use ratchet::Ratchet;

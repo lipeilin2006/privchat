@@ -121,10 +121,10 @@ fn load_ratchet(
             .with_context(|| format!("恢复会话 {} 失败", path.display()))
     } else if let Some(spk) = peer_spk {
         let spk: [u8; 32] = hex_to_32(spk)?;
-        Ratchet::new_initiator(secret, peer, &spk)
+        Ratchet::new_initiator(secret, peer, &spk, None)
     } else {
         // 没有对方 SPK：只能当响应方，等对方先发。
-        Ratchet::new_responder(secret, peer, &cli_spk(secret))
+        Ratchet::new_responder(secret, peer, &cli_spk(secret), None)
     }
 }
 

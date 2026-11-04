@@ -239,6 +239,42 @@ impl Transport {
             .ok_or_else(|| anyhow::anyhow!("no SPK for identity {local_id}"))
     }
 
+    /// 该身份前 N 把未用 OPK 的 `(id, 公钥)`，用于放进邀请串。
+    pub async fn opks_public(
+        &self,
+        local_id: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(u64, [u8; 32])>> {
+        let rows = self.store.list_opks(local_id, limit)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for (id, sk) in rows {
+            let sk: [u8; 32] = sk
+                .as_slice()
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("bad stored OPK"))?;
+            let secret = x25519_dalek::StaticSecret::from(sk);
+            out.push((id, x25519_dalek::PublicKey::from(&secret).to_bytes()));
+        }
+        Ok(out)
+    }
+
+    /// 按 id 取某身份未用过的 OPK 私钥（响应方解首条消息用）。
+    pub fn opk_sk(&self, local_id: &str, id: u64) -> anyhow::Result<Option<[u8; 32]>> {
+        let Some(sk) = self.store.opk_by_id(local_id, id)? else {
+            return Ok(None);
+        };
+        Ok(Some(
+            sk.as_slice()
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("bad stored OPK"))?,
+        ))
+    }
+
+    /// 用完后删除该 OPK。
+    pub fn consume_opk(&self, id: u64) -> anyhow::Result<()> {
+        self.store.delete_opk(id)
+    }
+
     /// 指定专属身份的 SPK 公钥（放进邀请串）。
     pub async fn spk_public(&self, local_id: &str) -> anyhow::Result<[u8; 32]> {
         let sk = self.spk_for(local_id).await?;
@@ -269,6 +305,14 @@ impl Transport {
         let mut spk = [0u8; 32];
         rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut spk);
         let id = build_identity(secret, spk, self.use_relay, self.tx.clone()).await?;
+        // 顺手补一批一次性预密钥（邀请里发公钥，对方发起会话时用一把）。
+        for _ in 0..8 {
+            let sk = x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng);
+            if let Err(error) = self.store.add_opk(&local_id, &sk.to_bytes()) {
+                eprintln!("[transport] save OPK failed: {error}");
+                break;
+            }
+        }
         if let Err(error) = self.store.save_identity_spk(&local_id, &id.spk_sk) {
             eprintln!("[transport] save SPK failed: {error}");
         }

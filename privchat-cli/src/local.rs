@@ -38,7 +38,12 @@ pub(crate) fn cmd_id(home: &Path, name: &str) -> Result<()> {
     let secret = load_secret(home, name)?;
     println!(
         "{}",
-        privchat_client_lib::layers::crypto::encode_invite(&secret, &cli_spk_pub(&secret), None)
+        privchat_client_lib::layers::crypto::encode_invite(
+            &secret,
+            &cli_spk_pub(&secret),
+            None,
+            &[]
+        )
     );
     Ok(())
 }
@@ -82,7 +87,8 @@ pub(crate) fn cmd_contact(
     // 邀请串 → (peer_id, SPK)；兼容直接给 peer_id（此时只能当响应方）。
     let parse_one = |raw: &str| -> Result<(String, Option<String>)> {
         if raw.starts_with("pc1:") {
-            let (peer, spk, _ticket) = privchat_client_lib::layers::crypto::parse_invite(raw)?;
+            let (peer, spk, _ticket, _opks) =
+                privchat_client_lib::layers::crypto::parse_invite(raw)?;
             Ok((peer, Some(hex_of(&spk))))
         } else {
             Ok((raw.to_string(), None))

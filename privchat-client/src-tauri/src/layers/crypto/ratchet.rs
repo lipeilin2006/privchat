@@ -38,6 +38,10 @@ pub struct Ratchet {
     recv_n: u32,
     /// 上一代发送条数：刷新后作为后续消息头 `pn`（接收方据此快进旧链）。
     prev_send_n: u32,
+    /// 发起方选用的 OPK id（0 = 没用；写进每条消息头）。
+    opk_id: u64,
+    /// 响应方待用的 OPK 私钥（收到首条消息后清空，一次性）。
+    opk_sk: Option<[u8; 32]>,
     /// 响应方待派生状态：本端 SPK 私钥。收到发起方首条消息（含 EK）后
     /// 用它还原 root₀，随后清空。为 `Some` 时表示会话尚未建立、不能发送。
     pending_spk: Option<[u8; 32]>,
@@ -58,11 +62,12 @@ impl Ratchet {
         own: &iroh::SecretKey,
         peer_id: &str,
         peer_spk: &[u8; 32],
+        opk: Option<(&[u8; 32], u64)>,
     ) -> Result<Self> {
         let peer_pub = decode_peer_pub(peer_id)?;
         let own_pub = own.public().as_bytes().to_owned();
         let (ek_priv, ek_pub) = new_eph();
-        let root = x3dh_root_initiator(own, &peer_pub, peer_spk, &ek_priv)?;
+        let root = x3dh_root_initiator(own, &peer_pub, peer_spk, &ek_priv, opk.map(|(pk, _)| pk))?;
         let (send_ck, recv_ck) = derive_chains(&root, &own_pub, &peer_pub);
         Ok(Self {
             own: own.clone(),
@@ -81,6 +86,8 @@ impl Ratchet {
             recv_n: 0,
             prev_send_n: 0,
             pending_spk: None,
+            opk_id: opk.map(|(_, id)| id).unwrap_or(0),
+            opk_sk: None,
             skipped: HashMap::new(),
             pending: None,
         })
@@ -92,6 +99,7 @@ impl Ratchet {
         own: &iroh::SecretKey,
         peer_id: &str,
         own_spk_sk: &[u8; 32],
+        opk: Option<(&[u8; 32], u64)>,
     ) -> Result<Self> {
         let peer_pub = decode_peer_pub(peer_id)?;
         let own_pub = own.public().as_bytes().to_owned();
@@ -112,6 +120,8 @@ impl Ratchet {
             recv_n: 0,
             prev_send_n: 0,
             pending_spk: Some(*own_spk_sk),
+            opk_id: opk.map(|(_, id)| id).unwrap_or(0),
+            opk_sk: opk.map(|(sk, _)| *sk),
             skipped: HashMap::new(),
             pending: None,
         })
@@ -245,6 +255,14 @@ impl Ratchet {
         out.extend_from_slice(&self.recv_ck);
         out.extend_from_slice(&self.recv_n.to_le_bytes());
         out.extend_from_slice(&self.prev_send_n.to_le_bytes());
+        out.extend_from_slice(&self.opk_id.to_le_bytes());
+        match self.opk_sk {
+            Some(sk) => {
+                out.push(1);
+                out.extend_from_slice(&sk);
+            }
+            None => out.push(0),
+        }
         out.extend_from_slice(&(self.skipped.len() as u32).to_le_bytes());
         for ((g, n), mk) in &self.skipped {
             out.extend_from_slice(&g.to_le_bytes());
@@ -291,6 +309,19 @@ impl Ratchet {
         let recv_ck = read_fixed::<32>(bytes, &mut pos)?;
         let recv_n = read_u32(bytes, &mut pos)?;
         let prev_send_n = read_u32(bytes, &mut pos)?;
+        let mut opk_bytes = [0u8; 8];
+        opk_bytes.copy_from_slice(
+            bytes
+                .get(pos..pos + 8)
+                .ok_or_else(|| anyhow!("truncated state"))?,
+        );
+        pos += 8;
+        let opk_id = u64::from_le_bytes(opk_bytes);
+        let opk_sk = if read_u8(bytes, &mut pos)? == 1 {
+            Some(read_fixed::<32>(bytes, &mut pos)?)
+        } else {
+            None
+        };
         let skipped_count = read_u32(bytes, &mut pos)? as usize;
         if skipped_count > SKIPPED_MAX {
             return Err(anyhow!("skipped pool too large"));
@@ -323,6 +354,8 @@ impl Ratchet {
             recv_ck,
             recv_n,
             prev_send_n,
+            opk_id,
+            opk_sk,
             pending_spk,
             skipped,
             pending: None,
@@ -374,6 +407,7 @@ impl Ratchet {
         out.extend_from_slice(self.our_eph_pub.as_ref().unwrap());
         out.extend_from_slice(&n.to_le_bytes());
         out.extend_from_slice(&self.prev_send_n.to_le_bytes());
+        out.extend_from_slice(&self.opk_id.to_le_bytes());
         out.extend_from_slice(&self.prev_eph);
         out.extend_from_slice(&nonce);
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&mk));
@@ -416,7 +450,20 @@ impl Ratchet {
                     hdr.gen
                 ));
             };
-            let root = x3dh_root_responder(&self.own, &self.peer_pub, &spk_sk, &ek_pub)?;
+            if hdr.opk_id != self.opk_id {
+                return Err(anyhow!(
+                    "OPK mismatch: header {} vs local {}",
+                    hdr.opk_id,
+                    self.opk_id
+                ));
+            }
+            let root = x3dh_root_responder(
+                &self.own,
+                &self.peer_pub,
+                &spk_sk,
+                &ek_pub,
+                self.opk_sk.as_ref(),
+            )?;
             let (send_ck, recv_ck) = derive_chains(&root, &self.own_pub, &self.peer_pub);
             self.root = root;
             self.gen = 0;
@@ -428,6 +475,8 @@ impl Ratchet {
             self.their_eph = None;
             self.prev_eph = [0u8; 32];
             self.pending_spk = None;
+            // OPK 一次性：派生完就丢。
+            self.opk_sk = None;
         }
 
         // 对方领先一代：收敛性接收刷新。
@@ -536,6 +585,8 @@ impl Clone for Ratchet {
             recv_ck: self.recv_ck,
             recv_n: self.recv_n,
             prev_send_n: self.prev_send_n,
+            opk_id: self.opk_id,
+            opk_sk: self.opk_sk,
             pending_spk: self.pending_spk,
             skipped: self.skipped.clone(),
             pending: None,

@@ -92,10 +92,26 @@ impl App {
 
             // 所有会话都解不开：本端作为响应方新建一段（对方是发起方）。
             if plain.is_none() {
-                let mut ratchet = crypto::Ratchet::new_responder(&secret, &sender, &spk)?;
+                // 对方用了 OPK：按 header 里的 id 取本端对应私钥（一次性）。
+                let opk_id = crypto::header_opk_id(&wire.msg)?;
+                let local_opk = if opk_id != 0 {
+                    self.transport.opk_sk(&local_id, opk_id)?
+                } else {
+                    None
+                };
+                let mut ratchet = crypto::Ratchet::new_responder(
+                    &secret,
+                    &sender,
+                    &spk,
+                    local_opk.as_ref().map(|sk| (sk, opk_id)),
+                )?;
                 let p = ratchet
                     .decrypt(&wire.msg)
                     .map_err(|e| anyhow!("no session could decrypt message: {e}"))?;
+                if local_opk.is_some() {
+                    // OPK 一次性：成功解出后立刻删除。
+                    let _ = self.transport.consume_opk(opk_id);
+                }
                 let ek = crypto::header_ek(&wire.msg)?;
                 let id = crypto::session_id(&ek, &own_ik, &peer_ik);
                 entries.push(SessionEntry {
@@ -136,9 +152,10 @@ impl App {
                     local_id: local_id.clone(),
                     name: None,
                     ticket: None,
-                    // 对端未提供邀请串时拿不到其 SPK；本端仍可继续应答
+                    // 对端未提供邀请串时拿不到其 SPK/OPK；本端仍可继续应答
                     // （会话是对方发起的），但要主动新建会话得先交换邀请。
                     peer_spk: None,
+                    peer_opks: Vec::new(),
                 },
             );
             // 若该身份之前是待绑定邀请身份，现在已绑定。

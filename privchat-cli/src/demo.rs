@@ -28,7 +28,7 @@ pub(crate) async fn cmd_demo(home: &Path, mailbox: &str) -> Result<()> {
     let t0 = Instant::now();
     let (msg_id, cipher_len) = {
         let secret = alice.clone();
-        let mut ratchet = Ratchet::new_initiator(&secret, &bob_id, &cli_spk_pub(&bob))?;
+        let mut ratchet = Ratchet::new_initiator(&secret, &bob_id, &cli_spk_pub(&bob), None)?;
         let endpoint = make_endpoint(SecretKey::generate()).await?;
         let body = json!({"v":1,"type":"text","ts":now_ms(),"text":text}).to_string();
         let r = deliver(

@@ -27,10 +27,10 @@ fn fixture() -> Fixture {
 
 impl Fixture {
     fn a(&self) -> Ratchet {
-        Ratchet::new_initiator(&self.alice, &self.bob_id, &self.spk_pk).unwrap()
+        Ratchet::new_initiator(&self.alice, &self.bob_id, &self.spk_pk, None).unwrap()
     }
     fn b(&self) -> Ratchet {
-        Ratchet::new_responder(&self.bob, &self.alice_id, &self.spk_sk).unwrap()
+        Ratchet::new_responder(&self.bob, &self.alice_id, &self.spk_sk, None).unwrap()
     }
 }
 
@@ -114,7 +114,7 @@ fn wrong_spk_cannot_decrypt() {
     a.next();
 
     let (wrong_sk, _wrong_pk) = new_eph();
-    let mut b = Ratchet::new_responder(&f.bob, &f.alice_id, &wrong_sk).unwrap();
+    let mut b = Ratchet::new_responder(&f.bob, &f.alice_id, &wrong_sk, None).unwrap();
     assert!(b.decrypt(&blob).is_err(), "wrong SPK must not derive root");
 }
 
@@ -127,7 +127,7 @@ fn ik_alone_cannot_derive_root() {
 
     // 攻击者有 bob 的 IK，但没有 bob 的 SPK 私钥。
     let (random_sk, _random_pk) = new_eph();
-    let mut attacker = Ratchet::new_responder(&f.bob, &f.alice_id, &random_sk).unwrap();
+    let mut attacker = Ratchet::new_responder(&f.bob, &f.alice_id, &random_sk, None).unwrap();
     assert!(
         attacker.decrypt(&blob).is_err(),
         "IK alone must not derive the session root"
@@ -241,7 +241,7 @@ fn third_party_cannot_read() {
     let mallory = SecretKey::generate();
     let mut a = f.a();
     let (m_sk, _m_pk) = new_eph();
-    let mut m = Ratchet::new_responder(&mallory, &f.alice_id, &m_sk).unwrap();
+    let mut m = Ratchet::new_responder(&mallory, &f.alice_id, &m_sk, None).unwrap();
     let blob = a.encrypt(b"secret").unwrap();
     assert!(m.decrypt(&blob).is_err(), "mallory must not decrypt");
 }
@@ -392,4 +392,34 @@ fn wrong_signer_is_rejected() {
         "signature from another key must be rejected"
     );
     assert_eq!(b.decrypt(&blob).unwrap(), b"from-alice");
+}
+
+/// 带 OPK 的 4-DH：双方用同一把 OPK 才能解；OPK id 会写进消息头。
+#[test]
+fn opk_session_roundtrip() {
+    let f = fixture();
+    let (opk_sk, opk_pk) = new_eph();
+    let opk_id = 7u64;
+    let mut a =
+        Ratchet::new_initiator(&f.alice, &f.bob_id, &f.spk_pk, Some((&opk_pk, opk_id))).unwrap();
+    let mut b =
+        Ratchet::new_responder(&f.bob, &f.alice_id, &f.spk_sk, Some((&opk_sk, opk_id))).unwrap();
+
+    let blob = a.encrypt(b"with opk").unwrap();
+    a.next();
+    assert_eq!(parse_header(&blob).unwrap().opk_id, opk_id);
+    assert_eq!(b.decrypt(&blob).unwrap(), b"with opk");
+}
+
+/// OPK id 不匹配（拿错一次性密钥）必须解不开。
+#[test]
+fn wrong_opk_is_rejected() {
+    let f = fixture();
+    let (opk_sk, opk_pk) = new_eph();
+    let mut a = Ratchet::new_initiator(&f.alice, &f.bob_id, &f.spk_pk, Some((&opk_pk, 1))).unwrap();
+    let (_other_sk, _other_pk) = new_eph();
+    let mut b = Ratchet::new_responder(&f.bob, &f.alice_id, &f.spk_sk, Some((&opk_sk, 2))).unwrap();
+
+    let blob = a.encrypt(b"x").unwrap();
+    assert!(b.decrypt(&blob).is_err(), "OPK id mismatch must fail");
 }

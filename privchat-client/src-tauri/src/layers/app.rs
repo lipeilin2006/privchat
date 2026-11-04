@@ -240,6 +240,9 @@ pub struct Contact {
     /// 对方的 X25519 SPK 公钥（来自邀请串，X3DH 用）。
     #[serde(default)]
     pub peer_spk: Option<Vec<u8>>,
+    /// 对方给的一次性预密钥 `(id, 公钥)`，发起新会话时取一把用掉。
+    #[serde(default)]
+    pub peer_opks: Vec<(u64, Vec<u8>)>,
 }
 
 /// 前端联系人列表条目（轻量）。
@@ -334,7 +337,14 @@ impl App {
                     self.transport.spk_public(&local_id).await,
                 ) {
                     // 生产邀请不带地址（避免泄漏 IP/relay），靠 DNS 发现。
-                    (Ok(secret), Ok(spk_pk)) => crypto::encode_invite(&secret, &spk_pk, None),
+                    (Ok(secret), Ok(spk_pk)) => {
+                        let opks = self
+                            .transport
+                            .opks_public(&local_id, 4)
+                            .await
+                            .unwrap_or_default();
+                        crypto::encode_invite(&secret, &spk_pk, None, &opks)
+                    }
                     _ => String::new(),
                 }
             }
@@ -626,7 +636,7 @@ impl App {
     /// **防冲突**：选中的本地身份必须未被任何联系人占用，否则跳过重选。
     pub async fn connect_peer(&self, invite: &str, name: Option<String>) -> Result<String> {
         // 邀请串 = IK + SPK + 签名；先验签再取身份。
-        let (invite_peer, spk, invite_ticket) = crypto::parse_invite(invite)?;
+        let (invite_peer, spk, invite_ticket, invite_opks) = crypto::parse_invite(invite)?;
         let _remote = self.transport.parse_peer_id(&invite_peer)?;
 
         let local_id = self.take_local_identity().await?;
@@ -641,6 +651,10 @@ impl App {
             // 存「拨号地址」（票据或 peer_id），不是邀请串本身。
             ticket: Some(dial.to_string()),
             peer_spk: Some(spk.to_vec()),
+            peer_opks: invite_opks
+                .into_iter()
+                .map(|(id, pk)| (id, pk.to_vec()))
+                .collect(),
         };
         self.contacts.lock().await.insert(peer_id.clone(), contact);
         self.persist_contacts().await;

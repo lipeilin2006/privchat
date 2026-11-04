@@ -18,13 +18,20 @@ pub(super) fn x3dh_root_initiator(
     peer_pub: &[u8; 32],
     peer_spk: &[u8; 32],
     ek_priv: &[u8; 32],
+    opk: Option<&[u8; 32]>,
 ) -> Result<[u8; 32]> {
     let own_ik = own_x25519_secret(own);
     let peer_ik = peer_montgomery(peer_pub)?;
     let dh1 = x25519_shared(&own_ik, peer_spk)?;
     let dh2 = x25519_shared(ek_priv, &peer_ik)?;
     let dh3 = x25519_shared(ek_priv, peer_spk)?;
-    Ok(x3dh_mix(&dh1, &dh2, &dh3))
+    match opk {
+        Some(pk) => {
+            let dh4 = x25519_shared(ek_priv, pk)?;
+            Ok(x3dh_mix4(&dh1, &dh2, &dh3, &dh4))
+        }
+        None => Ok(x3dh_mix(&dh1, &dh2, &dh3)),
+    }
 }
 
 /// X3DH 三组 DH 混合成 root₀（响应方，与发起方逐项相等）。
@@ -36,13 +43,34 @@ pub(super) fn x3dh_root_responder(
     peer_pub: &[u8; 32],
     own_spk_sk: &[u8; 32],
     ek_pub: &[u8; 32],
+    opk_sk: Option<&[u8; 32]>,
 ) -> Result<[u8; 32]> {
     let own_ik = own_x25519_secret(own);
     let peer_ik = peer_montgomery(peer_pub)?;
     let dh1 = x25519_shared(own_spk_sk, &peer_ik)?;
     let dh2 = x25519_shared(&own_ik, ek_pub)?;
     let dh3 = x25519_shared(own_spk_sk, ek_pub)?;
-    Ok(x3dh_mix(&dh1, &dh2, &dh3))
+    match opk_sk {
+        Some(sk) => {
+            let dh4 = x25519_shared(sk, ek_pub)?;
+            Ok(x3dh_mix4(&dh1, &dh2, &dh3, &dh4))
+        }
+        None => Ok(x3dh_mix(&dh1, &dh2, &dh3)),
+    }
+}
+
+/// 四组 DH（带 OPK）按固定顺序拼接。
+fn x3dh_mix4(dh1: &[u8; 32], dh2: &[u8; 32], dh3: &[u8; 32], dh4: &[u8; 32]) -> [u8; 32] {
+    let mut ikm = [0u8; 128];
+    ikm[..32].copy_from_slice(dh1);
+    ikm[32..64].copy_from_slice(dh2);
+    ikm[64..96].copy_from_slice(dh3);
+    ikm[96..].copy_from_slice(dh4);
+    let hk = Hkdf::<Sha256>::new(None, &ikm);
+    let mut root = [0u8; 32];
+    hk.expand(INFO_ROOT, &mut root)
+        .expect("hkdf expand 32 bytes cannot fail");
+    root
 }
 
 /// 三组 DH 按固定顺序拼起来做 HKDF，双方必须完全一致。
