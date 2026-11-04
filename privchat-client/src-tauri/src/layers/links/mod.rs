@@ -15,7 +15,7 @@ use tokio::sync::Mutex;
 
 use crate::layers::app::{OnionConfig, OnionMode, OnionRelay};
 use crate::layers::connection::{
-    self, DrainingQueue, Invite, Link, LinkState, OutQueue, QueueKeys,
+    self, DrainingQueue, Invite, Link, LinkState, OutQueue, PartialFile, QueueKeys,
 };
 use crate::layers::crypto::connection::Connection as E2e;
 use crate::layers::mailbox::MailboxClient;
@@ -203,15 +203,24 @@ impl QueueApi for IrohQueues {
         sig: &'a str,
     ) -> BoxFut<'a, Vec<Vec<u8>>> {
         Box::pin(async move {
-            let req = MailboxRequest::queue_get(queue, sig);
-            let resp = self.call(conn_id, mailbox, &req).await?;
-            let resp = Self::check(resp, "queue_get")?;
-            Ok(resp
-                .messages
-                .unwrap_or_default()
-                .into_iter()
-                .map(|m| m.msg)
-                .collect())
+            // 分页取：一次最多 2MiB，避免一个装满的队列把读取上限顶爆。
+            // 拿满一页就继续，拿到不满一页说明取完了。
+            const PAGE: usize = 2 * 1024 * 1024;
+            const MAX_ROUNDS: usize = 64;
+            let mut out = Vec::new();
+            for _ in 0..MAX_ROUNDS {
+                let req = MailboxRequest::queue_get_bounded(queue, sig, PAGE);
+                let resp = self.call(conn_id, mailbox, &req).await?;
+                let resp = Self::check(resp, "queue_get")?;
+                let rows = resp.messages.unwrap_or_default();
+                let bytes: usize = rows.iter().map(|m| m.msg.len()).sum();
+                let count = rows.len();
+                out.extend(rows.into_iter().map(|m| m.msg));
+                if count == 0 || bytes < PAGE {
+                    break;
+                }
+            }
+            Ok(out)
         })
     }
 
@@ -236,18 +245,50 @@ pub struct LinkManager {
     links: Mutex<HashMap<String, Link>>,
     /// 可用的 mailbox 池；轮换时依次换一台。
     pool: Mutex<Vec<String>>,
+    /// 洋葱是否开着（决定附件分片大小）。
+    onion_on: std::sync::atomic::AtomicBool,
 }
+
+/// 连续拉取失败多少次就尝试换一台信箱。
+const FAILOVER_AFTER: u32 = 3;
 
 /// 邀请有效期：10 分钟。轮换出来的队列不带这个限制。
 const INVITE_TTL_MS: u64 = 10 * 60 * 1000;
 
 /// 每多少条消息轮换一次入站队列。
 const ROTATE_EVERY: u32 = 500;
-/// 帧类型：0 = 文本，1 = 队列轮换通知。
+/// 帧类型：0 = 文本，1 = 队列轮换通知，2 = 文件分片。
 const FRAME_TEXT: u8 = 0;
 const FRAME_ROTATE: u8 = 1;
+const FRAME_FILE: u8 = 2;
+
+/// 附件上限 2MB。
+pub const MAX_FILE_BYTES: usize = 2 * 1024 * 1024;
+/// 走洋葱时每片小一点（JSON 数组编码约 4 倍膨胀，单包上限 60KB）。
+const FILE_CHUNK_ONION: usize = 8 * 1024 - 64;
+/// 直连时每片可以大一些。
+const FILE_CHUNK_DIRECT: usize = 24 * 1024;
+/// 文件名/MIME 的长度上限。
+const FILE_META_MAX: usize = 64;
+
+/// 收到的消息帧。
+#[derive(Debug)]
+pub enum ReceivedFrame {
+    Text(String),
+    File {
+        name: String,
+        mime: String,
+        data: Vec<u8>,
+    },
+}
 
 impl LinkManager {
+    /// 洋葱开关：只影响附件分片大小。
+    pub fn set_onion_enabled(&self, enabled: bool) {
+        self.onion_on
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub async fn set_pool(&self, mailboxes: Vec<String>) {
         *self.pool.lock().await = mailboxes;
     }
@@ -301,6 +342,7 @@ impl LinkManager {
             api,
             links: Mutex::new(links),
             pool: Mutex::new(Vec::new()),
+            onion_on: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -493,8 +535,114 @@ impl LinkManager {
         self.maybe_rotate(conn_id).await
     }
 
+    /// 发一个附件（≤2MB）：切成分片、逐片加密投递。
+    ///
+    /// 走洋葱时分片小一点（单包上限），直连时可以大一些。
+    pub async fn send_file(
+        &self,
+        conn_id: &str,
+        name: &str,
+        mime: &str,
+        data: &[u8],
+    ) -> Result<()> {
+        if data.len() > MAX_FILE_BYTES {
+            return Err(anyhow!("附件不能超过 2MB"));
+        }
+        if name.len() > FILE_META_MAX || mime.len() > FILE_META_MAX {
+            return Err(anyhow!("文件名或类型太长"));
+        }
+        let onion_on = self.onion_on.load(std::sync::atomic::Ordering::Relaxed);
+        let chunk = if onion_on {
+            FILE_CHUNK_ONION
+        } else {
+            FILE_CHUNK_DIRECT
+        };
+
+        let mut links = self.links.lock().await;
+        let link = links
+            .get_mut(conn_id)
+            .ok_or_else(|| anyhow!("unknown connection {conn_id}"))?;
+        let out = link
+            .out
+            .clone()
+            .ok_or_else(|| anyhow!("connection not paired yet"))?;
+
+        let mut file_id = [0u8; 16];
+        rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut file_id);
+        let total = data.len().div_ceil(chunk).max(1) as u16;
+
+        for seq in 0..total {
+            let start = seq as usize * chunk;
+            let end = (start + chunk).min(data.len());
+            let mut frame = Vec::with_capacity(end - start + 128);
+            frame.push(FRAME_FILE);
+            frame.extend_from_slice(&file_id);
+            frame.extend_from_slice(&seq.to_le_bytes());
+            frame.extend_from_slice(&total.to_le_bytes());
+            if seq == 0 {
+                frame.push(name.len() as u8);
+                frame.push(mime.len() as u8);
+                frame.extend_from_slice(name.as_bytes());
+                frame.extend_from_slice(mime.as_bytes());
+            }
+            frame.extend_from_slice(&data[start..end]);
+            let blob = link.e2e.encrypt(&privchat_common::pad_plaintext(&frame))?;
+            let sig = connection::sign_send(
+                &out.queue_id,
+                &blob,
+                &SigningKey::from_bytes(&out.sender_sk),
+            );
+            self.api
+                .send(
+                    conn_id,
+                    &out.mailbox,
+                    &connection::hex_encode(&out.queue_id),
+                    blob,
+                    &sig,
+                )
+                .await?;
+        }
+        link.sent_since_rotate = link.sent_since_rotate.saturating_add(total as u32);
+        self.persist(conn_id, link)?;
+        Ok(())
+    }
+
+    /// 删除连接：本地状态、数据库行、节点上的队列（含排空中的旧队列）。
+    pub async fn delete(&self, conn_id: &str) -> Result<()> {
+        let link = {
+            let mut links = self.links.lock().await;
+            links
+                .remove(conn_id)
+                .ok_or_else(|| anyhow!("unknown connection {conn_id}"))?
+        };
+
+        // 节点上的队列尽力删掉（删不掉也不挡本地删除，等 TTL 收尸）。
+        let mut queues: Vec<([u8; 16], String, SigningKey)> = vec![(
+            link.in_queue,
+            link.in_mailbox.clone(),
+            link.owner_keys.owner.clone(),
+        )];
+        for drained in &link.draining {
+            queues.push((
+                drained.queue_id,
+                drained.mailbox.clone(),
+                drained.keys.owner.clone(),
+            ));
+        }
+        for (queue_id, mailbox, owner) in queues {
+            let sig = connection::sign_delete(&queue_id, &owner);
+            let _ = self
+                .api
+                .delete(conn_id, &mailbox, &connection::hex_encode(&queue_id), &sig)
+                .await;
+        }
+
+        self.store.delete_connection(conn_id)?;
+        Ok(())
+    }
+
     /// 取走并解密本连接入站队列（含轮换中的旧队列）的全部消息。
-    pub async fn poll(&self, conn_id: &str) -> Result<Vec<Vec<u8>>> {
+    pub async fn poll(&self, conn_id: &str) -> Result<Vec<ReceivedFrame>> {
         let (mut sources, had_draining) = {
             let links = self.links.lock().await;
             let link = links
@@ -517,7 +665,8 @@ impl LinkManager {
 
         let mut blobs = Vec::new();
         let mut empty: Vec<[u8; 16]> = Vec::new();
-        for (mailbox, queue, sig) in sources.drain(..) {
+        let mut primary_failed = false;
+        for (index, (mailbox, queue, sig)) in sources.drain(..).enumerate() {
             match self
                 .api
                 .get(conn_id, &mailbox, &connection::hex_encode(&queue), &sig)
@@ -529,7 +678,13 @@ impl LinkManager {
                     }
                     blobs.append(&mut rows);
                 }
-                Err(e) => eprintln!("[links] get from {mailbox} failed: {e}"),
+                Err(e) => {
+                    // 只统计主队列：排空中的旧队列失败不影响判断。
+                    if index == 0 {
+                        primary_failed = true;
+                    }
+                    eprintln!("[links] get from {mailbox} failed: {e}");
+                }
             }
         }
 
@@ -538,6 +693,15 @@ impl LinkManager {
         let link = links
             .get_mut(conn_id)
             .ok_or_else(|| anyhow!("unknown connection {conn_id}"))?;
+
+        // 主队列连续拉不动：累计失败次数，够了就换个信箱再来。
+        if primary_failed {
+            link.fail_streak = link.fail_streak.saturating_add(1);
+        } else {
+            link.fail_streak = 0;
+        }
+        let want_failover = link.fail_streak >= FAILOVER_AFTER;
+        let current_mailbox = link.in_mailbox.clone();
 
         // 旧的排空队列：连续几次没消息就删掉。
         if had_draining {
@@ -578,7 +742,9 @@ impl LinkManager {
                 }
             };
             match plain.first().copied() {
-                Some(FRAME_TEXT) => out.push(plain[1..].to_vec()),
+                Some(FRAME_TEXT) => out.push(ReceivedFrame::Text(
+                    String::from_utf8_lossy(&plain[1..]).into_owned(),
+                )),
                 Some(FRAME_ROTATE) => match serde_json::from_slice::<OutQueue>(&plain[1..]) {
                     Ok(new_out) => {
                         link.out = Some(new_out);
@@ -586,10 +752,60 @@ impl LinkManager {
                     }
                     Err(e) => eprintln!("[links] bad rotate frame: {e}"),
                 },
+                Some(FRAME_FILE) => {
+                    if let Some(frame) = parse_file_chunk(&plain[1..]) {
+                        let partial =
+                            link.incoming
+                                .entry(frame.id)
+                                .or_insert_with(|| PartialFile {
+                                    name: String::new(),
+                                    mime: String::new(),
+                                    total: frame.total,
+                                    next: 0,
+                                    data: Vec::new(),
+                                });
+                        if frame.seq == 0 {
+                            partial.name = frame.name;
+                            partial.mime = frame.mime;
+                            partial.total = frame.total;
+                            partial.data.clear();
+                            partial.next = 0;
+                        }
+                        if frame.seq == partial.next {
+                            partial.data.extend_from_slice(&frame.data);
+                            partial.next += 1;
+                        }
+                        if partial.next == partial.total {
+                            if let Some(done) = link.incoming.remove(&frame.id) {
+                                out.push(ReceivedFrame::File {
+                                    name: done.name,
+                                    mime: done.mime,
+                                    data: done.data,
+                                });
+                            }
+                        }
+                    }
+                }
                 _ => eprintln!("[links] unknown frame type"),
             }
         }
         self.persist(conn_id, link)?;
+        drop(links);
+
+        // 换一台信箱：池里得有别的节点才算有意义。
+        if want_failover {
+            let pool = self.pool.lock().await.clone();
+            let has_other = pool.iter().any(|m| m != &current_mailbox);
+            if has_other {
+                eprintln!(
+                    "[links] {} unreachable {} times, rotating to another mailbox",
+                    conn_id, FAILOVER_AFTER
+                );
+                if let Err(e) = self.rotate(conn_id).await {
+                    eprintln!("[links] failover rotate failed: {e}");
+                }
+            }
+        }
         Ok(out)
     }
 
@@ -686,6 +902,8 @@ fn row_to_link(row: &ConnRow) -> Result<Link> {
         user_rotate: false,
         draining: draining_from_json(&row.draining),
         created: row.created,
+        fail_streak: 0,
+        incoming: std::collections::HashMap::new(),
     })
 }
 
@@ -737,6 +955,49 @@ fn draining_from_json(text: &str) -> Vec<DrainingQueue> {
             })
         })
         .collect()
+}
+
+struct FileChunk {
+    id: [u8; 16],
+    seq: u16,
+    total: u16,
+    name: String,
+    mime: String,
+    data: Vec<u8>,
+}
+
+/// 解析一个文件分片帧（已去掉帧类型字节）。
+fn parse_file_chunk(body: &[u8]) -> Option<FileChunk> {
+    if body.len() < 20 {
+        return None;
+    }
+    let id: [u8; 16] = body[..16].try_into().ok()?;
+    let seq = u16::from_le_bytes([body[16], body[17]]);
+    let total = u16::from_le_bytes([body[18], body[19]]);
+    if total == 0 || seq >= total {
+        return None;
+    }
+    let mut pos = 20;
+    let (name, mime) = if seq == 0 {
+        let name_len = *body.get(pos)? as usize;
+        let mime_len = *body.get(pos + 1)? as usize;
+        pos += 2;
+        let name = String::from_utf8(body.get(pos..pos + name_len)?.to_vec()).ok()?;
+        pos += name_len;
+        let mime = String::from_utf8(body.get(pos..pos + mime_len)?.to_vec()).ok()?;
+        pos += mime_len;
+        (name, mime)
+    } else {
+        (String::new(), String::new())
+    };
+    Some(FileChunk {
+        id,
+        seq,
+        total,
+        name,
+        mime,
+        data: body.get(pos..)?.to_vec(),
+    })
 }
 
 fn is_peer_id(id: &str) -> bool {

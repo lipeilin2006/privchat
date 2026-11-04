@@ -68,19 +68,19 @@ impl AppState {
         );
         *self.app.lock().await = Some(app.clone());
 
-        // 每 3 秒拉一次已建立的连接，新消息通过事件上抛前端。
+        // 后台轮询：每轮 2.2~3.8 秒（随机抖动，别让节点看到固定的 3 秒节奏）。
         let handle = app_handle.clone();
         let poll_app = app.clone();
         let task = tauri::async_runtime::spawn(async move {
-            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3));
             loop {
-                ticker.tick().await;
                 for (conn_id, text) in poll_app.poll_all_connections().await {
                     let _ = handle.emit(
                         "connection://message",
                         &serde_json::json!({"conn_id": conn_id, "text": text}),
                     );
                 }
+                let jitter_ms = 2200 + (rand_core::RngCore::next_u32(&mut rand_core::OsRng) % 1600);
+                tokio::time::sleep(std::time::Duration::from_millis(u64::from(jitter_ms))).await;
             }
         });
         *self.poll_task.lock().await = Some(task);

@@ -122,6 +122,17 @@ impl QueueApi for MemQueues {
     }
 }
 
+/// 只取文本帧，方便断言。
+fn texts(frames: Vec<ReceivedFrame>) -> Vec<String> {
+    frames
+        .into_iter()
+        .filter_map(|frame| match frame {
+            ReceivedFrame::Text(text) => Some(text),
+            _ => None,
+        })
+        .collect()
+}
+
 async fn manager(api: Arc<dyn QueueApi>, dir: &str) -> LinkManager {
     let path = std::env::temp_dir().join(format!("privchat-links-{dir}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&path);
@@ -155,7 +166,10 @@ async fn queue_rotation_switches_mailbox() {
     // B 取一次，收到轮换通知，把出站队列切到 A 的新队列。
     let _ = b.poll(&b_id).await.expect("b poll");
     b.send(&b_id, b"hi new queue").await.expect("b send");
-    assert_eq!(a.poll(&a_id).await.unwrap(), vec![b"hi new queue".to_vec()]);
+    assert_eq!(
+        texts(a.poll(&a_id).await.unwrap()),
+        vec!["hi new queue".to_string()]
+    );
 
     // 旧队列连续几次没消息后应被删除。
     let old_queue = a.links.lock().await[&a_id].draining[0].queue_id;
@@ -209,14 +223,14 @@ async fn mutual_scan_end_to_end() {
 
     a.send(&a_id, b"hello from a").await.expect("a send");
     let got = b.poll(&b_id).await.expect("b poll");
-    assert_eq!(got, vec![b"hello from a".to_vec()]);
+    assert_eq!(texts(got), vec!["hello from a".to_string()]);
 
     b.send(&b_id, b"hi from b").await.expect("b send");
     let got = a.poll(&a_id).await.expect("a poll");
-    assert_eq!(got, vec![b"hi from b".to_vec()]);
+    assert_eq!(texts(got), vec!["hi from b".to_string()]);
 
     // 取回即删。
-    assert!(a.poll(&a_id).await.unwrap().is_empty());
+    assert!(texts(a.poll(&a_id).await.unwrap()).is_empty());
 }
 
 /// 轮换后重启：排空列表必须跟着连接一起回来，否则旧队列里的消息永远没人取。
@@ -377,4 +391,64 @@ async fn connection_created_timestamp_survives_reload() {
     let links = reloaded.links.lock().await;
     let link = links.get(&id).expect("link restored");
     assert!(link.created > 0, "created timestamp must be persisted");
+}
+
+/// 主队列连续拉不动时，自动换到池里的另一台信箱。
+#[tokio::test]
+async fn repeated_get_failures_trigger_failover() {
+    let api = Arc::new(MemQueues::default());
+    let a = manager(api.clone() as Arc<dyn QueueApi>, "fo-a").await;
+    let b = manager(api.clone() as Arc<dyn QueueApi>, "fo-b").await;
+
+    let (a_id, a_invite) = a.create("m1").await.expect("a create");
+    let (b_id, b_invite) = b.create("m1").await.expect("b create");
+    a.accept(&a_id, &b_invite).await.expect("a accept");
+    b.accept(&b_id, &a_invite).await.expect("b accept");
+
+    a.set_pool(vec!["m1".to_string(), "m2".to_string()]).await;
+
+    // 模拟信箱失联：把 a 的入站队列从节点上抹掉。
+    let in_hex = connection::hex_encode(&a.links.lock().await[&a_id].in_queue);
+    api.queues.lock().unwrap().remove(&in_hex);
+
+    for _ in 0..FAILOVER_AFTER {
+        let _ = a.poll(&a_id).await;
+    }
+
+    let links = a.links.lock().await;
+    let link = &links[&a_id];
+    assert_eq!(
+        link.in_mailbox, "m2",
+        "should fail over to the second mailbox"
+    );
+    assert_eq!(link.draining.len(), 1, "old queue should go to draining");
+}
+
+/// 附件：分片发送、对端拼回原样。
+#[tokio::test]
+async fn file_transfer_roundtrip() {
+    let api = Arc::new(MemQueues::default());
+    let a = manager(api.clone() as Arc<dyn QueueApi>, "file-a").await;
+    let b = manager(api.clone() as Arc<dyn QueueApi>, "file-b").await;
+
+    let (a_id, a_invite) = a.create("m1").await.expect("a create");
+    let (b_id, b_invite) = b.create("m1").await.expect("b create");
+    a.accept(&a_id, &b_invite).await.expect("a accept");
+    b.accept(&b_id, &a_invite).await.expect("b accept");
+
+    let payload: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
+    a.send_file(&a_id, "pic.png", "image/png", &payload)
+        .await
+        .expect("send file");
+
+    let frames = b.poll(&b_id).await.expect("b poll");
+    assert_eq!(frames.len(), 1, "one file should be assembled");
+    match &frames[0] {
+        ReceivedFrame::File { name, mime, data } => {
+            assert_eq!(name, "pic.png");
+            assert_eq!(mime, "image/png");
+            assert_eq!(data, &payload, "payload must survive chunking");
+        }
+        other => panic!("expected file frame, got {other:?}"),
+    }
 }

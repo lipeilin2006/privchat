@@ -1,12 +1,27 @@
 import { useEffect, useRef, useState } from "react";
 import { Placeholder } from "@telegram-apps/telegram-ui";
-import { ArrowLeft, CheckCheck, SendHorizontal } from "lucide-react";
+import { ArrowLeft, CheckCheck, MoreHorizontal, Paperclip, SendHorizontal } from "lucide-react";
 import wallpaper from "../assets/wallpaper.png";
 import { t } from "../i18n";
+import { api } from "../api";
+import ActionSheet from "./ActionSheet";
 import { avatarColor, fmtTime, initials } from "../utils/format";
 
-export default function ChatWindow({ conversation, messages, onBack, onSend }) {
+export default function ChatWindow({
+  conversation,
+  messages,
+  onBack,
+  onSend,
+  onRotate,
+  onDelete,
+  onReload,
+  notify,
+}) {
   const [text, setText] = useState("");
+  const [sheetOpen, setSheetOpen] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [sendingFile, setSendingFile] = useState(false);
+  const fileRef = useRef(null);
   const bodyRef = useRef(null);
 
   useEffect(() => {
@@ -45,7 +60,99 @@ export default function ChatWindow({ conversation, messages, onBack, onSend }) {
           <div className="chat-head-name">{conversation.title}</div>
           <div className="chat-head-sub">{t("online")}</div>
         </div>
+        <button
+          className="round-btn"
+          onClick={() => fileRef.current?.click()}
+          aria-label={t("attach")}
+          disabled={sendingFile}
+        >
+          <Paperclip size={18} />
+        </button>
+        <button
+          className="round-btn"
+          onClick={() => setSheetOpen(true)}
+          aria-label={t("more")}
+        >
+          <MoreHorizontal size={20} />
+        </button>
+        <input
+          ref={fileRef}
+          type="file"
+          className="hidden-file"
+          accept="image/*,application/pdf,text/plain,*/*"
+          onChange={async (event) => {
+            const file = event.target.files?.[0];
+            event.target.value = "";
+            if (!file) return;
+            if (file.size > 2 * 1024 * 1024) {
+              notify?.(t("fileTooLarge"), "err");
+              return;
+            }
+            setSendingFile(true);
+            try {
+              const dataUrl = await new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = () => resolve(reader.result);
+                reader.onerror = reject;
+                reader.readAsDataURL(file);
+              });
+              const base64 = String(dataUrl).split(",")[1] || "";
+              await api.sendFile(
+                conversation.peer_id,
+                file.name,
+                file.type || "application/octet-stream",
+                base64
+              );
+              await onReload?.();
+            } catch (err) {
+              notify?.(String(err), "err");
+            } finally {
+              setSendingFile(false);
+            }
+          }}
+        />
       </header>
+
+      {sheetOpen && (
+        <ActionSheet
+          title={conversation.title}
+          onClose={() => setSheetOpen(false)}
+          actions={[
+            {
+              label: t("rotateQueue"),
+              onClick: onRotate,
+            },
+            {
+              label: t("deleteConnection"),
+              danger: true,
+              onClick: () => setConfirmDelete(true),
+            },
+          ]}
+        />
+      )}
+
+      {confirmDelete && (
+        <div className="confirm-mask" onClick={() => setConfirmDelete(false)}>
+          <div className="confirm-sheet" onClick={(e) => e.stopPropagation()}>
+            <div className="confirm-title">{t("deleteConnection")}</div>
+            <div className="confirm-text">{t("deleteConfirm2")}</div>
+            <div className="confirm-actions">
+              <button className="confirm-btn" onClick={() => setConfirmDelete(false)}>
+                {t("cancel")}
+              </button>
+              <button
+                className="confirm-btn danger"
+                onClick={async () => {
+                  await onDelete?.();
+                  setConfirmDelete(false);
+                }}
+              >
+                {t("confirmOk")}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       <div className="chat-body" ref={bodyRef}>
         {messages.length > 0 && <div className="date-sep">{t("today")}</div>}
@@ -57,7 +164,22 @@ export default function ChatWindow({ conversation, messages, onBack, onSend }) {
                 m.status === "failed" ? "failed" : ""
               }`}
             >
-              <div className="msg-text">{m.text}</div>
+              {m.kind === "file" ? (
+                String(m.mime || "").startsWith("image/") && m.data ? (
+                  <img
+                    className="msg-image"
+                    src={`data:${m.mime};base64,${m.data}`}
+                    alt={m.name || "image"}
+                  />
+                ) : (
+                  <div className="file-card">
+                    <span className="file-name">{m.name || m.text}</span>
+                    <span className="file-size">{t("fileMessage")}</span>
+                  </div>
+                )
+              ) : (
+                <div className="msg-text">{m.text}</div>
+              )}
               <div className="msg-meta">
                 <span>{fmtTime(m.time)}</span>
                 {m.from === "me" && (m.status === "sent" || m.status === "sending") && (

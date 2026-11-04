@@ -5,11 +5,21 @@ use std::sync::Arc;
 use iroh_tickets::endpoint::EndpointTicket;
 use iroh_tickets::Ticket;
 use privchat_client_lib::layers::app::OnionConfig;
-use privchat_client_lib::layers::links::{IrohQueues, LinkManager};
+use privchat_client_lib::layers::links::{IrohQueues, LinkManager, ReceivedFrame};
 use privchat_client_lib::layers::store::Store;
 use privchat_client_lib::layers::transport::Transport;
 
 const KEY: [u8; 32] = [9u8; 32];
+
+fn texts(frames: Vec<ReceivedFrame>) -> Vec<String> {
+    frames
+        .into_iter()
+        .filter_map(|frame| match frame {
+            ReceivedFrame::Text(text) => Some(text),
+            _ => None,
+        })
+        .collect()
+}
 
 async fn manager(dir: &str, transport: Transport) -> (LinkManager, Arc<Store>) {
     let path =
@@ -63,12 +73,12 @@ async fn two_clients_over_real_mailbox() {
     // A → B（走真实 mailbox 节点）。
     a.send(&a_id, b"hello over mailbox").await.expect("a send");
     let got = b.poll(&b_id).await.expect("b poll");
-    assert_eq!(got, vec![b"hello over mailbox".to_vec()]);
+    assert_eq!(texts(got), vec!["hello over mailbox".to_string()]);
 
     // B → A。
     b.send(&b_id, b"hi back").await.expect("b send");
     let got = a.poll(&a_id).await.expect("a poll");
-    assert_eq!(got, vec![b"hi back".to_vec()]);
+    assert_eq!(texts(got), vec!["hi back".to_string()]);
 
     // 取回即删。
     assert!(b.poll(&b_id).await.unwrap().is_empty());

@@ -13,9 +13,12 @@ export const api = {
   createConnection: (mailbox = null) => invoke("create_connection", { mailbox }),
   acceptConnection: (connId, invite) =>
     invoke("accept_connection", { connId, invite }),
+  deleteConnection: (connId) => invoke("delete_connection", { connId }),
+  rotateConnection: (connId) => invoke("rotate_connection", { connId }),
   sendOnConnection: (connId, text) =>
     invoke("send_on_connection", { connId, text }),
-  pollConnection: (connId) => invoke("poll_connection", { connId }),
+  sendFile: (connId, name, mime, data) =>
+    invoke("send_file", { connId, name, mime, data }),
   listConnections: () => invoke("list_connections"),
   connectionHistory: (connId) => invoke("connection_history", { connId }),
   renameConnection: (connId, name) =>

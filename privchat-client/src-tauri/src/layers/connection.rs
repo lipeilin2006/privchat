@@ -241,6 +241,16 @@ pub enum LinkState {
     Established,
 }
 
+/// 正在拼装的一个入站文件。
+#[derive(Debug, Clone)]
+pub struct PartialFile {
+    pub name: String,
+    pub mime: String,
+    pub total: u16,
+    pub next: u16,
+    pub data: Vec<u8>,
+}
+
 /// 出站队列：对方的入站队列地址，以及写它需要的 sender 私钥。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OutQueue {
@@ -267,6 +277,10 @@ pub struct Link {
     pub draining: Vec<DrainingQueue>,
     /// 创建时间（毫秒）：用来在启动清理时分辨哪条待配对连接更新。
     pub created: u64,
+    /// 连续拉取失败次数（不落库）：到阈值就尝试换一台信箱。
+    pub fail_streak: u32,
+    /// 正在拼装的入站文件（不落库；半截丢了就丢了）。
+    pub incoming: std::collections::HashMap<[u8; 16], PartialFile>,
 }
 
 impl Link {
@@ -297,6 +311,8 @@ impl Link {
                 user_rotate: false,
                 draining: Vec::new(),
                 created: now_ms(),
+                fail_streak: 0,
+                incoming: std::collections::HashMap::new(),
             },
             invite,
         )

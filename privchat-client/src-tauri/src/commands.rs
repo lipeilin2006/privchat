@@ -312,6 +312,12 @@ pub(crate) struct ConnectionMessage {
     from: String,
     text: String,
     time: u64,
+    /// "text" / "file"
+    kind: String,
+    name: Option<String>,
+    mime: Option<String>,
+    /// 附件内容（base64），只有 kind=file 才有。
+    data: Option<String>,
 }
 
 /// 新协议：生成邀请（同时在该 mailbox 上创建接收队列）。
@@ -341,6 +347,52 @@ pub(crate) async fn accept_connection(
         .map_err(|e| e.to_string())
 }
 
+/// 删除连接：本地状态 + 节点队列一起清掉。
+#[tauri::command]
+pub(crate) async fn delete_connection(
+    conn_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    state
+        .require_app()?
+        .delete_connection(&conn_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// 手动轮换入站队列（换一条队列，可以换到另一台信箱）。
+#[tauri::command]
+pub(crate) async fn rotate_connection(
+    conn_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    state
+        .require_app()?
+        .rotate_connection(&conn_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// 发附件（base64 传入，≤2MB）。
+#[tauri::command]
+pub(crate) async fn send_file(
+    conn_id: String,
+    name: String,
+    mime: String,
+    data: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data.as_bytes())
+        .map_err(|_| "附件内容不是合法 base64".to_string())?;
+    state
+        .require_app()?
+        .send_file(&conn_id, &name, &mime, bytes)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// 新协议：发消息。
 #[tauri::command]
 pub(crate) async fn send_on_connection(
@@ -351,19 +403,6 @@ pub(crate) async fn send_on_connection(
     state
         .require_app()?
         .send_on_connection(&conn_id, &text)
-        .await
-        .map_err(|e| e.to_string())
-}
-
-/// 新协议：手动拉一次。
-#[tauri::command]
-pub(crate) async fn poll_connection(
-    conn_id: String,
-    state: State<'_, AppState>,
-) -> Result<Vec<String>, String> {
-    state
-        .require_app()?
-        .poll_connection(&conn_id)
         .await
         .map_err(|e| e.to_string())
 }
@@ -397,11 +436,20 @@ pub(crate) async fn connection_history(
         .connection_history(&conn_id)
         .map_err(|e| e.to_string())?
         .into_iter()
-        .map(|m| ConnectionMessage {
-            id: m.msg_id,
-            from: m.sender,
-            text: m.text,
-            time: m.time,
+        .map(|m| {
+            use base64::Engine;
+            ConnectionMessage {
+                id: m.msg_id,
+                from: m.sender,
+                text: m.text,
+                time: m.time,
+                kind: m.kind,
+                name: m.name,
+                mime: m.mime,
+                data: m
+                    .data
+                    .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes)),
+            }
         })
         .collect())
 }

@@ -70,6 +70,10 @@ impl Store {
                  sender TEXT NOT NULL,
                  text TEXT NOT NULL,
                  time INTEGER NOT NULL,
+                 kind TEXT NOT NULL DEFAULT 'text',
+                 name TEXT,
+                 mime TEXT,
+                 data BLOB,
                  PRIMARY KEY (conn_id, msg_id)
              );
                  CREATE TABLE IF NOT EXISTS settings (
@@ -88,6 +92,25 @@ impl Store {
                 "ALTER TABLE mailbox_peers ADD COLUMN priority INTEGER NOT NULL DEFAULT 0",
                 [],
             )?;
+        }
+        // 旧库补附件相关列（kind 有默认值，老消息默认 text）。
+        for (column, ddl) in [
+            (
+                "kind",
+                "ALTER TABLE conn_messages ADD COLUMN kind TEXT NOT NULL DEFAULT 'text'",
+            ),
+            ("name", "ALTER TABLE conn_messages ADD COLUMN name TEXT"),
+            ("mime", "ALTER TABLE conn_messages ADD COLUMN mime TEXT"),
+            ("data", "ALTER TABLE conn_messages ADD COLUMN data BLOB"),
+        ] {
+            let exists: i64 = conn.query_row(
+                "SELECT count(*) FROM pragma_table_info('conn_messages') WHERE name = ?1",
+                [column],
+                |row| row.get(0),
+            )?;
+            if exists == 0 {
+                conn.execute(ddl, [])?;
+            }
         }
         // 旧库直接对齐 schema：role / last_used 两个没用的 NOT NULL 列去掉。
         let legacy_columns: i64 = conn.query_row(

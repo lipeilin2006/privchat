@@ -328,10 +328,15 @@ impl App {
             onion.clone(),
             relay_latency.clone(),
         ));
+        let onion_enabled = {
+            let cfg = onion.lock().await;
+            cfg.enabled && !cfg.relays.is_empty()
+        };
         let links = Arc::new(LinkManager::load(store.clone(), queue_api).await?);
         links
             .set_pool(peer_ids(&mailbox_peers.lock().await.clone()))
             .await;
+        links.set_onion_enabled(onion_enabled);
         let (stop_tx, _) = watch::channel(false);
         Ok(Self {
             transport,
@@ -359,6 +364,16 @@ impl App {
         self.links.create(&mailbox).await
     }
 
+    /// 删除连接。
+    pub async fn delete_connection(&self, conn_id: &str) -> Result<()> {
+        self.links.delete(conn_id).await
+    }
+
+    /// 手动轮换入站队列。
+    pub async fn rotate_connection(&self, conn_id: &str) -> Result<()> {
+        self.links.rotate(conn_id).await
+    }
+
     /// 互扫到对方邀请后配对。
     pub async fn accept_connection(&self, conn_id: &str, invite: &str) -> Result<()> {
         self.links.accept(conn_id, invite).await
@@ -374,25 +389,74 @@ impl App {
             sender: "me".into(),
             text: text.to_string(),
             time,
+            kind: "text".into(),
+            name: None,
+            mime: None,
+            data: None,
         });
         Ok(())
     }
 
-    /// 取走并解密该连接的全部待收消息（入库后返回文本）。
+    /// 发一个附件（≤2MB，图片也走这里）。
+    pub async fn send_file(
+        &self,
+        conn_id: &str,
+        name: &str,
+        mime: &str,
+        data: Vec<u8>,
+    ) -> Result<()> {
+        self.links.send_file(conn_id, name, mime, &data).await?;
+        let time = now_ms();
+        let _ = self.store.append_conn_message(&ConnMessage {
+            conn_id: conn_id.to_string(),
+            msg_id: next_msg_id("me-file", time),
+            sender: "me".into(),
+            text: name.to_string(),
+            time,
+            kind: "file".into(),
+            name: Some(name.to_string()),
+            mime: Some(mime.to_string()),
+            data: Some(data),
+        });
+        Ok(())
+    }
+
+    /// 取走并解密该连接的全部待收消息（入库，返回给上层做提示用）。
     pub async fn poll_connection(&self, conn_id: &str) -> Result<Vec<String>> {
-        let blobs = self.links.poll(conn_id).await?;
+        let frames = self.links.poll(conn_id).await?;
         let mut out = Vec::new();
-        for (i, blob) in blobs.into_iter().enumerate() {
-            let text = String::from_utf8_lossy(&blob).into_owned();
+        for (i, frame) in frames.into_iter().enumerate() {
             let time = now_ms() + i as u64;
-            let _ = self.store.append_conn_message(&ConnMessage {
-                conn_id: conn_id.to_string(),
-                msg_id: next_msg_id("peer", time),
-                sender: "peer".into(),
-                text: text.clone(),
-                time,
-            });
-            out.push(text);
+            match frame {
+                crate::layers::links::ReceivedFrame::Text(text) => {
+                    let _ = self.store.append_conn_message(&ConnMessage {
+                        conn_id: conn_id.to_string(),
+                        msg_id: next_msg_id("peer", time),
+                        sender: "peer".into(),
+                        text: text.clone(),
+                        time,
+                        kind: "text".into(),
+                        name: None,
+                        mime: None,
+                        data: None,
+                    });
+                    out.push(text);
+                }
+                crate::layers::links::ReceivedFrame::File { name, mime, data } => {
+                    let _ = self.store.append_conn_message(&ConnMessage {
+                        conn_id: conn_id.to_string(),
+                        msg_id: next_msg_id("peer-file", time),
+                        sender: "peer".into(),
+                        text: name.clone(),
+                        time,
+                        kind: "file".into(),
+                        name: Some(name.clone()),
+                        mime: Some(mime),
+                        data: Some(data),
+                    });
+                    out.push(name);
+                }
+            }
         }
         Ok(out)
     }
@@ -446,6 +510,8 @@ impl App {
         });
         let json = serde_json::to_string(&config)?;
         self.store.save_onion_config(&json)?;
+        self.links
+            .set_onion_enabled(config.enabled && !config.relays.is_empty());
         *self.onion.lock().await = config;
         Ok(())
     }

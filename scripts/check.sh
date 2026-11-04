@@ -27,6 +27,14 @@ cargo fmt --all -- --check
 echo "[check] clippy"
 cargo clippy --workspace --all-targets -- -D warnings
 
+echo "[check] cargo audit"
+if command -v cargo-audit >/dev/null 2>&1; then
+  # 只关心漏洞；unmaintained/yanked 这类 warning 不挡合并
+  cargo audit || exit 1
+else
+  echo "[check] 跳过：cargo-audit 未安装（cargo install cargo-audit）"
+fi
+
 echo "[check] tests"
 cargo test --workspace
 

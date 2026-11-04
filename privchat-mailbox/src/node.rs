@@ -324,7 +324,11 @@ async fn handle_queue_get(handler: &MailboxHandler, req: MailboxRequest) -> Mail
     if !verify_sig(&owner_auth, &msg, &sig) {
         return err("queue_get: bad signature");
     }
-    match handler.store.take_queue(&queue).await {
+    let rows = match req.max_bytes {
+        Some(limit) if limit > 0 => handler.store.take_queue_bounded(&queue, limit).await,
+        _ => handler.store.take_queue(&queue).await,
+    };
+    match rows {
         Ok(rows) => MailboxResponse {
             ok: true,
             error: None,

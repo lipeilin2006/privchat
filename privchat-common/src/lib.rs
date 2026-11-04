@@ -71,6 +71,10 @@ pub struct MailboxRequest {
     /// 队列读/删的签名（hex）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sig: Option<String>,
+    /// 一次取走多少字节以内（QueueGet 用，缺省 = 不限制）。
+    /// 分页取，避免一个 64MiB 的队列把客户端/中继的读取上限顶爆。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<usize>,
     /// 队列的邀请有效期（毫秒，0/缺省 = 长期）。只对建队列有意义。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl_ms: Option<u64>,
@@ -87,6 +91,7 @@ impl Default for MailboxRequest {
             sender_auth: None,
             owner_auth: None,
             sig: None,
+            max_bytes: None,
             ttl_ms: None,
             payload: None,
         }
@@ -141,6 +146,14 @@ impl MailboxRequest {
             queue: Some(queue.to_string()),
             sig: Some(sig.to_string()),
             ..Self::default()
+        }
+    }
+
+    /// 取走队列消息，最多 `max_bytes` 字节（分页取）。
+    pub fn queue_get_bounded(queue: &str, sig: &str, max_bytes: usize) -> Self {
+        Self {
+            max_bytes: Some(max_bytes),
+            ..Self::queue_get(queue, sig)
         }
     }
 

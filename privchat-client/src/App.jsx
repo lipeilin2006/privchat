@@ -150,42 +150,18 @@ export default function App() {
 
   useEffect(() => {
     if (vaultState !== "unlocked") return;
-    let stopped = false;
-    const tick = async () => {
-      if (stopped) return;
-      try {
-        const list = await api.listConnections();
-        for (const c of list || []) {
-          if (c.state !== "established") continue;
-          const got = await api.pollConnection(c.conn_id);
-          if (got && got.length) {
-            const msgs = await api.connectionHistory(c.conn_id);
-            setHistory((prev) => ({ ...prev, [c.conn_id]: msgs || [] }));
-          }
-        }
-      } catch {
-        // 网络抖动：下一轮再试
-      }
-    };
-    const timer = setInterval(tick, 3000);
-    return () => {
-      stopped = true;
-      clearInterval(timer);
-    };
-  }, [vaultState]);
-
-  useEffect(() => {
-    if (vaultState !== "unlocked") return;
     let off;
-    listen("chat://message", (event) => {
-      const { from, text, time } = event.payload || {};
-      if (!from) return;
-      setHistory((prev) => {
-        const list = prev[from] ? [...prev[from]] : [];
-        if (list.some((m) => m.id === `live-${time}`)) return prev;
-        list.push({ id: `live-${time}`, from: "peer", text, time, status: "received" });
-        return { ...prev, [from]: list };
-      });
+    // 后台轮询拉到新消息后会发这个事件；前端只用重新读一次历史，
+    // 不再自己 setInterval 轮询（以前两边都在拉，消息会被对方先取走）。
+    listen("connection://message", async (event) => {
+      const connId = event.payload?.conn_id;
+      if (!connId) return;
+      try {
+        const msgs = await api.connectionHistory(connId);
+        setHistory((prev) => ({ ...prev, [connId]: msgs || [] }));
+      } catch {
+        // 下一轮事件会再来
+      }
     }).then((unlisten) => {
       off = unlisten;
     });
@@ -332,6 +308,34 @@ export default function App() {
                 messages={history[activePeer] || []}
                 onBack={() => setPage("chats")}
                 onSend={(text) => send(activePeer, text)}
+                notify={notify}
+                onReload={async () => {
+                  try {
+                    const msgs = await api.connectionHistory(activePeer);
+                    setHistory((prev) => ({ ...prev, [activePeer]: msgs || [] }));
+                  } catch {
+                    // 忽略：下次事件会刷新
+                  }
+                }}
+                onRotate={async () => {
+                  try {
+                    await api.rotateConnection(activePeer);
+                    notify(t("rotateDone"));
+                  } catch (e) {
+                    notify(String(e), "err");
+                  }
+                }}
+                onDelete={async () => {
+                  try {
+                    await api.deleteConnection(activePeer);
+                    setActivePeer(null);
+                    setPage("chats");
+                    await loadAll();
+                    notify(t("deleteDone"));
+                  } catch (e) {
+                    notify(String(e), "err");
+                  }
+                }}
               />
             )}
 

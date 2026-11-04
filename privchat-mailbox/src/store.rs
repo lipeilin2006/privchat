@@ -203,6 +203,39 @@ impl MailboxStore {
         Ok(out)
     }
 
+    /// 取走队列里至多 `max_bytes` 字节的消息（按 seq 升序），只删取走的那部分。
+    pub(crate) async fn take_queue_bounded(
+        &self,
+        queue_id: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<(i64, Vec<u8>)>> {
+        let conn = self.conn.lock().await;
+        let mut out = Vec::new();
+        let mut total = 0usize;
+        {
+            let mut stmt = conn
+                .prepare("SELECT seq, payload FROM queue_msgs WHERE queue_id = ?1 ORDER BY seq")?;
+            let rows = stmt.query_map(params![queue_id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?;
+            for row in rows {
+                let (seq, payload) = row?;
+                if total + payload.len() > max_bytes && !out.is_empty() {
+                    break;
+                }
+                total += payload.len();
+                out.push((seq, payload));
+            }
+        }
+        for (seq, _) in &out {
+            conn.execute(
+                "DELETE FROM queue_msgs WHERE queue_id = ?1 AND seq = ?2",
+                params![queue_id, seq],
+            )?;
+        }
+        Ok(out)
+    }
+
     /// 删除队列及其消息。
     pub(crate) async fn delete_queue(&self, queue_id: &str) -> Result<usize> {
         let conn = self.conn.lock().await;

@@ -149,6 +149,11 @@ pub struct ConnMessage {
     pub sender: String,
     pub text: String,
     pub time: u64,
+    /// "text" / "file"（图片也是 file，看 mime）
+    pub kind: String,
+    pub name: Option<String>,
+    pub mime: Option<String>,
+    pub data: Option<Vec<u8>>,
 }
 
 impl Store {
@@ -156,9 +161,20 @@ impl Store {
     pub fn append_conn_message(&self, m: &ConnMessage) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT OR IGNORE INTO conn_messages (conn_id, msg_id, sender, text, time)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![m.conn_id, m.msg_id, m.sender, m.text, m.time as i64],
+            "INSERT OR IGNORE INTO conn_messages
+             (conn_id, msg_id, sender, text, time, kind, name, mime, data)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                m.conn_id,
+                m.msg_id,
+                m.sender,
+                m.text,
+                m.time as i64,
+                m.kind,
+                m.name,
+                m.mime,
+                m.data
+            ],
         )?;
         Ok(())
     }
@@ -167,8 +183,8 @@ impl Store {
     pub fn conn_messages(&self, conn_id: &str, limit: usize) -> Result<Vec<ConnMessage>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT conn_id, msg_id, sender, text, time FROM conn_messages
-             WHERE conn_id = ?1 ORDER BY time, rowid LIMIT ?2",
+            "SELECT conn_id, msg_id, sender, text, time, kind, name, mime, data
+             FROM conn_messages WHERE conn_id = ?1 ORDER BY time, rowid LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![conn_id, limit as i64], |row| {
             Ok(ConnMessage {
@@ -177,6 +193,10 @@ impl Store {
                 sender: row.get(2)?,
                 text: row.get(3)?,
                 time: row.get::<_, i64>(4)? as u64,
+                kind: row.get(5)?,
+                name: row.get(6)?,
+                mime: row.get(7)?,
+                data: row.get(8)?,
             })
         })?;
         let mut out = Vec::new();

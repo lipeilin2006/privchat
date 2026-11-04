@@ -23,6 +23,19 @@ export default function MyIdPage({ onClose, onAdded, notify, onScanStateChange }
   const [invite, setInvite] = useState("");
   const [name, setName] = useState("");
   const [busy, setBusy] = useState(false);
+  const [expiresAt, setExpiresAt] = useState(0);
+  const [now, setNow] = useState(Date.now());
+
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  const remainSec = expiresAt ? Math.max(0, Math.floor((expiresAt - now) / 1000)) : 0;
+  const expired = expiresAt > 0 && remainSec === 0;
+  const countdown = `${String(Math.floor(remainSec / 60)).padStart(2, "0")}:${String(
+    remainSec % 60
+  ).padStart(2, "0")}`;
 
   // 生成邀请 = 在 mailbox 上建一条接收队列，把地址 + 写权限给对方。
   const refresh = async () => {
@@ -37,6 +50,7 @@ export default function MyIdPage({ onClose, onAdded, notify, onScanStateChange }
       const [id, text] = await api.createConnection(null);
       setConnId(id);
       setMyId(text);
+      setExpiresAt(Date.now() + 10 * 60 * 1000);
       setQr(await QRCode.toDataURL(text, { width: 220, margin: 1 }));
     } catch (e) {
       notify(String(e), "err");
@@ -146,7 +160,16 @@ export default function MyIdPage({ onClose, onAdded, notify, onScanStateChange }
       </header>
 
       <div className="id-card">
-        {qr ? <img src={qr} alt="QR" className="qr" /> : <Placeholder description={t("myId")} />}
+        {qr ? (
+          <img src={qr} alt="QR" className={`qr${expired ? " qr-expired" : ""}`} />
+        ) : (
+          <Placeholder description={t("myId")} />
+        )}
+        {qr && (
+          <div className={`invite-timer${expired ? " expired" : ""}`}>
+            {expired ? t("inviteExpired") : `${t("inviteValidFor")} ${countdown}`}
+          </div>
+        )}
         <div className="id-value mono">{myId}</div>
         <Button stretched mode="bezeled" onClick={copy} before={<Copy size={18} />}>{t("copyId")}</Button>
         <Button stretched mode="plain" loading={busy} onClick={refresh} before={<RefreshCw size={18} />}>{t("refreshId")}</Button>
