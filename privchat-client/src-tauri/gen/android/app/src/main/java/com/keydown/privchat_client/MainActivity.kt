@@ -10,6 +10,11 @@ import androidx.core.view.WindowInsetsCompat
 @Suppress("DEPRECATION")
 class MainActivity : TauriActivity() {
   override fun onCreate(savedInstanceState: Bundle?) {
+    // 防截图 / 防最近任务预览：聊天内容不该出现在系统截屏和任务切换里。
+    window.setFlags(
+      WindowManager.LayoutParams.FLAG_SECURE,
+      WindowManager.LayoutParams.FLAG_SECURE
+    )
     // Let Android resize the WebView when the IME opens instead of panning
     // the whole activity above the keyboard.
     window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)

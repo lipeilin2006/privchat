@@ -220,6 +220,7 @@ npm run uitest
 
 - [privchat-mailbox/CONFIG.md](privchat-mailbox/CONFIG.md) — 信箱配置、TTL、限额
 - [privchat-relay/CONFIG.md](privchat-relay/CONFIG.md) — 中继配置、转发白名单
+- [docs/ROADMAP.md](docs/ROADMAP.md) — 已知缺口与待办
 - [docs/SECURITY.md](docs/SECURITY.md) — 威胁模型、安全审查与抗追踪分析
 
 ---

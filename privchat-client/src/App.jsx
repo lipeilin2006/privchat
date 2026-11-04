@@ -30,6 +30,16 @@ export default function App() {
   const [toast, setToast] = useState(null);
   const toastTimer = useRef(null);
 
+  /// 锁上之后立即回到密码界面（后端会把 App 停掉、轮询任务也 abort）。
+  const lockNow = useCallback(async () => {
+    try {
+      await api.lockVault();
+    } catch {
+      // 已经锁了也无所谓
+    }
+    setVaultState("locked");
+  }, []);
+
   const notify = useCallback((text, type = "ok") => {
     setToast({ text, type });
     clearTimeout(toastTimer.current);
@@ -74,6 +84,69 @@ export default function App() {
   useEffect(() => {
     if (vaultState === "unlocked") loadAll();
   }, [vaultState, loadAll]);
+
+  // 自动锁定：空闲计时（0 = 永不）。
+  useEffect(() => {
+    if (vaultState !== "unlocked") return;
+    let minutes = 0;
+    let idleTimer;
+    const arm = () => {
+      clearTimeout(idleTimer);
+      if (minutes > 0) idleTimer = setTimeout(lockNow, minutes * 60000);
+    };
+    api
+      .autoLock()
+      .then((value) => {
+        minutes = value || 0;
+        arm();
+      })
+      .catch(() => {});
+    const events = ["pointerdown", "keydown", "touchstart", "wheel"];
+    events.forEach((event) => window.addEventListener(event, arm, { passive: true }));
+    // 设置页改完自动锁定，立刻按新值重新计时。
+    const onConfig = (event) => {
+      minutes = Number(event.detail) || 0;
+      arm();
+    };
+    window.addEventListener("privchat:autolock", onConfig);
+    return () => {
+      clearTimeout(idleTimer);
+      events.forEach((event) => window.removeEventListener(event, arm));
+      window.removeEventListener("privchat:autolock", onConfig);
+    };
+  }, [vaultState, lockNow]);
+
+  // 切后台：超过设定时长再回来也要重新解锁。
+  useEffect(() => {
+    if (vaultState !== "unlocked") return;
+    let hiddenAt = 0;
+    let minutes = 0;
+    api
+      .autoLock()
+      .then((value) => {
+        minutes = value || 0;
+      })
+      .catch(() => {});
+    const onVisibility = () => {
+      if (document.visibilityState === "hidden") {
+        hiddenAt = Date.now();
+        return;
+      }
+      if (!hiddenAt) return;
+      const elapsed = Date.now() - hiddenAt;
+      hiddenAt = 0;
+      if (minutes > 0 && elapsed >= minutes * 60000) lockNow();
+    };
+    const onConfig = (event) => {
+      minutes = Number(event.detail) || 0;
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    window.addEventListener("privchat:autolock", onConfig);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("privchat:autolock", onConfig);
+    };
+  }, [vaultState, lockNow]);
 
   useEffect(() => {
     if (vaultState !== "unlocked") return;

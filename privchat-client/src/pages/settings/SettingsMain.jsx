@@ -51,6 +51,7 @@ export default function SettingsMain({ notify, onLocked, onOpenMailbox, onOpenOn
     setLockModal(false);
     try {
       await api.setAutoLock(minutes);
+      window.dispatchEvent(new CustomEvent("privchat:autolock", { detail: minutes }));
       notify(t("saveOk"));
     } catch (e) {
       notify(String(e), "err");
