@@ -472,10 +472,7 @@ fn file_assembly_respects_limits() {
     assert!(accept_file_chunk(&mut link, frame(big, 0, 3, 1024 * 1024)).is_none());
     assert!(accept_file_chunk(&mut link, frame(big, 1, 3, 1024 * 1024)).is_none());
     assert!(accept_file_chunk(&mut link, frame(big, 2, 3, 1024 * 1024)).is_none());
-    assert!(
-        link.incoming.is_empty(),
-        "oversized file must be dropped"
-    );
+    assert!(link.incoming.is_empty(), "oversized file must be dropped");
 
     // 分片数超上限（1024）直接拒
     let many = [2u8; 16];

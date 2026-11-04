@@ -261,6 +261,7 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 fn build_and_run() {
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_app::init());
     // barcode-scanner 仅在移动端（Android/iOS）提供真实实现；桌面端该 crate 为空。
     #[cfg(mobile)]

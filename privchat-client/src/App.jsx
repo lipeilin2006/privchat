@@ -9,6 +9,7 @@ import {
 import { listen } from "@tauri-apps/api/event";
 import { onBackButtonPress } from "@tauri-apps/api/app";
 import { cancel as cancelScan } from "@tauri-apps/plugin-barcode-scanner";
+import { ensureNotificationPermission, notifyMessage } from "./notify";
 
 import { api } from "./api";
 import { t } from "./i18n";
@@ -29,6 +30,8 @@ export default function App() {
   const [page, setPage] = useState("chats");
   const [toast, setToast] = useState(null);
   const toastTimer = useRef(null);
+  const contactsRef = useRef([]);
+  contactsRef.current = contacts;
 
   /// 锁上之后立即回到密码界面（后端会把 App 停掉、轮询任务也 abort）。
   const lockNow = useCallback(async () => {
@@ -84,6 +87,11 @@ export default function App() {
   useEffect(() => {
     if (vaultState === "unlocked") loadAll();
   }, [vaultState, loadAll]);
+
+  // 解锁后把通知权限要一次
+  useEffect(() => {
+    if (vaultState === "unlocked") ensureNotificationPermission();
+  }, [vaultState]);
 
   // 自动锁定：空闲计时（0 = 永不）。
   useEffect(() => {
@@ -161,6 +169,12 @@ export default function App() {
         setHistory((prev) => ({ ...prev, [connId]: msgs || [] }));
       } catch {
         // 下一轮事件会再来
+      }
+      // App 不在前台时弹本地通知
+      if (document.visibilityState === "hidden") {
+        const name = contactsRef.current.find((c) => c.peer_id === connId)?.name;
+        const preview = String(event.payload?.text || t("newMessage")).slice(0, 80);
+        notifyMessage(name || t("newMessage"), preview);
       }
     }).then((unlisten) => {
       off = unlisten;

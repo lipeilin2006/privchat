@@ -945,7 +945,10 @@ fn accept_file_chunk(link: &mut Link, frame: FileChunk) -> Option<ReceivedFrame>
         return None;
     }
     if !link.incoming.contains_key(&frame.id) && link.incoming.len() >= FILE_MAX_PARTIALS {
-        eprintln!("[links] too many in-flight files, dropping {}", hex_tag(&frame.id));
+        eprintln!(
+            "[links] too many in-flight files, dropping {}",
+            hex_tag(&frame.id)
+        );
         return None;
     }
     let partial = link
