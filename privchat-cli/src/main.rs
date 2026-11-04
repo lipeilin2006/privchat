@@ -23,6 +23,12 @@ use privchat_client_lib::layers::crypto::Ratchet;
 use privchat_common::{find_pow, make_endpoint, send_request, MailboxRequest, MailboxResponse};
 use privchat_onion::{wrap, ONION_ALPN};
 
+mod demo;
+mod image;
+
+use demo::cmd_demo;
+use image::{cmd_recv_image, cmd_send_image};
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -313,18 +319,15 @@ fn relays_of(args: &Args) -> Vec<String> {
 }
 
 fn hex_to_32(s: &str) -> Result<[u8; 32]> {
-    if s.len() != 64 {
-        bail!("SPK 应为 64 位十六进制");
-    }
-    let mut out = [0u8; 32];
-    for i in 0..32 {
-        out[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)?;
-    }
-    Ok(out)
+    let bytes = privchat_client_lib::layers::crypto::hex_decode(s)?;
+    bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("SPK 应为 64 位十六进制"))
 }
 
 fn hex_of(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    privchat_client_lib::layers::crypto::hex_encode(bytes)
 }
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -703,203 +706,6 @@ async fn cmd_recv(home: &Path, name: &str, mailbox: &str, only_peer: Option<&str
                 m.plain.len()
             ),
         }
-    }
-    Ok(())
-}
-
-async fn cmd_send_image(
-    home: &Path,
-    from: &str,
-    to: &str,
-    path: &str,
-    mailbox: &str,
-    relays: Vec<String>,
-    chunk_size: usize,
-) -> Result<()> {
-    let data = fs::read(path).with_context(|| format!("读取图片失败: {path}"))?;
-    if data.is_empty() {
-        bail!("图片为空");
-    }
-    let file_name = Path::new(path)
-        .file_name()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| "image.bin".into());
-    let sha = sha256_hex(&data);
-    let chunk = chunk_size.max(1024);
-    let chunks = data.len().div_ceil(chunk);
-    let manifest = json!({
-        "v": 1, "type": "img-manifest", "name": file_name,
-        "size": data.len(), "sha256": sha, "chunks": chunks, "chunk_size": chunk,
-        "ts": now_ms(),
-    });
-
-    let (label, peer, spk) = resolve_contact(home, from, to)?;
-    let secret = identity_for(home, from, &label)?;
-    let mut ratchet = load_ratchet(home, &secret, from, &peer, spk.as_deref())?;
-    // P0：图片发送同样用一次性连接身份。
-    let endpoint = make_endpoint(SecretKey::generate()).await?;
-
-    let started = Instant::now();
-    let (mid, _) = deliver(
-        home,
-        from,
-        &secret,
-        &peer,
-        manifest.to_string().as_bytes(),
-        mailbox,
-        &relays,
-        &endpoint,
-        &mut ratchet,
-    )
-    .await?;
-    println!(
-        "manifest msg_id={mid} size={}B chunks={chunks} sha256={sha}",
-        data.len()
-    );
-
-    for (i, piece) in data.chunks(chunk).enumerate() {
-        let (mid, len) = deliver(
-            home,
-            from,
-            &secret,
-            &peer,
-            piece,
-            mailbox,
-            &relays,
-            &endpoint,
-            &mut ratchet,
-        )
-        .await?;
-        println!(
-            "  chunk {}/{} msg_id={mid} ciphertext={len}B",
-            i + 1,
-            chunks
-        );
-    }
-    endpoint.close().await;
-    let route = if relays.is_empty() { "direct" } else { "onion" };
-    println!(
-        "image sent: {chunks} chunks in {}ms route={route}",
-        started.elapsed().as_millis()
-    );
-    Ok(())
-}
-
-async fn cmd_recv_image(
-    home: &Path,
-    name: &str,
-    mailbox: &str,
-    only_peer: Option<&str>,
-    out: Option<&str>,
-) -> Result<()> {
-    let msgs = recv_all(home, name, mailbox, only_peer).await?;
-    let mut manifest: Option<Value> = None;
-    let mut chunks: Vec<(u64, Vec<u8>)> = Vec::new();
-    for m in &msgs {
-        if let Ok(v) = serde_json::from_slice::<Value>(&m.plain) {
-            if v.get("type").and_then(|t| t.as_str()) == Some("img-manifest") {
-                manifest = Some(v);
-                continue;
-            }
-        }
-        chunks.push((msg_order(&m.msg_id).1, m.plain.clone()));
-    }
-    let manifest = manifest.ok_or_else(|| anyhow!("未收到图片清单（img-manifest）"))?;
-    let expect = manifest["chunks"].as_u64().unwrap_or(0) as usize;
-    if chunks.len() != expect {
-        bail!("分块数量不符：收到 {}，应为 {expect}", chunks.len());
-    }
-    chunks.sort_by_key(|(i, _)| *i);
-    let mut data = Vec::new();
-    for (_, piece) in &chunks {
-        data.extend_from_slice(piece);
-    }
-    let expect_sha = manifest["sha256"].as_str().unwrap_or_default();
-    let actual = sha256_hex(&data);
-    if actual != expect_sha {
-        bail!("sha256 校验失败：期望 {expect_sha}，实际 {actual}");
-    }
-    // 清单里的文件名来自对端，必须只取最后一段，防止 `../` 路径穿越。
-    let raw_name = manifest["name"].as_str().unwrap_or("image.bin");
-    let safe_name = Path::new(raw_name)
-        .file_name()
-        .map(|s| s.to_string_lossy().to_string())
-        .filter(|s| !s.is_empty() && s != ".." && s != ".")
-        .unwrap_or_else(|| "image.bin".into());
-    let out_path = PathBuf::from(out.unwrap_or(&safe_name));
-    fs::write(&out_path, &data)?;
-    println!(
-        "image received: {} bytes -> {} (sha256 ok)",
-        data.len(),
-        out_path.display()
-    );
-    Ok(())
-}
-
-async fn cmd_demo(home: &Path, mailbox: &str) -> Result<()> {
-    let demo_home = home.join("demo");
-    fs::create_dir_all(&demo_home)?;
-    for f in fs::read_dir(&demo_home)?.flatten() {
-        let _ = fs::remove_file(f.path());
-    }
-    let alice = SecretKey::generate();
-    let bob = SecretKey::generate();
-    fs::write(key_path(&demo_home, "alice"), alice.to_bytes())?;
-    fs::write(key_path(&demo_home, "bob"), bob.to_bytes())?;
-    let alice_id = peer_id_of(&alice);
-    let bob_id = peer_id_of(&bob);
-    fs::write(
-        demo_home.join("bob.contacts"),
-        format!("{alice_id} {alice_id} {}\n", hex_of(&cli_spk_pub(&alice))),
-    )?;
-    fs::write(
-        demo_home.join("alice.contacts"),
-        format!("{bob_id} {bob_id} {}\n", hex_of(&cli_spk_pub(&bob))),
-    )?;
-    println!("demo identities\n  alice: {alice_id}\n  bob  : {bob_id}");
-
-    let text = format!("hello from alice @ {}", now_ms());
-    let t0 = Instant::now();
-    let (msg_id, cipher_len) = {
-        let secret = alice.clone();
-        let mut ratchet = Ratchet::new_initiator(&secret, &bob_id, &cli_spk_pub(&bob))?;
-        let endpoint = make_endpoint(SecretKey::generate()).await?;
-        let body = json!({"v":1,"type":"text","ts":now_ms(),"text":text}).to_string();
-        let r = deliver(
-            &demo_home,
-            "alice",
-            &secret,
-            &bob_id,
-            body.as_bytes(),
-            mailbox,
-            &[],
-            &endpoint,
-            &mut ratchet,
-        )
-        .await;
-        endpoint.close().await;
-        r?
-    };
-    println!("\n1) alice -> bob\n   msg_id={msg_id} ciphertext={cipher_len}B");
-
-    let received = recv_all(&demo_home, "bob", mailbox, Some(&alice_id)).await?;
-    println!("\n2) bob fetch + decrypt");
-    let mut ok = false;
-    for m in &received {
-        let v: Value = serde_json::from_slice(&m.plain)?;
-        println!("   from={} ciphertext={}B", m.peer, m.cipher_len);
-        println!("   plaintext={}", v["text"].as_str().unwrap_or_default());
-        if v["text"].as_str() == Some(text.as_str()) {
-            ok = true;
-        }
-    }
-    println!(
-        "\nresult: {} ({} ms)",
-        if ok { "PASS" } else { "FAIL" },
-        t0.elapsed().as_millis()
-    );
-    if !ok {
-        bail!("端到端校验失败");
     }
     Ok(())
 }

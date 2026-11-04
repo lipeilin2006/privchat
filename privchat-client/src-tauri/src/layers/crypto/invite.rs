@@ -3,6 +3,8 @@
 //! 签名覆盖 `IK || SPK || OPK 列表`，收方验签后即可确认这些密钥都属于该 IK。
 
 use anyhow::{anyhow, Result};
+
+use super::hex::{hex_decode, hex_encode};
 use ed25519_dalek::SigningKey;
 
 /// 邀请串前缀。
@@ -35,7 +37,7 @@ pub fn parse_invite(invite: &str) -> Result<(String, [u8; 32], Option<String>)> 
         .trim()
         .strip_prefix(INVITE_PREFIX)
         .ok_or_else(|| anyhow!("invite must start with {INVITE_PREFIX}"))?;
-    let bytes = hex_decode_vec(raw)?;
+    let bytes = hex_decode(raw)?;
     if bytes.len() < 130 {
         return Err(anyhow!("bad invite length: {}", bytes.len()));
     }
@@ -62,35 +64,4 @@ pub fn parse_invite(invite: &str) -> Result<(String, [u8; 32], Option<String>)> 
     vk.verify_strict(&msg, &ed25519_dalek::Signature::from_bytes(&sig))
         .map_err(|_| anyhow!("invite signature verification failed"))?;
     Ok((hex_encode(&ik), spk, ticket))
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        out.push_str(&format!("{b:02x}"));
-    }
-    out
-}
-
-fn hex_val(b: u8) -> Result<u8> {
-    match b {
-        b'0'..=b'9' => Ok(b - b'0'),
-        b'a'..=b'f' => Ok(b - b'a' + 10),
-        b'A'..=b'F' => Ok(b - b'A' + 10),
-        _ => Err(anyhow!("invalid hex char: {}", b as char)),
-    }
-}
-
-fn hex_decode_vec(s: &str) -> Result<Vec<u8>> {
-    if s.len() % 2 != 0 {
-        return Err(anyhow!("odd hex length"));
-    }
-    let mut out = Vec::with_capacity(s.len() / 2);
-    let bytes = s.as_bytes();
-    for i in (0..bytes.len()).step_by(2) {
-        let hi = hex_val(bytes[i])?;
-        let lo = hex_val(bytes[i + 1])?;
-        out.push((hi << 4) | lo);
-    }
-    Ok(out)
 }

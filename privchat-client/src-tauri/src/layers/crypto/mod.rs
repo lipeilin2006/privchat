@@ -56,10 +56,12 @@ use rand_core::RngCore;
 use sha2::{Digest, Sha256};
 
 pub(super) mod header;
+pub(super) mod hex;
 pub(super) mod invite;
 pub(super) mod ratchet;
 pub(super) mod x3dh;
 
+pub use hex::{hex_decode, hex_encode};
 pub use invite::{encode_invite, parse_invite};
 pub use ratchet::Ratchet;
 
@@ -204,33 +206,20 @@ fn insert_skipped(
 
 /// 解码对端 peer_id（hexlower 的 Ed25519 公钥）为 32 字节。
 fn decode_peer_pub(peer_id: &str) -> Result<[u8; 32]> {
-    let bytes = hex_decode(peer_id)?;
+    if peer_id.len() != 64 {
+        return Err(anyhow!(
+            "peer id must be 64 hex chars, got {}",
+            peer_id.len()
+        ));
+    }
+    let bytes: [u8; 32] = hex_decode(peer_id)?
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("peer id must be 64 hex chars"))?;
     // 校验是合法 Ed25519 公钥（防注入）。
     ed25519_dalek::VerifyingKey::from_bytes(&bytes)
         .map_err(|e| anyhow!("invalid peer key: {e}"))?;
     Ok(bytes)
-}
-
-fn hex_decode(s: &str) -> Result<[u8; 32]> {
-    if s.len() != 64 {
-        return Err(anyhow!("peer id must be 64 hex chars, got {}", s.len()));
-    }
-    let mut out = [0u8; 32];
-    for (i, byte) in out.iter_mut().enumerate() {
-        let hi = hex_val(s.as_bytes()[i * 2])?;
-        let lo = hex_val(s.as_bytes()[i * 2 + 1])?;
-        *byte = (hi << 4) | lo;
-    }
-    Ok(out)
-}
-
-fn hex_val(b: u8) -> Result<u8> {
-    match b {
-        b'0'..=b'9' => Ok(b - b'0'),
-        b'a'..=b'f' => Ok(b - b'a' + 10),
-        b'A'..=b'F' => Ok(b - b'A' + 10),
-        _ => Err(anyhow!("invalid hex char: {}", b as char)),
-    }
 }
 
 fn read_u8(bytes: &[u8], pos: &mut usize) -> Result<u8> {

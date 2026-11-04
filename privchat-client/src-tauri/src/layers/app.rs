@@ -658,25 +658,19 @@ impl App {
     /// 拿到递增且唯一的 `(gen, n)`（并发直接加密会读到相同的未提交状态，
     /// 产生相同 msg_id，接收方去重会丢弃后面几条）；对端断连且无 mailbox
     /// 兜底时，队列中剩余消息快速失败（不再各自等 10s 超时）。
-    pub async fn send_message(&self, peer_id: &str, text: &str) -> Result<ChatMessage> {
-        let utc_time = now_ms();
-        let contact = self
-            .contacts
-            .lock()
-            .await
-            .get(peer_id)
-            .cloned()
-            .ok_or_else(|| anyhow!("unknown peer: {peer_id}"))?;
-        let local_id = contact.local_id.clone();
-
-        let plain = PlainMsg {
-            msg_text: text.to_string(),
-            utc_time,
-        };
-        // 加密前做桶填充：同桶内消息密文长度一致，削弱长度侧信道。
-        let plain_bytes = privchat_common::pad_plaintext(&serde_json::to_vec(&plain)?);
-
-        let key = (local_id.clone(), peer_id.to_string());
+    /// 把一条已加密的明文投进对应会话的发送队列，并等待发送结果。
+    ///
+    /// 队列按 `(local_id, peer_id)` 串行化：保证同会话消息拿到递增的
+    /// `(gen, n)`，也避免并发加密读到同一状态。
+    async fn enqueue_send(
+        &self,
+        local_id: &str,
+        peer_id: &str,
+        plain_bytes: Vec<u8>,
+        utc_time: u64,
+        text: &str,
+    ) -> Result<ChatMessage> {
+        let key = (local_id.to_string(), peer_id.to_string());
         // 取该会话的发送 worker；不存在则创建一个（懒启动，之后复用）。
         let tx = {
             let mut queues = self.send_queues.lock().await;
@@ -716,6 +710,28 @@ impl App {
         })
         .map_err(|_| anyhow!("send queue closed for {peer_id}"))?;
         reply_rx.await.map_err(|_| anyhow!("send worker dropped"))?
+    }
+
+    pub async fn send_message(&self, peer_id: &str, text: &str) -> Result<ChatMessage> {
+        let utc_time = now_ms();
+        let contact = self
+            .contacts
+            .lock()
+            .await
+            .get(peer_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("unknown peer: {peer_id}"))?;
+        let local_id = contact.local_id.clone();
+
+        let plain = PlainMsg {
+            msg_text: text.to_string(),
+            utc_time,
+        };
+        // 加密前做桶填充：同桶内消息密文长度一致，削弱长度侧信道。
+        let plain_bytes = privchat_common::pad_plaintext(&serde_json::to_vec(&plain)?);
+
+        self.enqueue_send(&local_id, peer_id, plain_bytes, utc_time, text)
+            .await
     }
 }
 
