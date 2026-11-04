@@ -178,6 +178,9 @@ bash scripts/build-android-arm64.sh
 ## 🧪 测试
 
 ```bash
+# 一键：fmt 检查 + clippy(warning=失败) + 全 workspace 测试
+bash scripts/check.sh
+
 # Rust：客户端 lib + mailbox + common + onion
 cargo test -p privchat-client --lib -- --test-threads=1
 cargo test -p privchat-mailbox
