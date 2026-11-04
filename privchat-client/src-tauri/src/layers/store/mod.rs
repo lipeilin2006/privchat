@@ -53,7 +53,6 @@ impl Store {
              CREATE TABLE IF NOT EXISTS connections (
                  conn_id TEXT PRIMARY KEY,
                  name TEXT,
-                 role TEXT NOT NULL,
                  state TEXT NOT NULL,
                  in_queue TEXT NOT NULL,
                  in_mailbox TEXT NOT NULL,
@@ -63,7 +62,6 @@ impl Store {
                  owner_sk BLOB NOT NULL,
                  e2e_state BLOB NOT NULL,
                  created INTEGER NOT NULL,
-                 last_used INTEGER NOT NULL,
                  draining TEXT NOT NULL DEFAULT '[]'
              );
              CREATE TABLE IF NOT EXISTS conn_messages (
@@ -89,6 +87,38 @@ impl Store {
             conn.execute(
                 "ALTER TABLE mailbox_peers ADD COLUMN priority INTEGER NOT NULL DEFAULT 0",
                 [],
+            )?;
+        }
+        // 旧库直接对齐 schema：role / last_used 两个没用的 NOT NULL 列去掉。
+        let legacy_columns: i64 = conn.query_row(
+            "SELECT count(*) FROM pragma_table_info('connections') WHERE name IN ('role','last_used')",
+            [],
+            |row| row.get(0),
+        )?;
+        if legacy_columns > 0 {
+            conn.execute_batch(
+                "BEGIN;
+                 CREATE TABLE connections_new (
+                     conn_id TEXT PRIMARY KEY,
+                     name TEXT,
+                     state TEXT NOT NULL,
+                     in_queue TEXT NOT NULL,
+                     in_mailbox TEXT NOT NULL,
+                     out_queue TEXT,
+                     out_mailbox TEXT,
+                     out_sender_sk BLOB,
+                     owner_sk BLOB NOT NULL,
+                     e2e_state BLOB NOT NULL,
+                     created INTEGER NOT NULL,
+                     draining TEXT NOT NULL DEFAULT '[]'
+                 );
+                 INSERT INTO connections_new
+                     SELECT conn_id, name, state, in_queue, in_mailbox, out_queue, out_mailbox,
+                            out_sender_sk, owner_sk, e2e_state, created, draining
+                     FROM connections;
+                 DROP TABLE connections;
+                 ALTER TABLE connections_new RENAME TO connections;
+                 COMMIT;",
             )?;
         }
         // 旧库升级：早先的 connections 表没有 draining 列。
@@ -204,6 +234,56 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 老库里的 role / last_used 会在打开时被重建掉，数据要照搬过来。
+    #[test]
+    fn legacy_columns_are_dropped_on_open() {
+        let dir = temp_dir("legacy-cols");
+        let store = Store::open(&dir, KEY).expect("open");
+        let row = ConnRow {
+            conn_id: "c1".into(),
+            name: Some("Alice".into()),
+            state: "pending".into(),
+            in_queue: "00112233445566778899aabbccddeeff".into(),
+            in_mailbox: "mb".into(),
+            out_queue: None,
+            out_mailbox: None,
+            out_sender_sk: None,
+            owner_sk: vec![1u8; 32],
+            e2e_state: vec![2u8; 8],
+            created: 7,
+            draining: "[]".into(),
+        };
+        store.save_connection(&row).expect("save");
+        // 模拟老库：把已废弃的两列加回去（NOT NULL 无默认值正是老 schema 的样子）
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute_batch(
+                "ALTER TABLE connections ADD COLUMN role TEXT NOT NULL DEFAULT 'peer';
+                 ALTER TABLE connections ADD COLUMN last_used INTEGER NOT NULL DEFAULT 0;",
+            )
+            .expect("simulate legacy schema");
+        }
+        drop(store);
+
+        let store = Store::open(&dir, KEY).expect("reopen");
+        let columns: Vec<String> = {
+            let conn = store.conn.lock().unwrap();
+            let mut stmt = conn
+                .prepare("SELECT name FROM pragma_table_info('connections')")
+                .unwrap();
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+            rows.collect::<Result<Vec<_>, _>>().unwrap()
+        };
+        assert!(!columns.contains(&"role".to_string()));
+        assert!(!columns.contains(&"last_used".to_string()));
+
+        let loaded = store.load_connections().expect("load");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].conn_id, "c1");
+        assert_eq!(loaded[0].created, 7);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn connections_roundtrip() {
         let dir = temp_dir("connections");
@@ -211,8 +291,7 @@ mod tests {
         let row = ConnRow {
             conn_id: "c1".into(),
             name: Some("Alice".into()),
-            role: "owner".into(),
-            state: "invited".into(),
+            state: "pending".into(),
             in_queue: "00112233445566778899aabbccddeeff".into(),
             in_mailbox: "mb".into(),
             out_queue: None,
@@ -221,7 +300,6 @@ mod tests {
             owner_sk: vec![1u8; 32],
             e2e_state: vec![2u8; 8],
             created: 1,
-            last_used: 1,
             draining: "[]".into(),
         };
         store.save_connection(&row).expect("save");

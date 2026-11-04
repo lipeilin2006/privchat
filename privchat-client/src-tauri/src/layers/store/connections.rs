@@ -12,8 +12,6 @@ pub struct ConnRow {
     pub conn_id: String,
     /// 本端备注（可空）。
     pub name: Option<String>,
-    /// "owner" / "joiner"。
-    pub role: String,
     /// "invited" / "joining" / "established" / "closed"。
     pub state: String,
     /// 本端入站队列。
@@ -29,7 +27,6 @@ pub struct ConnRow {
     /// E2E 会话状态（`Connection::to_bytes`）。
     pub e2e_state: Vec<u8>,
     pub created: u64,
-    pub last_used: u64,
     /// 轮换后还在排空的旧队列（JSON 数组）。
     pub draining: String,
 }
@@ -40,13 +37,12 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT OR REPLACE INTO connections
-             (conn_id, name, role, state, in_queue, in_mailbox, out_queue, out_mailbox,
-              out_sender_sk, owner_sk, e2e_state, created, last_used, draining)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+             (conn_id, name, state, in_queue, in_mailbox, out_queue, out_mailbox,
+              out_sender_sk, owner_sk, e2e_state, created, draining)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
             params![
                 row.conn_id,
                 row.name,
-                row.role,
                 row.state,
                 row.in_queue,
                 row.in_mailbox,
@@ -56,7 +52,6 @@ impl Store {
                 row.owner_sk,
                 row.e2e_state,
                 row.created as i64,
-                row.last_used as i64,
                 row.draining,
             ],
         )?;
@@ -67,26 +62,24 @@ impl Store {
     pub fn load_connections(&self) -> Result<Vec<ConnRow>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT conn_id, name, role, state, in_queue, in_mailbox, out_queue, out_mailbox,
-                    out_sender_sk, owner_sk, e2e_state, created, last_used, draining
+            "SELECT conn_id, name, state, in_queue, in_mailbox, out_queue, out_mailbox,
+                    out_sender_sk, owner_sk, e2e_state, created, draining
              FROM connections ORDER BY created",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(ConnRow {
                 conn_id: row.get(0)?,
                 name: row.get(1)?,
-                role: row.get(2)?,
-                state: row.get(3)?,
-                in_queue: row.get(4)?,
-                in_mailbox: row.get(5)?,
-                out_queue: row.get(6)?,
-                out_mailbox: row.get(7)?,
-                out_sender_sk: row.get(8)?,
-                owner_sk: row.get(9)?,
-                e2e_state: row.get(10)?,
-                created: row.get::<_, i64>(11)? as u64,
-                last_used: row.get::<_, i64>(12)? as u64,
-                draining: row.get(13)?,
+                state: row.get(2)?,
+                in_queue: row.get(3)?,
+                in_mailbox: row.get(4)?,
+                out_queue: row.get(5)?,
+                out_mailbox: row.get(6)?,
+                out_sender_sk: row.get(7)?,
+                owner_sk: row.get(8)?,
+                e2e_state: row.get(9)?,
+                created: row.get::<_, i64>(10)? as u64,
+                draining: row.get(11)?,
             })
         })?;
         let mut out = Vec::new();
@@ -101,26 +94,24 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let row = conn
             .query_row(
-                "SELECT conn_id, name, role, state, in_queue, in_mailbox, out_queue, out_mailbox,
-                        out_sender_sk, owner_sk, e2e_state, created, last_used, draining
+                "SELECT conn_id, name, state, in_queue, in_mailbox, out_queue, out_mailbox,
+                        out_sender_sk, owner_sk, e2e_state, created, draining
                  FROM connections WHERE conn_id = ?1",
                 params![conn_id],
                 |row| {
                     Ok(ConnRow {
                         conn_id: row.get(0)?,
                         name: row.get(1)?,
-                        role: row.get(2)?,
-                        state: row.get(3)?,
-                        in_queue: row.get(4)?,
-                        in_mailbox: row.get(5)?,
-                        out_queue: row.get(6)?,
-                        out_mailbox: row.get(7)?,
-                        out_sender_sk: row.get(8)?,
-                        owner_sk: row.get(9)?,
-                        e2e_state: row.get(10)?,
-                        created: row.get::<_, i64>(11)? as u64,
-                        last_used: row.get::<_, i64>(12)? as u64,
-                        draining: row.get(13)?,
+                        state: row.get(2)?,
+                        in_queue: row.get(3)?,
+                        in_mailbox: row.get(4)?,
+                        out_queue: row.get(5)?,
+                        out_mailbox: row.get(6)?,
+                        out_sender_sk: row.get(7)?,
+                        owner_sk: row.get(8)?,
+                        e2e_state: row.get(9)?,
+                        created: row.get::<_, i64>(10)? as u64,
+                        draining: row.get(11)?,
                     })
                 },
             )

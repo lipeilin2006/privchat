@@ -239,8 +239,6 @@ pub enum LinkState {
     Pending,
     /// 已配对，双向可发。
     Established,
-    /// 已关闭。
-    Closed,
 }
 
 /// 出站队列：对方的入站队列地址，以及写它需要的 sender 私钥。

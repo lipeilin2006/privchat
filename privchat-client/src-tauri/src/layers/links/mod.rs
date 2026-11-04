@@ -609,7 +609,6 @@ impl LinkManager {
         let row = ConnRow {
             conn_id: conn_id.to_string(),
             name: None,
-            role: "peer".to_string(),
             state: state_str(link.state).to_string(),
             in_queue: connection::hex_encode(&link.in_queue),
             in_mailbox: link.in_mailbox.clone(),
@@ -619,7 +618,6 @@ impl LinkManager {
             owner_sk: owner_sk.to_vec(),
             e2e_state: link.e2e.to_bytes(),
             created: link.created,
-            last_used: now_ms(),
             draining: draining_to_json(&link.draining),
         };
         self.store.save_connection(&row)
@@ -630,15 +628,13 @@ fn state_str(state: LinkState) -> &'static str {
     match state {
         LinkState::Pending => "pending",
         LinkState::Established => "established",
-        LinkState::Closed => "closed",
     }
 }
 
 fn state_from_str(s: &str) -> LinkState {
     match s {
-        "pending" | "invited" | "joining" => LinkState::Pending,
         "established" => LinkState::Established,
-        _ => LinkState::Closed,
+        _ => LinkState::Pending,
     }
 }
 
@@ -729,13 +725,6 @@ fn draining_from_json(text: &str) -> Vec<DrainingQueue> {
             })
         })
         .collect()
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 fn is_peer_id(id: &str) -> bool {
