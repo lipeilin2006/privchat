@@ -360,21 +360,6 @@ async fn handle_queue_delete(handler: &MailboxHandler, req: MailboxRequest) -> M
     }
 }
 
-/// 洋葱转发白名单：`PRIVCHAT_MAILBOX_ONION_PEERS="id1,id2"`，未设置则不限制。
-fn load_onion_allowlist() -> Option<Arc<Vec<String>>> {
-    let raw = std::env::var("PRIVCHAT_MAILBOX_ONION_PEERS").ok()?;
-    let list: Vec<String> = raw
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| s.len() == 64)
-        .collect();
-    if list.is_empty() {
-        None
-    } else {
-        Some(Arc::new(list))
-    }
-}
-
 /// 日志里只打印 peer_id 前缀，减少节点日志泄露完整身份。
 fn short_id(id: &str) -> &str {
     &id[..id.len().min(12)]
@@ -409,44 +394,121 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// 读取消息 TTL 配置（秒）。环境变量 `PRIVCHAT_MAILBOX_TTL_SECS` 优先，
-/// 其次 `data_dir/config.json` 的 `ttl_secs`，缺省 7 天；0 = 永不过期。
-fn load_ttl(data_dir: &std::path::Path) -> u64 {
-    if let Ok(v) = std::env::var("PRIVCHAT_MAILBOX_TTL_SECS") {
-        if let Ok(secs) = v.trim().parse::<u64>() {
-            return secs;
-        }
-    }
-    if let Ok(bytes) = std::fs::read(data_dir.join("config.json")) {
-        #[derive(serde::Deserialize)]
-        struct Cfg {
-            ttl_secs: Option<u64>,
-        }
-        if let Ok(cfg) = serde_json::from_slice::<Cfg>(&bytes) {
-            if let Some(secs) = cfg.ttl_secs {
-                return secs;
-            }
-        }
-    }
-    7 * 24 * 3600
+/// 节点配置：`data_dir/config.json` 一个文件装下所有可调项。
+///
+/// 优先级：环境变量 > config.json > 默认值。
+/// 环境变量留着是因为 systemd / docker 里覆盖最方便，日常改配置只动 json。
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct NodeConfig {
+    /// 密文保留秒数，0 = 永不过期。
+    #[serde(default)]
+    ttl_secs: Option<u64>,
+    /// both / mailbox / relay。
+    #[serde(default)]
+    role: Option<String>,
+    /// 固定监听地址，例如 "0.0.0.0:8443"；不写则随机端口。
+    #[serde(default)]
+    bind: Option<String>,
+    /// 洋葱转发白名单（逗号分隔的 peer_id 列表）；空 = 不限制。
+    #[serde(default)]
+    onion_peers: Option<Vec<String>>,
+    /// 单队列条数上限。
+    #[serde(default)]
+    max_queue_msgs: Option<usize>,
+    /// 单队列字节上限。
+    #[serde(default)]
+    max_queue_bytes: Option<usize>,
+    /// 节点上队列总数上限。
+    #[serde(default)]
+    max_queues: Option<usize>,
 }
 
-/// 首次启动兜底：若 `config.json` 不存在则按当前生效值落盘生成，
-/// 便于用户直接编辑。已存在的文件绝不覆盖。
-/// 读取节点角色：环境变量 > `config.json` 的 `role` > `both`。
-fn load_role(data_dir: &std::path::Path) -> Result<String> {
-    if let Ok(role) = std::env::var("PRIVCHAT_MAILBOX_ROLE") {
-        return validate_role(role);
-    }
-    let cfg_path = data_dir.join("config.json");
-    if let Ok(bytes) = std::fs::read(&cfg_path) {
-        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-            if let Some(role) = value.get("role").and_then(|v| v.as_str()) {
-                return validate_role(role.to_string());
-            }
+const CONFIG_FILE: &str = "config.json";
+
+/// 生效配置：环境变量已经叠到文件配置上，后面直接用。
+struct ResolvedConfig {
+    ttl_secs: u64,
+    role: String,
+    bind: Option<String>,
+    onion_peers: Vec<String>,
+    max_queue_msgs: usize,
+    max_queue_bytes: usize,
+    max_queues: usize,
+}
+
+/// 读 config.json；不存在或写坏了就当成空配置（全部走默认）。
+fn load_node_config(data_dir: &std::path::Path) -> NodeConfig {
+    let path = data_dir.join(CONFIG_FILE);
+    let Ok(bytes) = std::fs::read(&path) else {
+        return NodeConfig::default();
+    };
+    match serde_json::from_slice::<NodeConfig>(&bytes) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("[mailbox] config.json 解析失败，按默认值启动: {e}");
+            NodeConfig::default()
         }
     }
-    Ok("both".into())
+}
+
+fn env_string(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn env_usize(key: &str) -> Option<usize> {
+    env_string(key).and_then(|v| v.parse().ok())
+}
+
+fn env_u64(key: &str) -> Option<u64> {
+    env_string(key).and_then(|v| v.parse().ok())
+}
+
+fn is_peer_id(id: &str) -> bool {
+    id.len() == 64 && id.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn resolve_config(file: NodeConfig) -> Result<ResolvedConfig> {
+    let ttl_secs = env_u64("PRIVCHAT_MAILBOX_TTL_SECS")
+        .or(file.ttl_secs)
+        .unwrap_or(7 * 24 * 3600);
+    let role = validate_role(
+        env_string("PRIVCHAT_MAILBOX_ROLE")
+            .or(file.role)
+            .unwrap_or_else(|| "both".into()),
+    )?;
+    let bind = env_string("PRIVCHAT_MAILBOX_BIND").or(file.bind);
+    let onion_peers = match env_string("PRIVCHAT_MAILBOX_ONION_PEERS") {
+        Some(raw) => raw
+            .split(',')
+            .map(str::trim)
+            .filter(|p| is_peer_id(p))
+            .map(str::to_string)
+            .collect(),
+        None => file
+            .onion_peers
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|p| is_peer_id(p))
+            .collect(),
+    };
+    Ok(ResolvedConfig {
+        ttl_secs,
+        role,
+        bind,
+        onion_peers,
+        max_queue_msgs: env_usize("PRIVCHAT_MAILBOX_MAX_QUEUE_MSGS")
+            .or(file.max_queue_msgs)
+            .unwrap_or(1000),
+        max_queue_bytes: env_usize("PRIVCHAT_MAILBOX_MAX_QUEUE_BYTES")
+            .or(file.max_queue_bytes)
+            .unwrap_or(64 * 1024 * 1024),
+        max_queues: env_usize("PRIVCHAT_MAILBOX_MAX_QUEUES")
+            .or(file.max_queues)
+            .unwrap_or(50_000),
+    })
 }
 
 fn validate_role(role: String) -> Result<String> {
@@ -454,23 +516,33 @@ fn validate_role(role: String) -> Result<String> {
         Ok(role)
     } else {
         Err(anyhow!(
-            "node role 只能是 both/relay/mailbox（环境变量 PRIVCHAT_MAILBOX_ROLE 或 config.json 的 role），当前: {role}"
+            "node role 只能是 both/relay/mailbox（config.json 的 role 或环境变量 PRIVCHAT_MAILBOX_ROLE），当前: {role}"
         ))
     }
 }
 
-fn ensure_config_files(data_dir: &std::path::Path, ttl_secs: u64, role: &str) -> Result<()> {
-    let cfg_path = data_dir.join("config.json");
-    if !cfg_path.exists() {
-        std::fs::write(
-            &cfg_path,
-            serde_json::to_string_pretty(&serde_json::json!({
-                "ttl_secs": ttl_secs,
-                "role": role,
-            }))?,
-        )?;
-        eprintln!("[mailbox] wrote {}", cfg_path.display());
+/// 首次启动兜底：把当前生效配置写进 config.json，方便用户照着改。
+/// 已存在的文件绝不覆盖。
+fn ensure_config_files(data_dir: &std::path::Path, cfg: &ResolvedConfig) -> Result<()> {
+    let cfg_path = data_dir.join(CONFIG_FILE);
+    if cfg_path.exists() {
+        return Ok(());
     }
+    let file = NodeConfig {
+        ttl_secs: Some(cfg.ttl_secs),
+        role: Some(cfg.role.clone()),
+        bind: cfg.bind.clone(),
+        onion_peers: if cfg.onion_peers.is_empty() {
+            None
+        } else {
+            Some(cfg.onion_peers.clone())
+        },
+        max_queue_msgs: Some(cfg.max_queue_msgs),
+        max_queue_bytes: Some(cfg.max_queue_bytes),
+        max_queues: Some(cfg.max_queues),
+    };
+    std::fs::write(&cfg_path, serde_json::to_string_pretty(&file)?)?;
+    eprintln!("[mailbox] wrote {}", cfg_path.display());
     Ok(())
 }
 
@@ -495,21 +567,28 @@ pub async fn run() -> Result<()> {
         key
     };
 
-    let ttl_secs = load_ttl(&data_dir);
-    let role = load_role(&data_dir)?;
-    let store = MailboxStore::open(data_dir.join("mailbox.db"), ttl_secs)?;
-    // 首次启动兜底：缺失的配置文件落盘，方便用户后续编辑。
-    ensure_config_files(&data_dir, ttl_secs, &role)?;
+    // 配置全部来自一个 config.json（环境变量可覆盖）。
+    let cfg = resolve_config(load_node_config(&data_dir))?;
+    ensure_config_files(&data_dir, &cfg)?;
+    let ttl_secs = cfg.ttl_secs;
+    let role = cfg.role.clone();
+    let store = MailboxStore::open_with_limits(
+        data_dir.join("mailbox.db"),
+        cfg.ttl_secs,
+        cfg.max_queue_msgs,
+        cfg.max_queue_bytes,
+        cfg.max_queues,
+    )?;
 
     let mut endpoint_builder = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
         .secret_key(secret_key.clone())
         .alpns(vec![ALPN.to_vec()]);
     // 公网部署常用：固定监听地址/端口，客户端可以直接拨。
     // 不设则随机端口，只能靠 relay + 发现服务找到。
-    if let Ok(bind) = std::env::var("PRIVCHAT_MAILBOX_BIND") {
+    if let Some(bind) = &cfg.bind {
         let addr: std::net::SocketAddr = bind
             .parse()
-            .map_err(|e| anyhow!("PRIVCHAT_MAILBOX_BIND 不是合法地址 {bind}: {e}"))?;
+            .map_err(|e| anyhow!("config.json 的 bind 不是合法地址 {bind}: {e}"))?;
         endpoint_builder = endpoint_builder
             .bind_addr(addr)
             .map_err(|e| anyhow!("bind_addr {addr} 失败: {e}"))?;
@@ -538,7 +617,11 @@ pub async fn run() -> Result<()> {
             endpoint: endpoint.clone(),
             allow_forward: role != "mailbox",
             allow_terminal: role != "relay",
-            onion_allow: load_onion_allowlist(),
+            onion_allow: if cfg.onion_peers.is_empty() {
+                None
+            } else {
+                Some(Arc::new(cfg.onion_peers.clone()))
+            },
         },
     );
     let router = router_builder.spawn();
@@ -572,7 +655,7 @@ pub async fn run() -> Result<()> {
     println!("  ttl     : {} secs (0 = never expire)", ttl_secs);
     println!("  data_dir: {}", data_dir.display());
     println!("  role    : {role} (mailbox={serve_mailbox}, onion_relay={serve_onion})");
-    if let Ok(bind) = std::env::var("PRIVCHAT_MAILBOX_BIND") {
+    if let Some(bind) = &cfg.bind {
         println!("  bind    : {bind}");
     }
 
@@ -624,4 +707,80 @@ pub async fn spawn_test_node(dir: &std::path::Path, ttl_secs: u64) -> Result<Tes
         .accept(ALPN, handler)
         .spawn();
     Ok(TestNode { endpoint, router })
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("privchat-node-cfg-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn old_config_without_new_fields_still_loads() {
+        let dir = temp_dir("old");
+        std::fs::write(
+            dir.join(CONFIG_FILE),
+            r#"{"ttl_secs": 60, "role": "relay"}"#,
+        )
+        .unwrap();
+        let cfg = load_node_config(&dir);
+        assert_eq!(cfg.ttl_secs, Some(60));
+        assert_eq!(cfg.role.as_deref(), Some("relay"));
+        assert!(cfg.bind.is_none());
+        assert!(cfg.onion_peers.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn full_config_parses() {
+        let dir = temp_dir("full");
+        let peer = "ab".repeat(32);
+        std::fs::write(
+            dir.join(CONFIG_FILE),
+            format!(
+                r#"{{
+                    "ttl_secs": 0,
+                    "role": "both",
+                    "bind": "0.0.0.0:8443",
+                    "onion_peers": ["{peer}"],
+                    "max_queue_msgs": 10,
+                    "max_queue_bytes": 4096,
+                    "max_queues": 99
+                }}"#
+            ),
+        )
+        .unwrap();
+        let cfg = load_node_config(&dir);
+        assert_eq!(cfg.ttl_secs, Some(0));
+        assert_eq!(cfg.bind.as_deref(), Some("0.0.0.0:8443"));
+        assert_eq!(cfg.onion_peers.as_ref().unwrap()[0], peer);
+        assert_eq!(cfg.max_queue_msgs, Some(10));
+        assert_eq!(cfg.max_queue_bytes, Some(4096));
+        assert_eq!(cfg.max_queues, Some(99));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn broken_config_falls_back_to_defaults() {
+        let dir = temp_dir("broken");
+        std::fs::write(dir.join(CONFIG_FILE), "{not json").unwrap();
+        let cfg = load_node_config(&dir);
+        assert!(cfg.role.is_none());
+        assert!(cfg.ttl_secs.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn role_validation() {
+        assert!(validate_role("both".into()).is_ok());
+        assert!(validate_role("relay".into()).is_ok());
+        assert!(validate_role("mailbox".into()).is_ok());
+        assert!(validate_role("nope".into()).is_err());
+    }
 }

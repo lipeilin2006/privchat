@@ -55,13 +55,31 @@ install -d -m 0755 /etc/privchat
 if [ ! -f /etc/privchat/mailbox.env ]; then
   cat > /etc/privchat/mailbox.env <<EOF
 PRIVCHAT_MAILBOX_DATA_DIR=/var/lib/privchat-mailbox
-PRIVCHAT_MAILBOX_BIND=0.0.0.0:${PORT}
-PRIVCHAT_MAILBOX_ROLE=both
 EOF
   chmod 0644 /etc/privchat/mailbox.env
   echo "[remote] 写入 /etc/privchat/mailbox.env"
 else
   echo "[remote] 保留已有 /etc/privchat/mailbox.env"
+fi
+
+# 节点配置统一在 config.json；已存在就不动，避免覆盖手工调过的值
+if [ ! -f /var/lib/privchat-mailbox/config.json ]; then
+  cat > /var/lib/privchat-mailbox/config.json <<EOF
+{
+  "ttl_secs": 604800,
+  "role": "both",
+  "bind": "0.0.0.0:${PORT}",
+  "onion_peers": [],
+  "max_queue_msgs": 1000,
+  "max_queue_bytes": 67108864,
+  "max_queues": 50000
+}
+EOF
+  chown privchat:privchat /var/lib/privchat-mailbox/config.json
+  chmod 0600 /var/lib/privchat-mailbox/config.json
+  echo "[remote] 写入 /var/lib/privchat-mailbox/config.json"
+else
+  echo "[remote] 保留已有 config.json"
 fi
 
 install -m 0644 /tmp/privchat-mailbox.service /etc/systemd/system/privchat-mailbox.service
