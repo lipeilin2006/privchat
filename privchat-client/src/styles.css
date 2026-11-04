@@ -2621,3 +2621,74 @@ body {
 .muted {
   opacity: 0.8;
 }
+
+/* 静态 / 动态 切换 */
+.seg {
+  display: flex;
+  gap: 4px;
+  margin: 4px 16px 6px;
+  padding: 3px;
+  border-radius: 10px;
+  background: rgba(127, 127, 127, 0.12);
+}
+
+.seg-item {
+  flex: 1;
+  border: 0;
+  background: transparent;
+  color: var(--tg-sub);
+  font-size: 13px;
+  padding: 7px 0;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.seg-item.active {
+  background: var(--tg-bg);
+  color: var(--tg-accent);
+  font-weight: 600;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+}
+
+/* 动态参数：跳数 + 两个权重 */
+.tune-block {
+  margin: 2px 16px 8px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: var(--tg-bg);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.tune-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+  color: var(--tg-text);
+}
+
+.tune-label {
+  flex: none;
+  width: 92px;
+  color: var(--tg-sub);
+  font-size: 12px;
+}
+
+.tune-slider {
+  flex: 1;
+  accent-color: var(--tg-accent);
+}
+
+.tune-value {
+  width: 18px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--tg-accent);
+  font-size: 12px;
+}
+
+.push-right {
+  margin-left: auto;
+}

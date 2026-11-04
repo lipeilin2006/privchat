@@ -172,6 +172,22 @@ pub(crate) async fn get_mailbox_peers(
 }
 
 /// 一次给所有信箱测速（并发），返回各自的往返毫秒数。
+/// 测中继延迟（连一下就走，不真发请求）。
+#[tauri::command]
+pub(crate) async fn test_onion_relays(
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::layers::app::RelayPing>, String> {
+    Ok(state.require_app()?.test_relays().await)
+}
+
+/// 最近一次中继测速的缓存（peer_id → 毫秒）。
+#[tauri::command]
+pub(crate) async fn onion_relay_latency(
+    state: State<'_, AppState>,
+) -> Result<std::collections::HashMap<String, u64>, String> {
+    Ok(state.require_app()?.get_relay_latency().await)
+}
+
 #[tauri::command]
 pub(crate) async fn ping_mailboxes(
     state: State<'_, AppState>,

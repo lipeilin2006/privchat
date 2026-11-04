@@ -13,7 +13,7 @@ use ed25519_dalek::SigningKey;
 use iroh::Endpoint;
 use tokio::sync::Mutex;
 
-use crate::layers::app::OnionConfig;
+use crate::layers::app::{OnionConfig, OnionMode, OnionRelay};
 use crate::layers::connection::{
     self, DrainingQueue, Invite, Link, LinkState, OutQueue, QueueKeys,
 };
@@ -68,14 +68,21 @@ pub struct IrohQueues {
     endpoints: Mutex<HashMap<String, Endpoint>>,
     /// 洋葱配置：开了就把请求逐层包好再送出去。
     onion: Arc<Mutex<OnionConfig>>,
+    /// 中继的实测延迟（动态模式下按权重随机挑路径用）。
+    relay_latency: Arc<Mutex<HashMap<String, u64>>>,
 }
 
 impl IrohQueues {
-    pub fn new(transport: Transport, onion: Arc<Mutex<OnionConfig>>) -> Self {
+    pub fn new(
+        transport: Transport,
+        onion: Arc<Mutex<OnionConfig>>,
+        relay_latency: Arc<Mutex<HashMap<String, u64>>>,
+    ) -> Self {
         Self {
             transport,
             endpoints: Mutex::new(HashMap::new()),
             onion,
+            relay_latency,
         }
     }
 
@@ -90,22 +97,42 @@ impl IrohQueues {
         Ok(ep)
     }
 
-    /// 洋葱路径：配置里的中继 + 终点 mailbox。没开或没配中继就返回 None。
+    /// 洋葱路径：中继 + 终点 mailbox。没开或没配中继就返回 None。
+    ///
+    /// 静态：按配置顺序整条走。
+    /// 动态：每发一次从池子里按权重随机挑 `hops` 跳——优先级越高、延迟越低
+    /// 越容易被选中，两个因素的权重大小都能调。
     async fn onion_path(&self, mailbox: &str) -> Option<Vec<String>> {
         let config = self.onion.lock().await.clone();
         if !config.enabled {
             return None;
         }
-        let mut path: Vec<String> = config
+        let pool: Vec<OnionRelay> = config
             .relays
-            .into_iter()
-            .map(|r| r.trim().to_string())
-            .filter(|r| r.len() == 64 && r.chars().all(|c| c.is_ascii_hexdigit()))
-            .filter(|r| r != mailbox)
+            .iter()
+            .filter(|relay| is_peer_id(&relay.peer_id) && relay.peer_id != mailbox)
+            .cloned()
             .collect();
-        if path.is_empty() {
+        if pool.is_empty() {
             return None;
         }
+        let relays: Vec<String> = match config.mode {
+            OnionMode::Static => pool.iter().map(|relay| relay.peer_id.clone()).collect(),
+            OnionMode::Dynamic => {
+                let latencies = self.relay_latency.lock().await.clone();
+                sample_relays(
+                    &pool,
+                    config.hops as usize,
+                    config.weight_priority,
+                    config.weight_latency,
+                    &latencies,
+                )
+            }
+        };
+        if relays.is_empty() {
+            return None;
+        }
+        let mut path = relays;
         path.push(mailbox.to_string());
         Some(path)
     }
@@ -707,6 +734,61 @@ fn draining_from_json(text: &str) -> Vec<DrainingQueue> {
             })
         })
         .collect()
+}
+
+fn is_peer_id(id: &str) -> bool {
+    id.len() == 64 && id.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// 一个中继被抽中的权重：优先级和延迟各占一份，权重大小由配置决定。
+fn relay_weight(
+    relay: &OnionRelay,
+    weight_priority: u8,
+    weight_latency: u8,
+    latencies: &HashMap<String, u64>,
+) -> u64 {
+    let priority = relay.priority.clamp(0, 9) as u64;
+    // 延迟越低分越高：0ms → 10 分，1s 以上 → 0 分；没测过给中间值。
+    let latency_score = match latencies.get(&relay.peer_id) {
+        Some(ms) => 10u64.saturating_sub((*ms / 100).min(10)),
+        None => 5,
+    };
+    // 两个权重都是 0 时退化成等概率（基础权重 1）。
+    1 + priority * weight_priority as u64 * 10 + latency_score * weight_latency as u64 * 10
+}
+
+/// 按权重不放回地抽 `hops` 个中继。
+fn sample_relays(
+    pool: &[OnionRelay],
+    hops: usize,
+    weight_priority: u8,
+    weight_latency: u8,
+    latencies: &HashMap<String, u64>,
+) -> Vec<String> {
+    if pool.is_empty() {
+        return Vec::new();
+    }
+    let mut remaining: Vec<OnionRelay> = pool.to_vec();
+    let want = hops.clamp(1, 5).min(remaining.len());
+    let mut out = Vec::with_capacity(want);
+    while out.len() < want {
+        let total: u64 = remaining
+            .iter()
+            .map(|relay| relay_weight(relay, weight_priority, weight_latency, latencies))
+            .sum();
+        let mut pick = rand_core::RngCore::next_u64(&mut rand_core::OsRng) % total.max(1);
+        let mut chosen = remaining.len() - 1;
+        for (i, relay) in remaining.iter().enumerate() {
+            let weight = relay_weight(relay, weight_priority, weight_latency, latencies);
+            if pick < weight {
+                chosen = i;
+                break;
+            }
+            pick -= weight;
+        }
+        out.push(remaining.remove(chosen).peer_id);
+    }
+    out
 }
 
 fn unique_conn_id() -> String {

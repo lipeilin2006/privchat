@@ -31,6 +31,8 @@ export const api = {
 
   getOnion: () => invoke("get_onion_config"),
   setOnion: (config) => invoke("set_onion_config", { config }),
+  testOnionRelays: () => invoke("test_onion_relays"),
+  onionRelayLatency: () => invoke("onion_relay_latency"),
 
   autoLock: () => invoke("get_auto_lock_minutes"),
   setAutoLock: (minutes) => invoke("set_auto_lock_minutes", { minutes }),

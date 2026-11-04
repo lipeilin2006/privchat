@@ -18,7 +18,11 @@ async fn manager(dir: &str, transport: Transport) -> (LinkManager, Arc<Store>) {
     std::fs::create_dir_all(&path).unwrap();
     let store = Arc::new(Store::open(&path, KEY).expect("store"));
     let onion = Arc::new(tokio::sync::Mutex::new(OnionConfig::default()));
-    let api = Arc::new(IrohQueues::new(transport, onion));
+    let api = Arc::new(IrohQueues::new(
+        transport,
+        onion,
+        Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+    ));
     let links = LinkManager::load(store.clone(), api).await.expect("load");
     (links, store)
 }

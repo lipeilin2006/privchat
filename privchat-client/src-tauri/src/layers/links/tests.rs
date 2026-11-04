@@ -293,3 +293,64 @@ async fn create_reuses_pending_invite() {
     let (id3, _) = a.create("m1").await.expect("create after pairing");
     assert_ne!(id1, id3, "paired connection must not be reused");
 }
+
+/// 动态选路：优先级高、延迟低的更容易被抽中；权重为 0 时接近等概率。
+#[test]
+fn dynamic_path_weights_priority_and_latency() {
+    let fast = "aa".repeat(32);
+    let slow = "bb".repeat(32);
+    let pool = vec![
+        OnionRelay {
+            peer_id: fast.clone(),
+            priority: 9,
+        },
+        OnionRelay {
+            peer_id: slow.clone(),
+            priority: 0,
+        },
+    ];
+    let mut latencies = HashMap::new();
+    latencies.insert(fast.clone(), 20);
+    latencies.insert(slow.clone(), 900);
+
+    let mut fast_hits = 0;
+    for _ in 0..200 {
+        let path = sample_relays(&pool, 1, 10, 10, &latencies);
+        if path[0] == fast {
+            fast_hits += 1;
+        }
+    }
+    assert!(
+        fast_hits > 150,
+        "priority+latency should favour the fast node, got {fast_hits}/200"
+    );
+
+    // 两个权重都为 0：退化成等概率。
+    let mut fast_uniform = 0;
+    for _ in 0..400 {
+        if sample_relays(&pool, 1, 0, 0, &latencies)[0] == fast {
+            fast_uniform += 1;
+        }
+    }
+    assert!(
+        (120..280).contains(&fast_uniform),
+        "zero weights should be near uniform, got {fast_uniform}/400"
+    );
+}
+
+/// 跳数不会超过池子大小，也不会重复走同一个节点。
+#[test]
+fn dynamic_path_has_no_duplicates() {
+    let pool: Vec<OnionRelay> = (0..3)
+        .map(|i| OnionRelay {
+            peer_id: format!("{:02x}", i).repeat(32),
+            priority: 0,
+        })
+        .collect();
+    let path = sample_relays(&pool, 5, 5, 5, &HashMap::new());
+    assert_eq!(path.len(), 3, "hops capped by pool size");
+    let mut unique = path.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), 3, "no duplicate relay in one path");
+}

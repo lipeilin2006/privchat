@@ -3,6 +3,7 @@
 //! 这里没有「联系人」实体：`connections` 表存的就是连接本身，
 //! 备注名只是本端显示用的别名。
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -13,6 +14,24 @@ use super::connection::LinkState;
 use super::links::{IrohQueues, LinkManager};
 use super::store::{ConnMessage, MailboxPeer, Store};
 use super::transport::Transport;
+
+/// 中继测速结果。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RelayPing {
+    pub peer_id: String,
+    pub ms: Option<u64>,
+    pub error: Option<String>,
+}
+
+impl RelayPing {
+    fn failed(peer_id: &str, error: &str) -> Self {
+        Self {
+            peer_id: peer_id.to_string(),
+            ms: None,
+            error: Some(error.to_string()),
+        }
+    }
+}
 
 /// 一次测速的结果。
 #[derive(Debug, Clone, serde::Serialize)]
@@ -86,6 +105,40 @@ mod tests {
     }
 
     #[test]
+    fn old_onion_config_still_parses() {
+        let id = "ab".repeat(32);
+        let json = format!(r#"{{"enabled":true,"relays":["{id}"]}}"#);
+        let cfg: OnionConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(cfg.mode, OnionMode::Static);
+        assert_eq!(cfg.relays.len(), 1);
+        assert_eq!(cfg.relays[0].peer_id, id);
+        assert_eq!(cfg.relays[0].priority, 0);
+        assert_eq!(cfg.hops, 2);
+        assert_eq!(cfg.weight_priority, 5);
+    }
+
+    #[test]
+    fn new_onion_config_roundtrips() {
+        let cfg = OnionConfig {
+            enabled: true,
+            mode: OnionMode::Dynamic,
+            relays: vec![OnionRelay {
+                peer_id: "cd".repeat(32),
+                priority: 7,
+            }],
+            hops: 3,
+            weight_priority: 8,
+            weight_latency: 2,
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: OnionConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.mode, OnionMode::Dynamic);
+        assert_eq!(back.relays[0].priority, 7);
+        assert_eq!(back.hops, 3);
+        assert_eq!(back.weight_priority, 8);
+    }
+
+    #[test]
     fn untested_nodes_are_last_resort() {
         let peers = vec![peer("slow", 3), peer("untested", 3)];
         let mut latencies = std::collections::HashMap::new();
@@ -99,11 +152,90 @@ mod tests {
     }
 }
 
+/// 洋葱路径模式：静态按配置顺序走，动态每次随机挑。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OnionMode {
+    #[default]
+    Static,
+    Dynamic,
+}
+
+/// 一个中继节点。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct OnionRelay {
+    pub peer_id: String,
+    /// 0..=9，动态模式下和延迟一起决定被选中的概率。
+    #[serde(default)]
+    pub priority: i64,
+}
+
 /// 洋葱路由配置。
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OnionConfig {
+    #[serde(default)]
     pub enabled: bool,
-    pub relays: Vec<String>,
+    #[serde(default)]
+    pub mode: OnionMode,
+    /// 中继池；静态模式按这个顺序走，动态模式从这里随机挑。
+    #[serde(default, deserialize_with = "de_relays")]
+    pub relays: Vec<OnionRelay>,
+    /// 动态模式走几跳（1..=5，池子不够就全用上）。
+    #[serde(default = "default_hops")]
+    pub hops: u8,
+    /// 优先级权重（0..=10）。
+    #[serde(default = "default_weight")]
+    pub weight_priority: u8,
+    /// 延迟权重（0..=10）。
+    #[serde(default = "default_weight")]
+    pub weight_latency: u8,
+}
+
+fn default_hops() -> u8 {
+    2
+}
+
+fn default_weight() -> u8 {
+    5
+}
+
+impl Default for OnionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: OnionMode::Static,
+            relays: Vec::new(),
+            hops: default_hops(),
+            weight_priority: default_weight(),
+            weight_latency: default_weight(),
+        }
+    }
+}
+
+/// 老配置里 relays 是 `["id", ...]`，新配置是 `[{"peer_id":..,"priority":..}]`，
+/// 两种都要能读。
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum RelayRaw {
+    Id(String),
+    Full(OnionRelay),
+}
+
+fn de_relays<'de, D>(deserializer: D) -> Result<Vec<OnionRelay>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = <Vec<RelayRaw> as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(raw
+        .into_iter()
+        .map(|relay| match relay {
+            RelayRaw::Id(peer_id) => OnionRelay {
+                peer_id,
+                priority: 0,
+            },
+            RelayRaw::Full(relay) => relay,
+        })
+        .collect())
 }
 
 /// L4 应用门面。
@@ -115,6 +247,8 @@ pub struct App {
     /// 配置的信箱节点（带优先级；建连接时按优先级 + 延迟挑一台）。
     mailbox_peers: Arc<Mutex<Vec<MailboxPeer>>>,
     onion: Arc<Mutex<OnionConfig>>,
+    /// 中继实测延迟缓存（动态选路用；不落库）。
+    relay_latency: Arc<Mutex<HashMap<String, u64>>>,
     stop_tx: watch::Sender<bool>,
 }
 
@@ -144,7 +278,12 @@ impl App {
                 .and_then(|json| serde_json::from_str::<OnionConfig>(&json).ok())
                 .unwrap_or_default(),
         ));
-        let queue_api = Arc::new(IrohQueues::new(transport.clone(), onion.clone()));
+        let relay_latency = Arc::new(Mutex::new(HashMap::new()));
+        let queue_api = Arc::new(IrohQueues::new(
+            transport.clone(),
+            onion.clone(),
+            relay_latency.clone(),
+        ));
         let links = Arc::new(LinkManager::load(store.clone(), queue_api).await?);
         links
             .set_pool(peer_ids(&mailbox_peers.lock().await.clone()))
@@ -156,6 +295,7 @@ impl App {
             links,
             mailbox_peers,
             onion,
+            relay_latency,
             stop_tx,
         })
     }
@@ -248,11 +388,103 @@ impl App {
         self.onion.lock().await.clone()
     }
 
-    pub async fn set_onion_config(&self, config: OnionConfig) -> Result<()> {
+    pub async fn set_onion_config(&self, mut config: OnionConfig) -> Result<()> {
+        // 收一下边界，别让前端传进来的奇怪数值把选路算坏。
+        config.hops = config.hops.clamp(1, 5);
+        config.weight_priority = config.weight_priority.min(10);
+        config.weight_latency = config.weight_latency.min(10);
+        for relay in &mut config.relays {
+            relay.priority = relay.priority.clamp(0, 9);
+        }
+        config.relays.retain(|relay| {
+            relay.peer_id.len() == 64 && relay.peer_id.chars().all(|c| c.is_ascii_hexdigit())
+        });
         let json = serde_json::to_string(&config)?;
         self.store.save_onion_config(&json)?;
         *self.onion.lock().await = config;
         Ok(())
+    }
+
+    /// 测中继延迟：连一下 ONION_ALPN 看看握手要多久（不真的发请求）。
+    pub async fn test_relays(&self) -> Vec<RelayPing> {
+        let relays = self.onion.lock().await.relays.clone();
+        if relays.is_empty() {
+            return Vec::new();
+        }
+        let Ok(local_id) = self.transport.create_identity().await else {
+            return relays
+                .iter()
+                .map(|relay| RelayPing::failed(&relay.peer_id, "创建拨号身份失败"))
+                .collect();
+        };
+        let endpoint = match self.transport.endpoint_for(&local_id).await {
+            Ok(endpoint) => endpoint,
+            Err(e) => {
+                self.transport.forget(&local_id).await;
+                return relays
+                    .iter()
+                    .map(|relay| RelayPing::failed(&relay.peer_id, &e.to_string()))
+                    .collect();
+            }
+        };
+
+        let mut set = tokio::task::JoinSet::new();
+        for relay in relays {
+            let endpoint = endpoint.clone();
+            let peer_id = relay.peer_id.clone();
+            set.spawn(async move {
+                let started = std::time::Instant::now();
+                let result = match peer_id.parse::<iroh::EndpointId>() {
+                    Ok(id) => tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        endpoint.connect(iroh::EndpointAddr::new(id), privchat_onion::ONION_ALPN),
+                    )
+                    .await
+                    .map_err(|_| "连接超时".to_string())
+                    .and_then(|r| r.map_err(|e| e.to_string())),
+                    Err(_) => Err("节点 ID 不合法".to_string()),
+                };
+                let ms = started.elapsed().as_millis() as u64;
+                match result {
+                    Ok(conn) => {
+                        // 只测握手，立刻断开。
+                        drop(conn);
+                        RelayPing {
+                            peer_id,
+                            ms: Some(ms),
+                            error: None,
+                        }
+                    }
+                    Err(error) => RelayPing {
+                        peer_id,
+                        ms: None,
+                        error: Some(error),
+                    },
+                }
+            });
+        }
+        let mut out = Vec::new();
+        while let Some(res) = set.join_next().await {
+            if let Ok(ping) = res {
+                out.push(ping);
+            }
+        }
+        {
+            let mut cache = self.relay_latency.lock().await;
+            for ping in &out {
+                if let Some(ms) = ping.ms {
+                    cache.insert(ping.peer_id.clone(), ms);
+                } else {
+                    cache.remove(&ping.peer_id);
+                }
+            }
+        }
+        self.transport.forget(&local_id).await;
+        out
+    }
+
+    pub async fn get_relay_latency(&self) -> HashMap<String, u64> {
+        self.relay_latency.lock().await.clone()
     }
 
     pub async fn get_mailbox_peers(&self) -> Vec<MailboxPeer> {

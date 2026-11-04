@@ -290,6 +290,8 @@ fn build_and_run() {
             get_mailbox_peers,
             get_onion_config,
             set_onion_config,
+            test_onion_relays,
+            onion_relay_latency,
             ping_mailbox,
             add_mailbox_peer,
             set_mailbox_priority,

@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { Button, Cell, Switch, Placeholder } from "@telegram-apps/telegram-ui";
 import {
   ArrowLeft,
@@ -7,33 +7,57 @@ import {
   ChevronDown,
   X,
   ShieldCheck,
+  Activity,
 } from "lucide-react";
 import Group from "../../components/Group";
 import { api } from "../../api";
 import { t } from "../../i18n";
 
 const RELAY_RE = /^[0-9a-fA-F]{64}$/;
+const PRIORITIES = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
 
 function shortId(id) {
   return id.length > 18 ? `${id.slice(0, 10)}…${id.slice(-6)}` : id;
 }
 
+function emptyConfig() {
+  return {
+    enabled: false,
+    mode: "static",
+    relays: [],
+    hops: 2,
+    weight_priority: 5,
+    weight_latency: 5,
+  };
+}
+
 export default function OnionPage({ notify, onClose }) {
-  const [cfg, setCfg] = useState({ enabled: false, relays: [] });
+  const [cfg, setCfg] = useState(emptyConfig());
+  const [latency, setLatency] = useState({});
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
+  const [testing, setTesting] = useState(false);
 
   useEffect(() => {
-    api
-      .getOnion()
-      .then((c) =>
+    Promise.all([api.getOnion(), api.onionRelayLatency().catch(() => ({}))])
+      .then(([c, lat]) => {
         setCfg({
-          enabled: !!c?.enabled,
-          relays: Array.isArray(c?.relays) ? [...c.relays] : [],
-        })
-      )
+          ...emptyConfig(),
+          ...(c || {}),
+          relays: Array.isArray(c?.relays)
+            ? c.relays.map((r) =>
+                typeof r === "string"
+                  ? { peer_id: r, priority: 0 }
+                  : { peer_id: r.peer_id, priority: r.priority ?? 0 }
+              )
+            : [],
+        });
+        setLatency(lat || {});
+      })
       .catch(() => {});
   }, []);
+
+  const dynamic = cfg.mode === "dynamic";
 
   const save = async () => {
     if (cfg.enabled && cfg.relays.length === 0) {
@@ -42,7 +66,16 @@ export default function OnionPage({ notify, onClose }) {
     }
     setBusy(true);
     try {
-      await api.setOnion(cfg);
+      await api.setOnion({
+        ...cfg,
+        relays: cfg.relays.map((r) => ({
+          peer_id: r.peer_id,
+          priority: Number(r.priority) || 0,
+        })),
+        hops: Number(cfg.hops) || 1,
+        weight_priority: Number(cfg.weight_priority) || 0,
+        weight_latency: Number(cfg.weight_latency) || 0,
+      });
       notify(t("saveOk"));
     } catch (e) {
       notify(String(e), "err");
@@ -54,8 +87,10 @@ export default function OnionPage({ notify, onClose }) {
   const add = () => {
     const id = input.trim();
     if (!RELAY_RE.test(id)) return notify(t("invalidId"), "err");
-    if (cfg.relays.includes(id)) return notify(t("relayExists"), "err");
-    setCfg((c) => ({ ...c, relays: [...c.relays, id] }));
+    if (cfg.relays.some((r) => r.peer_id === id)) {
+      return notify(t("relayExists"), "err");
+    }
+    setCfg((c) => ({ ...c, relays: [...c.relays, { peer_id: id, priority: 0 }] }));
     setInput("");
   };
 
@@ -69,8 +104,39 @@ export default function OnionPage({ notify, onClose }) {
     });
   };
 
+  const patchRelay = (id, patch) =>
+    setCfg((c) => ({
+      ...c,
+      relays: c.relays.map((r) => (r.peer_id === id ? { ...r, ...patch } : r)),
+    }));
+
   const removeRelay = (id) =>
-    setCfg((c) => ({ ...c, relays: c.relays.filter((x) => x !== id) }));
+    setCfg((c) => ({ ...c, relays: c.relays.filter((r) => r.peer_id !== id) }));
+
+  const testRelays = async () => {
+    if (cfg.relays.length === 0) return;
+    setTesting(true);
+    try {
+      const results = await api.testOnionRelays();
+      const next = {};
+      for (const r of results || []) {
+        if (r.ms != null) next[r.peer_id] = r.ms;
+      }
+      setLatency(next);
+    } catch (e) {
+      notify(String(e), "err");
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  const fastest = useMemo(() => {
+    let best = null;
+    for (const [id, ms] of Object.entries(latency)) {
+      if (best == null || ms < best.ms) best = { id, ms };
+    }
+    return best;
+  }, [latency]);
 
   return (
     <div className="page">
@@ -96,9 +162,7 @@ export default function OnionPage({ notify, onClose }) {
             after={
               <Switch
                 checked={cfg.enabled}
-                onChange={(e) =>
-                  setCfg((c) => ({ ...c, enabled: e.target.checked }))
-                }
+                onChange={(e) => setCfg((c) => ({ ...c, enabled: e.target.checked }))}
               />
             }
           >
@@ -106,14 +170,93 @@ export default function OnionPage({ notify, onClose }) {
           </Cell>
         </Group>
 
-        <div className="path-preview">
-          <span className="path-node">{t("relays")} × {cfg.relays.length}</span>
-          <span className="path-arrow">→</span>
-          <span className="path-node terminal">{t("mailbox")}</span>
-        </div>
-        <div className="hint-line">{t("terminalHint")}</div>
-
         <Group title={t("relayPath")}>
+          <div className="seg">
+            <button
+              className={`seg-item ${!dynamic ? "active" : ""}`}
+              onClick={() => setCfg((c) => ({ ...c, mode: "static" }))}
+            >
+              {t("staticMode")}
+            </button>
+            <button
+              className={`seg-item ${dynamic ? "active" : ""}`}
+              onClick={() => setCfg((c) => ({ ...c, mode: "dynamic" }))}
+            >
+              {t("dynamicMode")}
+            </button>
+          </div>
+          <div className="hint-line">
+            {dynamic ? t("dynamicHint") : t("onionModeHint")}
+          </div>
+
+          {dynamic && (
+            <div className="tune-block">
+              <div className="tune-row">
+                <span className="tune-label">{t("hops")}</span>
+                <select
+                  className="tg-select priority-select"
+                  value={cfg.hops}
+                  onChange={(e) => setCfg((c) => ({ ...c, hops: Number(e.target.value) }))}
+                >
+                  {[1, 2, 3, 4, 5].map((n) => (
+                    <option key={n} value={n}>
+                      {n}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="tune-row">
+                <span className="tune-label">{t("weightPriority")}</span>
+                <input
+                  className="tune-slider"
+                  type="range"
+                  min="0"
+                  max="10"
+                  step="1"
+                  value={cfg.weight_priority}
+                  onChange={(e) =>
+                    setCfg((c) => ({ ...c, weight_priority: Number(e.target.value) }))
+                  }
+                />
+                <span className="tune-value">{cfg.weight_priority}</span>
+              </div>
+              <div className="tune-row">
+                <span className="tune-label">{t("weightLatency")}</span>
+                <input
+                  className="tune-slider"
+                  type="range"
+                  min="0"
+                  max="10"
+                  step="1"
+                  value={cfg.weight_latency}
+                  onChange={(e) =>
+                    setCfg((c) => ({ ...c, weight_latency: Number(e.target.value) }))
+                  }
+                />
+                <span className="tune-value">{cfg.weight_latency}</span>
+              </div>
+            </div>
+          )}
+
+          <div className="path-preview">
+            <span className="path-node">
+              {dynamic
+                ? `${t("relays")} × ${Math.min(cfg.hops, cfg.relays.length || cfg.hops)}`
+                : `${t("relays")} × ${cfg.relays.length}`}
+            </span>
+            <span className="path-arrow">→</span>
+            <span className="path-node terminal">{t("mailbox")}</span>
+            <button
+              className="row-icon push-right"
+              onClick={testRelays}
+              disabled={testing || cfg.relays.length === 0}
+              aria-label={t("testRelay")}
+              title={t("testRelay")}
+            >
+              <Activity size={16} />
+            </button>
+          </div>
+
           <div className="form-row inset">
             <input
               className="plain-input grow mono"
@@ -131,36 +274,70 @@ export default function OnionPage({ notify, onClose }) {
 
           {cfg.relays.length === 0 && <Placeholder description={t("noRelays")} />}
           {cfg.relays.map((r, i) => (
-            <div className="peer-row" key={r}>
+            <div className="peer-row" key={r.peer_id}>
               <span className="peer-icon relay">
                 <span className="relay-index">{i + 1}</span>
               </span>
               <div className="peer-main">
-                <div className="peer-id mono">{shortId(r)}</div>
+                <div className="peer-id mono">{shortId(r.peer_id)}</div>
                 <div className="peer-meta">
-                  <span className="muted">{t("relayRole")}</span>
+                  {dynamic ? (
+                    <span className="peer-priority">
+                      {t("priority")}
+                      <select
+                        className="tg-select priority-select small"
+                        value={r.priority}
+                        onChange={(e) =>
+                          patchRelay(r.peer_id, { priority: Number(e.target.value) })
+                        }
+                      >
+                        {PRIORITIES.map((n) => (
+                          <option key={n} value={n}>
+                            {n}
+                          </option>
+                        ))}
+                      </select>
+                    </span>
+                  ) : (
+                    <span className="muted">{t("relayRole")}</span>
+                  )}
+                  {latency[r.peer_id] != null ? (
+                    <span
+                      className={`lat-badge ok${
+                        fastest?.id === r.peer_id ? " best" : ""
+                      }`}
+                    >
+                      {latency[r.peer_id]} ms
+                    </span>
+                  ) : (
+                    <span className="lat-badge idle">{t("untested")}</span>
+                  )}
                 </div>
               </div>
               <div className="row-actions">
+                {!dynamic && (
+                  <>
+                    <button
+                      className="row-icon"
+                      disabled={i === 0}
+                      onClick={() => move(i, -1)}
+                      aria-label="up"
+                    >
+                      <ChevronUp size={18} />
+                    </button>
+                    <button
+                      className="row-icon"
+                      disabled={i === cfg.relays.length - 1}
+                      onClick={() => move(i, 1)}
+                      aria-label="down"
+                    >
+                      <ChevronDown size={18} />
+                    </button>
+                  </>
+                )}
                 <button
                   className="row-icon"
-                  disabled={i === 0}
-                  onClick={() => move(i, -1)}
-                  aria-label="up"
-                >
-                  <ChevronUp size={18} />
-                </button>
-                <button
-                  className="row-icon"
-                  disabled={i === cfg.relays.length - 1}
-                  onClick={() => move(i, 1)}
-                  aria-label="down"
-                >
-                  <ChevronDown size={18} />
-                </button>
-                <button
-                  className="row-icon"
-                  onClick={() => removeRelay(r)}
+                  onClick={() => removeRelay(r.peer_id)}
                   aria-label="remove"
                 >
                   <X size={18} />
