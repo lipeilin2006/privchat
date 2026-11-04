@@ -134,6 +134,24 @@ impl LinkManager {
         self.links.lock().await.keys().cloned().collect()
     }
 
+    /// 全部连接：`(conn_id, 备注, 状态)`。
+    pub async fn list(&self) -> Vec<(String, Option<String>, LinkState)> {
+        let names: HashMap<String, Option<String>> = self
+            .store
+            .load_connections()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|row| (row.conn_id, row.name))
+            .collect();
+        let links = self.links.lock().await;
+        let mut out: Vec<_> = links
+            .iter()
+            .map(|(id, link)| (id.clone(), names.get(id).cloned().flatten(), link.state))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
     pub async fn state(&self, conn_id: &str) -> Option<LinkState> {
         self.links.lock().await.get(conn_id).map(|l| l.state)
     }

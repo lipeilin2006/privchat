@@ -208,6 +208,8 @@ pub struct App {
     allow_direct: bool,
     /// 待绑定专属身份（已生成邀请但尚未被连接的 local_id）。
     pending: Arc<Mutex<Vec<String>>>,
+    /// 新协议：单向队列连接（没有「联系人」，只有连接 + 备注）。
+    links: Arc<crate::layers::links::LinkManager>,
     /// 会话缓存：`(local_id, peer_id) -> Vec<SessionEntry>`。
     /// 一条联系人可有多条会话（并发发起），主会话负责发送，其余只解密。
     sessions: SessionMap,
@@ -289,6 +291,9 @@ impl App {
         // 会话：从磁盘恢复（需要各专属身份私钥还原 root₀ 与链状态）。
         let session_map = session::load_map(&store, &store.load_identities()?);
         let sessions = Arc::new(Mutex::new(session_map));
+        let links = Arc::new(
+            crate::layers::links::LinkManager::load(transport.clone(), store.clone()).await?,
+        );
         let send_queues = Arc::new(Mutex::new(HashMap::new()));
         let mailbox_poll_started = Arc::new(AtomicBool::new(false));
         let mailbox_poll_task = Arc::new(Mutex::new(None));
@@ -305,6 +310,7 @@ impl App {
             onion,
             allow_direct: !use_relay,
             pending,
+            links,
             sessions,
             send_queues,
             mailbox_poll_started,
@@ -622,6 +628,47 @@ impl App {
             Some(i) => Ok(pending.remove(i)),
             None => self.transport.create_identity().await,
         }
+    }
+
+    /// 新协议：生成本端连接，返回 `(conn_id, px1 邀请串)`。
+    ///
+    /// 调用时会在 mailbox 上创建接收队列；把邀请码给对方扫，
+    /// 再调 [`accept_connection`] 完成配对。
+    pub async fn create_connection(&self, mailbox: &str) -> Result<(String, String)> {
+        self.links.create(mailbox).await
+    }
+
+    /// 新协议：扫到对方邀请后完成配对。
+    pub async fn accept_connection(&self, conn_id: &str, invite: &str) -> Result<()> {
+        self.links.accept(conn_id, invite).await
+    }
+
+    /// 新协议：在连接上发一条文本。
+    pub async fn send_on_connection(&self, conn_id: &str, text: &str) -> Result<()> {
+        self.links.send(conn_id, text.as_bytes()).await
+    }
+
+    /// 新协议：取走并解密该连接的全部待收消息。
+    pub async fn poll_connection(&self, conn_id: &str) -> Result<Vec<String>> {
+        Ok(self
+            .links
+            .poll(conn_id)
+            .await?
+            .into_iter()
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .collect())
+    }
+
+    /// 新协议：全部连接（id + 备注 + 状态）。
+    pub async fn list_connections(
+        &self,
+    ) -> Vec<(String, Option<String>, crate::layers::connection::LinkState)> {
+        self.links.list().await
+    }
+
+    /// 新协议：给连接改备注（只是显示名）。
+    pub fn rename_connection(&self, conn_id: &str, name: Option<&str>) -> Result<()> {
+        self.links.rename(conn_id, name)
     }
 
     /// 通过邀请串（纯 peer_id 或完整票据）建立好友关系，返回对方 peer_id。
