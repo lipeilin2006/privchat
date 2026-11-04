@@ -26,16 +26,11 @@ use std::sync::Mutex;
 use anyhow::{anyhow, Result};
 use rusqlite::{params, Connection};
 
-pub use connections::{ConnMessage, ConnRow};
 mod connections;
-mod contacts;
 mod identities;
-mod messages;
-mod opks;
-mod sessions;
 mod settings;
 
-use super::app::{ChatMessage, Contact};
+pub use connections::{ConnMessage, ConnRow};
 
 /// 每条离线消息写入的 mailbox 节点数（0 = 全部已配置节点）。
 pub const UNBOUND_IDENTITY_TTL_MS: u64 = 24 * 60 * 60 * 1000;
@@ -56,38 +51,12 @@ impl Store {
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA foreign_keys=ON;
-             CREATE TABLE IF NOT EXISTS contacts (
-                 peer_id TEXT PRIMARY KEY,
-                 local_id TEXT NOT NULL,
-                 name TEXT,
-                 ticket TEXT,
-                 peer_spk BLOB,
-                 peer_opks TEXT
-             );
-             CREATE TABLE IF NOT EXISTS messages (
-                 peer_id TEXT NOT NULL,
-                 msg_id TEXT NOT NULL,
-                 sender TEXT NOT NULL,
-                 text TEXT NOT NULL,
-                 time INTEGER NOT NULL,
-                 PRIMARY KEY (peer_id, msg_id)
-             );
              CREATE TABLE IF NOT EXISTS mailbox_peers (
                  peer_id TEXT PRIMARY KEY
              );
              CREATE TABLE IF NOT EXISTS identities (
                  local_id TEXT PRIMARY KEY,
                  secret BLOB NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS opks (
-                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                 local_id TEXT NOT NULL,
-                 sk BLOB NOT NULL,
-                 used INTEGER NOT NULL DEFAULT 0
-             );
-             CREATE TABLE IF NOT EXISTS identity_spk (
-                 local_id TEXT PRIMARY KEY,
-                 spk_sk BLOB NOT NULL
              );
              CREATE TABLE IF NOT EXISTS connections (
                  conn_id TEXT PRIMARY KEY,
@@ -112,22 +81,9 @@ impl Store {
                  time INTEGER NOT NULL,
                  PRIMARY KEY (conn_id, msg_id)
              );
-             CREATE TABLE IF NOT EXISTS sessions (
-                 session_id TEXT PRIMARY KEY,
-                 local_id TEXT NOT NULL,
-                 peer_id TEXT NOT NULL,
-                 role TEXT NOT NULL,
-                 active INTEGER NOT NULL,
-                 state BLOB NOT NULL
-             );
-             CREATE INDEX IF NOT EXISTS idx_sessions_peer ON sessions(local_id, peer_id);
                  CREATE TABLE IF NOT EXISTS settings (
                      key TEXT PRIMARY KEY,
                      value TEXT NOT NULL
-                 );
-                 CREATE TABLE IF NOT EXISTS drafts (
-                     peer_id TEXT PRIMARY KEY,
-                     text TEXT NOT NULL
                  );",
         )?;
         Ok(Self {
@@ -165,75 +121,27 @@ mod tests {
         dir
     }
 
-    fn sample_contacts() -> HashMap<String, Contact> {
-        let mut contacts = HashMap::new();
-        contacts.insert(
-            "peer1".to_string(),
-            Contact {
-                peer_id: "peer1".to_string(),
-                local_id: "local1".to_string(),
-                name: Some("Alice".to_string()),
-                ticket: Some("ticket1".to_string()),
-                peer_spk: None,
-                peer_opks: Vec::new(),
-            },
-        );
-        contacts
-    }
-
-    fn sample_history() -> HashMap<String, Vec<ChatMessage>> {
-        let mut history = HashMap::new();
-        history.insert(
-            "peer1".to_string(),
-            vec![ChatMessage {
-                id: "m1".to_string(),
-                from: "local1".to_string(),
-                text: "hi".to_string(),
-                time: 1700000000000,
-            }],
-        );
-        history
-    }
-
     #[test]
     fn sqlite_roundtrip_encrypted_file() {
         let dir = temp_dir("enc");
         let store = Store::open(&dir, KEY).expect("open");
-
         assert!(dir.join("privchat.db").exists());
-
-        let contacts = sample_contacts();
-        store.save_contacts(&contacts).expect("save contacts");
-        let loaded = store.load_contacts().expect("load contacts");
-        assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded["peer1"].name.as_deref(), Some("Alice"));
-
-        let history = sample_history();
-        store.save_history(&history).expect("save history");
-        let h = store.load_history().expect("load history");
-        assert_eq!(h["peer1"].len(), 1);
-        assert_eq!(h["peer1"][0].text, "hi");
-        assert_eq!(h["peer1"][0].time, 1700000000000);
 
         store
             .save_mailbox_peers(&["mb1".to_string(), "mb2".to_string()])
             .expect("save mailbox");
         assert_eq!(store.load_mailbox_peers().unwrap(), vec!["mb1", "mb2"]);
 
-        // 落盘文件（含 WAL 后主库）不得含明文（搜索原始字符串应失败）。
+        // 落盘文件不得含明文。
         let raw = std::fs::read(dir.join("privchat.db")).unwrap();
         assert!(
-            !raw.windows(5).any(|w| w == b"Alice"),
-            "plaintext 'Alice' must not appear in db file"
+            !raw.windows(8).any(|w| w == b"mailbox-"),
+            "plaintext must not appear in db file"
         );
 
-        // 重开：数据仍在（持久化生效）。
         drop(store);
         let store2 = Store::open(&dir, KEY).expect("reopen");
-        assert_eq!(store2.load_contacts().unwrap().len(), 1);
-        assert_eq!(store2.load_history().unwrap()["peer1"].len(), 1);
         assert_eq!(store2.load_mailbox_peers().unwrap().len(), 2);
-
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -241,7 +149,7 @@ mod tests {
     fn wrong_key_cannot_open() {
         let dir = temp_dir("wrongkey");
         let store = Store::open(&dir, KEY).expect("open");
-        store.save_contacts(&sample_contacts()).expect("save");
+        store.save_mailbox_peers(&["mb".to_string()]).expect("save");
         drop(store);
 
         // 错误密钥打开加密库 → 打开即报错（SQLCipher 首页解密失败）。
@@ -257,9 +165,8 @@ mod tests {
     fn empty_ok() {
         let dir = temp_dir("empty");
         let store = Store::open(&dir, KEY).expect("open empty");
-        assert!(store.load_contacts().unwrap().is_empty());
-        assert!(store.load_history().unwrap().is_empty());
         assert!(store.load_mailbox_peers().unwrap().is_empty());
+        assert!(store.load_connections().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -1,4 +1,4 @@
-//! 专属身份：私钥、SPK，以及未绑定身份的过期清理。
+//! 专属身份：私钥与未绑定身份的过期清理。
 
 use super::*;
 
@@ -22,29 +22,7 @@ impl Store {
         )?;
         Ok(())
     }
-    /// 保存某个专属身份的 SPK 私钥（X25519，32 字节）。
-    pub fn save_identity_spk(&self, local_id: &str, spk_sk: &[u8]) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT OR REPLACE INTO identity_spk (local_id, spk_sk) VALUES (?1, ?2)",
-            params![local_id, spk_sk],
-        )?;
-        Ok(())
-    }
-    /// 读取全部 SPK 私钥（local_id → 32 字节）。
-    pub fn load_identity_spks(&self) -> Result<HashMap<String, Vec<u8>>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT local_id, spk_sk FROM identity_spk")?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
-        })?;
-        let mut out = HashMap::new();
-        for r in rows {
-            let (local_id, spk) = r?;
-            out.insert(local_id, spk);
-        }
-        Ok(out)
-    }
+
     /// 读取全部专属身份私钥（local_id → SecretKey 字节）。
     pub fn load_identities(&self) -> Result<HashMap<String, Vec<u8>>> {
         let conn = self.conn.lock().unwrap();
@@ -64,10 +42,6 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "DELETE FROM identities WHERE local_id = ?1",
-            params![local_id],
-        )?;
-        conn.execute(
-            "DELETE FROM identity_spk WHERE local_id = ?1",
             params![local_id],
         )?;
         conn.execute(

@@ -175,8 +175,7 @@ impl AppState {
             .ok_or_else(|| "vault not unlocked".to_string())
     }
 
-    /// 用派生密钥解锁存储并启动应用层。需在 Tauri 事件循环的 setup 中完成，
-    /// 以便拿到 app handle 注册入站消息监听。
+    /// 用派生密钥解锁存储并启动应用层，同时启动连接轮询任务。
     async fn start_with_key(
         &self,
         app_handle: tauri::AppHandle,
@@ -184,29 +183,25 @@ impl AppState {
     ) -> Result<(), String> {
         #[cfg(target_os = "android")]
         android_ctx::init();
-        let (app, incoming) = App::start(self.data_dir(), key)
-            .await
-            .map_err(|e| e.to_string())?;
-        let app = Arc::new(app);
+        let app = Arc::new(
+            App::start(self.data_dir(), key)
+                .await
+                .map_err(|e| e.to_string())?,
+        );
         *self.app.lock().await = Some(app.clone());
-        *self.incoming.lock().await = Some(incoming);
 
-        let mut rx = self
-            .incoming
-            .lock()
-            .await
-            .take()
-            .expect("incoming receiver set");
+        // 每 3 秒拉一次已建立的连接，新消息通过事件上抛前端。
         let handle = app_handle.clone();
-        let app = app.clone();
+        let poll_app = app.clone();
         let task = tauri::async_runtime::spawn(async move {
-            while let Some(env) = rx.recv().await {
-                match app.handle_incoming(env).await {
-                    Ok(Some(msg)) => {
-                        let _ = handle.emit("chat://message", &msg);
-                    }
-                    Ok(None) => {} // 队列控制信令，无需上抛前端
-                    Err(e) => eprintln!("incoming message failed: {e}"),
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3));
+            loop {
+                ticker.tick().await;
+                for (conn_id, text) in poll_app.poll_all_connections().await {
+                    let _ = handle.emit(
+                        "connection://message",
+                        &serde_json::json!({"conn_id": conn_id, "text": text}),
+                    );
                 }
             }
         });
@@ -383,118 +378,6 @@ async fn change_vault_password(
     )
     .map_err(user_error)?;
     Ok(())
-}
-
-#[tauri::command]
-async fn get_self_ticket(state: State<'_, AppState>) -> Result<String, String> {
-    Ok(state.require_app()?.self_ticket().await)
-}
-
-#[tauri::command]
-async fn delete_pending_identity(
-    local_id: String,
-    state: State<'_, AppState>,
-) -> Result<(), String> {
-    state
-        .require_app()?
-        .delete_pending_identity(&local_id)
-        .await
-        .map_err(user_error)
-}
-
-#[tauri::command]
-async fn connect_peer(
-    ticket: String,
-    name: Option<String>,
-    state: State<'_, AppState>,
-) -> Result<String, String> {
-    state
-        .require_app()?
-        .connect_peer(&ticket, name)
-        .await
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-async fn list_contacts(
-    state: State<'_, AppState>,
-) -> Result<Vec<layers::app::ContactSummary>, String> {
-    Ok(state.require_app()?.list_contacts().await)
-}
-
-#[tauri::command]
-async fn get_history(
-    peer_id: String,
-    state: State<'_, AppState>,
-) -> Result<Vec<layers::app::ChatMessage>, String> {
-    Ok(state.require_app()?.get_history(&peer_id).await)
-}
-
-#[tauri::command]
-async fn get_draft(peer_id: String, state: State<'_, AppState>) -> Result<String, String> {
-    state
-        .require_app()?
-        .load_draft(&peer_id)
-        .map_err(user_error)
-}
-
-#[tauri::command]
-async fn save_draft(
-    peer_id: String,
-    text: String,
-    state: State<'_, AppState>,
-) -> Result<(), String> {
-    state
-        .require_app()?
-        .save_draft(&peer_id, &text)
-        .map_err(user_error)
-}
-
-#[tauri::command]
-async fn search_messages(
-    query: String,
-    limit: Option<usize>,
-    state: State<'_, AppState>,
-) -> Result<Vec<(String, layers::app::ChatMessage)>, String> {
-    state
-        .require_app()?
-        .search_messages(&query, limit.unwrap_or(100).min(500))
-        .map_err(user_error)
-}
-
-#[tauri::command]
-async fn send_message(
-    peer_id: String,
-    text: String,
-    state: State<'_, AppState>,
-) -> Result<layers::app::ChatMessage, String> {
-    state
-        .require_app()?
-        .send_message(&peer_id, &text)
-        .await
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-async fn delete_contact(peer_id: String, state: State<'_, AppState>) -> Result<(), String> {
-    state
-        .require_app()?
-        .delete_contact(&peer_id)
-        .await
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-async fn rename_contact(
-    peer_id: String,
-    name: String,
-    state: State<'_, AppState>,
-) -> Result<layers::app::ContactSummary, String> {
-    state
-        .require_app()?
-        .rename_contact(&peer_id, &name)
-        .await
-        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -757,17 +640,6 @@ pub fn run() {
             lock_vault,
             export_diagnostics,
             change_vault_password,
-            get_self_ticket,
-            delete_pending_identity,
-            connect_peer,
-            send_message,
-            list_contacts,
-            get_history,
-            get_draft,
-            save_draft,
-            search_messages,
-            delete_contact,
-            rename_contact,
             get_mailbox_peers,
             get_onion_config,
             set_onion_config,

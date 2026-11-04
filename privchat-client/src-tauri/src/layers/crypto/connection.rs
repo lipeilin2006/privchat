@@ -309,6 +309,8 @@ impl Connection {
 /// 消息头。
 struct Header {
     n: u32,
+    /// 发送方的连接公钥（配对后不再需要，保留给将来的密钥轮换）。
+    #[allow(dead_code)]
     ek: [u8; 32],
     nonce: [u8; 12],
 }

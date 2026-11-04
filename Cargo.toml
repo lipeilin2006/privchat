@@ -19,6 +19,5 @@ members = [
     "privchat-client/src-tauri",
     "privchat-common",
     "privchat-mailbox",
-    "privchat-cli",
     "privchat-onion",
 ]

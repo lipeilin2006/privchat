@@ -54,8 +54,6 @@ pub struct IncomingEnvelope {
 /// 单个专属身份：SecretKey + 独立 Endpoint + 独立路由与连接缓存。
 struct Identity {
     secret: SecretKey,
-    /// 该身份的 X25519 SPK 私钥（X3DH 用，响应方持有）。
-    spk_sk: [u8; 32],
     endpoint: Endpoint,
     /// 直连接收循环。生产模式（use_relay=true）为 None：不再接受 P2P 入站。
     #[allow(dead_code)]
@@ -193,20 +191,11 @@ impl Transport {
         // 累加成 N × 超时；并行后总耗时收敛到单次最坏等待。
         let mut identities = transport.identities.write().await;
         let mut set = tokio::task::JoinSet::new();
-        let spks = transport.store.load_identity_spks()?;
         for (local_id, secret_bytes) in transport.store.load_identities()? {
             if let Ok(secret) = SecretKey::try_from(secret_bytes.as_slice()) {
-                let Some(spk_bytes) = spks.get(&local_id) else {
-                    eprintln!("[transport] identity {local_id} has no SPK, skipped");
-                    continue;
-                };
-                let Ok(spk_sk) = <[u8; 32]>::try_from(spk_bytes.as_slice()) else {
-                    eprintln!("[transport] identity {local_id} has bad SPK, skipped");
-                    continue;
-                };
                 let tx = transport.tx.clone();
                 set.spawn(async move {
-                    let id = build_identity(secret, spk_sk, use_relay, tx).await?;
+                    let id = build_identity(secret, use_relay, tx).await?;
                     Ok::<_, anyhow::Error>((local_id, Arc::new(id)))
                 });
             }
@@ -230,58 +219,6 @@ impl Transport {
             .ok_or_else(|| anyhow::anyhow!("no identity for {local_id}"))
     }
 
-    /// 指定专属身份的 SPK 私钥（响应方建立 X3DH 会话用）。
-    pub async fn spk_for(&self, local_id: &str) -> anyhow::Result<[u8; 32]> {
-        let identities = self.identities.read().await;
-        identities
-            .get(local_id)
-            .map(|id| id.spk_sk)
-            .ok_or_else(|| anyhow::anyhow!("no SPK for identity {local_id}"))
-    }
-
-    /// 该身份前 N 把未用 OPK 的 `(id, 公钥)`，用于放进邀请串。
-    pub async fn opks_public(
-        &self,
-        local_id: &str,
-        limit: usize,
-    ) -> anyhow::Result<Vec<(u64, [u8; 32])>> {
-        let rows = self.store.list_opks(local_id, limit)?;
-        let mut out = Vec::with_capacity(rows.len());
-        for (id, sk) in rows {
-            let sk: [u8; 32] = sk
-                .as_slice()
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("bad stored OPK"))?;
-            let secret = x25519_dalek::StaticSecret::from(sk);
-            out.push((id, x25519_dalek::PublicKey::from(&secret).to_bytes()));
-        }
-        Ok(out)
-    }
-
-    /// 按 id 取某身份未用过的 OPK 私钥（响应方解首条消息用）。
-    pub fn opk_sk(&self, local_id: &str, id: u64) -> anyhow::Result<Option<[u8; 32]>> {
-        let Some(sk) = self.store.opk_by_id(local_id, id)? else {
-            return Ok(None);
-        };
-        Ok(Some(
-            sk.as_slice()
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("bad stored OPK"))?,
-        ))
-    }
-
-    /// 用完后删除该 OPK。
-    pub fn consume_opk(&self, id: u64) -> anyhow::Result<()> {
-        self.store.delete_opk(id)
-    }
-
-    /// 指定专属身份的 SPK 公钥（放进邀请串）。
-    pub async fn spk_public(&self, local_id: &str) -> anyhow::Result<[u8; 32]> {
-        let sk = self.spk_for(local_id).await?;
-        let secret = x25519_dalek::StaticSecret::from(sk);
-        Ok(x25519_dalek::PublicKey::from(&secret).to_bytes())
-    }
-
     /// 指定专属身份的 Endpoint（供 mailbox 等以该身份拨号）。
     pub async fn endpoint_for(&self, local_id: &str) -> anyhow::Result<Endpoint> {
         let identities = self.identities.read().await;
@@ -302,20 +239,7 @@ impl Transport {
     pub async fn create_identity(&self) -> Result<String> {
         let secret = SecretKey::generate();
         let local_id = secret.public().to_string();
-        let mut spk = [0u8; 32];
-        rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut spk);
-        let id = build_identity(secret, spk, self.use_relay, self.tx.clone()).await?;
-        // 顺手补一批一次性预密钥（邀请里发公钥，对方发起会话时用一把）。
-        for _ in 0..8 {
-            let sk = x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng);
-            if let Err(error) = self.store.add_opk(&local_id, &sk.to_bytes()) {
-                eprintln!("[transport] save OPK failed: {error}");
-                break;
-            }
-        }
-        if let Err(error) = self.store.save_identity_spk(&local_id, &id.spk_sk) {
-            eprintln!("[transport] save SPK failed: {error}");
-        }
+        let id = build_identity(secret, self.use_relay, self.tx.clone()).await?;
         if let Err(error) = self.store.save_identity(
             &local_id,
             &id.secret.to_bytes(),
@@ -348,16 +272,7 @@ impl Transport {
             .ok_or_else(|| anyhow::anyhow!("no persisted identity for {local_id}"))?;
         let secret = SecretKey::try_from(secret_bytes.as_slice())
             .map_err(|e| anyhow::anyhow!("bad stored identity: {e}"))?;
-        let spk_bytes = self
-            .store
-            .load_identity_spks()?
-            .remove(local_id)
-            .ok_or_else(|| anyhow::anyhow!("no stored SPK for {local_id}"))?;
-        let spk_sk: [u8; 32] = spk_bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("bad stored SPK for {local_id}"))?;
-        let id = build_identity(secret, spk_sk, self.use_relay, self.tx.clone()).await?;
+        let id = build_identity(secret, self.use_relay, self.tx.clone()).await?;
         self.identities
             .write()
             .await
@@ -457,7 +372,6 @@ impl Transport {
 /// 构建一个专属身份端点并启动其接收循环。
 async fn build_identity(
     secret: SecretKey,
-    spk_sk: [u8; 32],
     use_relay: bool,
     tx: mpsc::UnboundedSender<IncomingEnvelope>,
 ) -> Result<Identity> {
@@ -505,7 +419,6 @@ async fn build_identity(
 
     Ok(Identity {
         secret,
-        spk_sk,
         endpoint,
         router,
         peers,

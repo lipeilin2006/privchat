@@ -4185,21 +4185,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "privchat-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "iroh",
- "privchat-client",
- "privchat-common",
- "privchat-onion",
- "serde_json",
- "sha2 0.10.9",
- "tokio",
- "x25519-dalek",
-]
-
-[[package]]
 name = "privchat-client"
 version = "0.1.0"
 dependencies = [

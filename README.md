@@ -78,7 +78,6 @@ privchat/
 ├── privchat-common/            wire 协议 / PoW / ALPN
 ├── privchat-mailbox/           离线消息节点（角色 / PEX / 同步）
 ├── privchat-onion/             洋葱路由封装与剥离
-├── privchat-cli/               命令行测试客户端
 ├── scripts/                    一键构建脚本
 └── README.md
 ```
