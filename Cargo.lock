@@ -4206,6 +4206,7 @@ dependencies = [
  "iroh-tickets",
  "privchat-common",
  "privchat-onion",
+ "rand_core 0.6.4",
  "rusqlite",
  "serde",
  "serde_json",
