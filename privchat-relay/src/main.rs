@@ -9,16 +9,21 @@
 //! ```
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
+use tokio::sync::Semaphore;
 use iroh::{Endpoint, SecretKey};
 
 use privchat_common::MailboxResponse;
 use privchat_onion::{peel, ONION_ALPN, PACKET_MAX, RESPONSE_MAX};
 
 const CONFIG_FILE: &str = "config.json";
+
+/// 同时处理的中继请求上限：防止对端狂开流把中继内存/带宽打满。
+const MAX_INFLIGHT: usize = 128;
 
 /// 中继节点配置。环境变量只用来临时覆盖。
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -76,6 +81,7 @@ struct RelayHandler {
     secret: SecretKey,
     endpoint: Endpoint,
     allow: Option<Vec<String>>,
+    permits: Arc<Semaphore>,
 }
 
 impl RelayHandler {
@@ -99,6 +105,20 @@ impl RelayHandler {
 
 impl ProtocolHandler for RelayHandler {
     async fn accept(&self, connection: iroh::endpoint::Connection) -> Result<(), AcceptError> {
+        let Ok(_permit) = self.permits.try_acquire() else {
+            if let Ok((mut send, _recv)) = connection.accept_bi().await {
+                let busy = MailboxResponse {
+                    ok: false,
+                    error: Some("relay busy: too many concurrent connections".into()),
+                    messages: None,
+                };
+                let _ = send
+                    .write_all(&serde_json::to_vec(&busy).unwrap_or_default())
+                    .await;
+                let _ = send.finish();
+            }
+            return Ok(());
+        };
         let remote = connection.remote_id().to_string();
         let (mut send, mut recv) = match connection.accept_bi().await {
             Ok(bi) => bi,
@@ -233,6 +253,7 @@ async fn main() -> Result<()> {
                 secret,
                 endpoint: endpoint.clone(),
                 allow,
+                permits: Arc::new(Semaphore::new(MAX_INFLIGHT)),
             },
         )
         .spawn();

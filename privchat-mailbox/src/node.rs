@@ -21,6 +21,10 @@
 //! 再删除，数据不搬迁。
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Instant;
+
+use tokio::sync::Semaphore;
 
 use anyhow::{anyhow, Result};
 use iroh::endpoint::Connection;
@@ -28,27 +32,108 @@ use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::SecretKey;
 
 use privchat_common::{
-    hex_decode, MailboxRequest, MailboxResponse, Op, StoredMessage, ALPN, MAX_PAYLOAD,
+    hex_decode, MailboxRequest, MailboxResponse, Op, StoredMessage, ALPN,
 };
 use privchat_onion::{peel, ONION_ALPN, PACKET_MAX};
 
 use crate::store::MailboxStore;
 
+/// 单条请求的读取上限：队列请求最大也就一条 64KB 密文（JSON 数组约 4 倍），
+/// 给到 2MB 足够，别按 16MB 收——那样 64 条并发就是 1GB 内存。
+const REQUEST_MAX: usize = 2 * 1024 * 1024;
+
+/// 同时处理的连接上限：防止对端狂开流把内存/CPU 打满。
+const MAX_INFLIGHT: usize = 64;
+/// 建队列速率：每秒补多少令牌、最多攒多少（防止 queue_create 刷满节点）。
+const CREATE_REFILL_PER_SEC: f64 = 20.0;
+const CREATE_BURST: f64 = 60.0;
+
+/// 简单令牌桶：全局共享，够用就好。
+#[derive(Debug)]
+struct RateLimiter {
+    state: std::sync::Mutex<(f64, Instant)>,
+}
+
+impl RateLimiter {
+    fn new(burst: f64) -> Self {
+        Self {
+            state: std::sync::Mutex::new((burst, Instant::now())),
+        }
+    }
+
+    fn allow(&self) -> bool {
+        let now = Instant::now();
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        let elapsed = now.saturating_duration_since(state.1).as_secs_f64();
+        state.0 = (state.0 + elapsed * CREATE_REFILL_PER_SEC).min(CREATE_BURST);
+        state.1 = now;
+        if state.0 >= 1.0 {
+            state.0 -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// 连接处理循环：读一个 bi-stream，解析请求，返回响应。
 #[derive(Debug, Clone)]
 struct MailboxHandler {
     store: MailboxStore,
+    /// 同时在处理的连接数上限。
+    permits: Arc<Semaphore>,
+    /// 建队列的令牌桶。
+    create_limiter: Arc<RateLimiter>,
+}
+
+impl MailboxHandler {
+    fn new(store: MailboxStore) -> Self {
+        Self::with_limits(
+            store,
+            Arc::new(Semaphore::new(MAX_INFLIGHT)),
+            Arc::new(RateLimiter::new(CREATE_BURST)),
+        )
+    }
+
+    fn with_limits(
+        store: MailboxStore,
+        permits: Arc<Semaphore>,
+        create_limiter: Arc<RateLimiter>,
+    ) -> Self {
+        Self {
+            store,
+            permits,
+            create_limiter,
+        }
+    }
 }
 
 impl ProtocolHandler for MailboxHandler {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        let Ok(_permit) = self.permits.try_acquire() else {
+            // 并发打满：回一句明确的「忙」，别把连接晾着。
+            if let Ok((mut send, _recv)) = connection.accept_bi().await {
+                let busy = MailboxResponse {
+                    ok: false,
+                    error: Some("node busy: too many concurrent connections".into()),
+                    messages: None,
+                };
+                let _ = send
+                    .write_all(&serde_json::to_vec(&busy).unwrap_or_default())
+                    .await;
+                let _ = send.finish();
+            }
+            return Ok(());
+        };
         loop {
             let (mut send, mut recv) = match connection.accept_bi().await {
                 Ok(bi) => bi,
                 Err(_) => break,
             };
 
-            let payload = match recv.read_to_end(MAX_PAYLOAD).await {
+            let payload = match recv.read_to_end(REQUEST_MAX).await {
                 Ok(b) => b,
                 Err(e) => {
                     eprintln!("[mailbox] accept_bi read failed: {e:#}");
@@ -72,10 +157,26 @@ impl ProtocolHandler for MailboxHandler {
 struct TerminalHandler {
     mailbox: MailboxHandler,
     secret: SecretKey,
+    /// 和信箱请求共用同一个并发额度。
+    permits: Arc<Semaphore>,
 }
 
 impl ProtocolHandler for TerminalHandler {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        let Ok(_permit) = self.permits.try_acquire() else {
+            if let Ok((mut send, _recv)) = connection.accept_bi().await {
+                let busy = MailboxResponse {
+                    ok: false,
+                    error: Some("node busy: too many concurrent connections".into()),
+                    messages: None,
+                };
+                let _ = send
+                    .write_all(&serde_json::to_vec(&busy).unwrap_or_default())
+                    .await;
+                let _ = send.finish();
+            }
+            return Ok(());
+        };
         let remote = connection.remote_id().to_string();
         let (mut send, mut recv) = match connection.accept_bi().await {
             Ok(bi) => bi,
@@ -158,6 +259,9 @@ fn verify_sig(pubkey: &[u8], msg: &[u8], sig_hex: &str) -> bool {
 
 /// 创建接收队列：先到先得，已存在直接拒绝。
 async fn handle_queue_create(handler: &MailboxHandler, req: MailboxRequest) -> MailboxResponse {
+    if !handler.create_limiter.allow() {
+        return err("queue_create rate limited, retry later");
+    }
     let (Some(queue), Some(sender_auth), Some(owner_auth)) =
         (req.queue, req.sender_auth, req.owner_auth)
     else {
@@ -458,9 +562,7 @@ pub async fn run() -> Result<()> {
     }
     let endpoint = endpoint_builder.bind().await?;
 
-    let mailbox_handler = MailboxHandler {
-        store: store.clone(),
-    };
+    let mailbox_handler = MailboxHandler::new(store.clone());
 
     // 信箱节点只挂两个 ALPN：信箱请求 + 洋葱终点（收最内层）。
     // 转发那一半已经拆到 privchat-relay，这里不再具备中继能力。
@@ -469,6 +571,7 @@ pub async fn run() -> Result<()> {
         .accept(
             ONION_ALPN,
             TerminalHandler {
+                permits: mailbox_handler.permits.clone(),
                 mailbox: mailbox_handler,
                 secret: secret_key.clone(),
             },
@@ -551,7 +654,7 @@ pub async fn spawn_test_node(dir: &std::path::Path, ttl_secs: u64) -> Result<Tes
         .alpns(vec![ALPN.to_vec()])
         .bind()
         .await?;
-    let handler = MailboxHandler { store };
+    let handler = MailboxHandler::new(store);
     let router = Router::builder(endpoint.clone())
         .accept(ALPN, handler)
         .spawn();
@@ -617,6 +720,17 @@ mod config_tests {
         assert!(cfg.role.is_none());
         assert!(cfg.ttl_secs.is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn create_rate_limiter_bursts_then_refills() {
+        let limiter = RateLimiter::new(3.0);
+        assert!(limiter.allow());
+        assert!(limiter.allow());
+        assert!(limiter.allow());
+        assert!(!limiter.allow(), "burst should be exhausted");
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        assert!(limiter.allow(), "tokens should refill over time");
     }
 
     #[test]

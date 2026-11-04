@@ -18,7 +18,7 @@ async fn queue_create_send_get_delete() {
         .bind()
         .await
         .expect("bind");
-    let handler = MailboxHandler { store };
+    let handler = MailboxHandler::new(store);
 
     // 两把独立的 Ed25519 密钥：sender（谁可以写）与 owner（谁能读/删）。
     let sender = ed25519_dalek::SigningKey::from_bytes(&iroh::SecretKey::generate().to_bytes());
