@@ -41,8 +41,8 @@ Cargo workspace 里，二进制与协议共用一份代码。
 ┌─────────────────────────────────────────────────────────────┐
 │                      privchat-mailbox                        │
 │  按 queue_id 分类的密文队列（SQLite，取回即删）               │
-│  ├─ role = mailbox / relay / both                            │
-│  └─ 节点之间不需要同步（每条队列只属于一台节点）               │
+│  同时作为洋葱终点点（收最内层）；不做转发                     │
+│  节点之间不需要同步（每条队列只属于一台节点）                 │
 └───────────────┬─────────────────────────────────────────────┘
                 │  ONION_ALPN（可选）
                 ▼
@@ -71,7 +71,8 @@ privchat/
 │   └── dev/                    无浏览器 UI 测试（puppeteer + mock）
 │
 ├── privchat-common/            wire 协议 / PoW / ALPN
-├── privchat-mailbox/           队列节点（角色 / TTL / 洋葱中继）
+├── privchat-mailbox/           信箱节点（队列存储 + 洋葱终点）
+├── privchat-relay/             洋葱中继节点（只转发，不落库）
 ├── privchat-onion/             洋葱路由封装与剥离
 ├── scripts/                    一键构建脚本
 └── README.md
@@ -91,16 +92,26 @@ onion ≈ 240，common ≈ 260，cli ≈ 860。
 - 桌面：Tauri 2 的系统依赖（Linux 需 `libwebkit2gtk-4.1-dev` 等）
 - Android：JDK 17+、Android SDK、NDK、`aarch64-linux-android` target
 
-### 1. 启动一个 mailbox 节点
+### 1. 启动一个信箱节点
 
 ```bash
 cd privchat-mailbox
 PRIVCHAT_MAILBOX_DATA_DIR=/tmp/pmb cargo run --release
 ```
 
-首次启动会生成 `secret.key` / `config.json` / `mailboxes.json`，并打印
-`peer_id`——把它填进客户端设置即可。节点配置详见
-[privchat-mailbox/CONFIG.md](privchat-mailbox/CONFIG.md)。
+首次启动会生成 `secret.key` / `config.json`，并打印 `peer_id`——
+填进客户端「信箱」。配置见 [privchat-mailbox/CONFIG.md](privchat-mailbox/CONFIG.md)。
+
+### 1b. 启动一个洋葱中继节点（可选）
+
+```bash
+cd privchat-relay
+PRIVCHAT_RELAY_DATA_DIR=/tmp/prelay cargo run --release
+```
+
+打印的 `peer_id` 填进客户端「洋葱路由」的中继列表。配置见
+[privchat-relay/CONFIG.md](privchat-relay/CONFIG.md)。
+信箱和中继是两个独立程序，可以部署在不同机器 / 不同运营者。
 
 ### 2. 开发运行客户端
 
@@ -145,22 +156,23 @@ bash scripts/build-android-arm64.sh
 | 自动锁定 | 永不 / 1 分钟 / 5 分钟 |
 | 语言 | 中文 / English |
 
-### mailbox 节点
+### 信箱节点 / 中继节点
+
+两个独立程序、各自一个 config.json：
 
 ```json
-{ "ttl_secs": 604800, "role": "both" }
+// privchat-mailbox：队列存储 + 洋葱终点
+{ "ttl_secs": 604800, "bind": "0.0.0.0:8443" }
+
+// privchat-relay：只转发，不落库
+{ "bind": "0.0.0.0:8444", "onion_peers": [] }
 ```
 
-| 字段 | 说明 |
-|---|---|
-| `ttl_secs` | 密文保留秒数，0 = 永久 |
-| `role` | `both` / `relay`（只转发）/ `mailbox`（只存储） |
+分离的意义：**首跳中继与终点信箱应由不同运营者部署**，否则同一节点
+同时看到「发送方」和「收件人队列」，洋葱匿名性失效。
 
-角色分离的意义：**首跳中继与终点 mailbox 应由不同运营者部署**，否则同一
-节点同时看到「发送方」和「收件人队列」，洋葱匿名性失效。
-
-环境变量：`PRIVCHAT_MAILBOX_DATA_DIR`、`PRIVCHAT_MAILBOX_ROLE`、
-`PRIVCHAT_MAILBOX_TTL_SECS`、`PRIVCHAT_MAILBOX_ONION_PEERS`。
+细节见 [privchat-mailbox/CONFIG.md](privchat-mailbox/CONFIG.md) 和
+[privchat-relay/CONFIG.md](privchat-relay/CONFIG.md)。
 
 ---
 
@@ -207,7 +219,8 @@ npm run uitest
 
 ## 📚 文档
 
-- [privchat-mailbox/CONFIG.md](privchat-mailbox/CONFIG.md) — 节点配置、角色、TTL
+- [privchat-mailbox/CONFIG.md](privchat-mailbox/CONFIG.md) — 信箱配置、TTL、限额
+- [privchat-relay/CONFIG.md](privchat-relay/CONFIG.md) — 中继配置、转发白名单
 - [docs/SECURITY.md](docs/SECURITY.md) — 威胁模型、安全审查与抗追踪分析
 
 ---

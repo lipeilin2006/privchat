@@ -24,4 +24,5 @@ members = [
     "privchat-common",
     "privchat-mailbox",
     "privchat-onion",
+    "privchat-relay",
 ]

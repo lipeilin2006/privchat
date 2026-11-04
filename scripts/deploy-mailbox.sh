@@ -67,9 +67,7 @@ if [ ! -f /var/lib/privchat-mailbox/config.json ]; then
   cat > /var/lib/privchat-mailbox/config.json <<EOF
 {
   "ttl_secs": 604800,
-  "role": "both",
   "bind": "0.0.0.0:${PORT}",
-  "onion_peers": [],
   "max_queue_msgs": 1000,
   "max_queue_bytes": 67108864,
   "max_queues": 50000

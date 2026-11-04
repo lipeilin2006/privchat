@@ -21,7 +21,6 @@
 //! 再删除，数据不搬迁。
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use iroh::endpoint::Connection;
@@ -31,7 +30,7 @@ use iroh::SecretKey;
 use privchat_common::{
     hex_decode, MailboxRequest, MailboxResponse, Op, StoredMessage, ALPN, MAX_PAYLOAD,
 };
-use privchat_onion::{peel, ONION_ALPN};
+use privchat_onion::{peel, ONION_ALPN, PACKET_MAX};
 
 use crate::store::MailboxStore;
 
@@ -66,154 +65,54 @@ impl ProtocolHandler for MailboxHandler {
     }
 }
 
-/// 洋葱中继处理器：剥离一层后转发，或作为终点把最内层请求交给 mailbox 处理。
+/// 洋葱终点处理器：剥掉最后一层，把最内层请求交给信箱处理。
+///
+/// 信箱节点**不再转发**——转发是 `privchat-relay` 的事，两个二进制各司其职。
 #[derive(Debug, Clone)]
-struct OnionHandler {
+struct TerminalHandler {
     mailbox: MailboxHandler,
     secret: SecretKey,
-    endpoint: iroh::Endpoint,
-    /// 允许把剥离后的包继续转发（中继角色）
-    allow_forward: bool,
-    /// 允许作为终点把最内层请求交给 mailbox（存储角色）
-    allow_terminal: bool,
-    /// 允许转发的下一跳白名单（None = 不限制）
-    onion_allow: Option<Arc<Vec<String>>>,
 }
 
-impl ProtocolHandler for OnionHandler {
+impl ProtocolHandler for TerminalHandler {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
         let remote = connection.remote_id().to_string();
         let (mut send, mut recv) = match connection.accept_bi().await {
             Ok(bi) => bi,
             Err(_) => return Ok(()),
         };
-        let packet = match recv.read_to_end(ONION_PACKET_MAX).await {
+        let packet = match recv.read_to_end(PACKET_MAX).await {
             Ok(bytes) => bytes,
             Err(error) => {
-                eprintln!("[onion] read failed: {error:#}");
+                eprintln!("[mailbox] onion read failed: {error:#}");
                 return Ok(());
             }
         };
-        match peel(&self.secret, &packet) {
-            Ok((Some(next), inner)) => {
-                if !self.allow_forward {
-                    let response = MailboxResponse {
-                        ok: false,
-                        error: Some("this node is mailbox-only: refusing to relay".into()),
-                        messages: None,
-                    };
-                    let _ = send
-                        .write_all(&serde_json::to_vec(&response).unwrap_or_default())
-                        .await;
-                    let _ = send.finish();
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                    return Ok(());
-                }
-                if let Some(allow) = &self.onion_allow {
-                    if !allow.iter().any(|p| p == &next) {
-                        let response = MailboxResponse {
-                            ok: false,
-                            error: Some("next hop is not in the onion allowlist".into()),
-                            messages: None,
-                        };
-                        let _ = send
-                            .write_all(&serde_json::to_vec(&response).unwrap_or_default())
-                            .await;
-                        let _ = send.finish();
-                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                        return Ok(());
-                    }
-                }
-                eprintln!(
-                    "[onion] relay from {}: forwarding {}B to {}",
-                    short_id(&remote),
-                    inner.len(),
-                    short_id(&next)
-                );
-                let endpoint = self.endpoint.clone();
-                match forward_onion(&endpoint, &next, inner).await {
-                    // 原样回传：中继不解析内容，也就不会把 messages 弄丢。
-                    Ok(raw) => {
-                        let wrote = send.write_all(&raw).await;
-                        eprintln!("[onion] response relayed ok={}", wrote.is_ok());
-                    }
-                    Err(error) => {
-                        eprintln!("[onion] forward to {next} failed: {error:#}");
-                        let response = MailboxResponse {
-                            ok: false,
-                            error: Some(format!("relay to {next} failed: {error:#}")),
-                            messages: None,
-                        };
-                        let _ = send
-                            .write_all(&serde_json::to_vec(&response).unwrap_or_default())
-                            .await;
-                    }
-                }
-                let _ = send.finish();
-            }
-            Ok((None, inner)) => {
-                if !self.allow_terminal {
-                    let response = MailboxResponse {
-                        ok: false,
-                        error: Some("this node is relay-only: refusing terminal delivery".into()),
-                        messages: None,
-                    };
-                    let _ = send
-                        .write_all(&serde_json::to_vec(&response).unwrap_or_default())
-                        .await;
-                    let _ = send.finish();
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                    return Ok(());
-                }
-                // 终点：把最内层请求交给 mailbox 处理（队列鉴权在请求体内）。
-                let response = handle_request(&self.mailbox, &inner).await;
-                let _ = send
-                    .write_all(&serde_json::to_vec(&response).unwrap_or_default())
-                    .await;
-                let _ = send.finish();
-            }
+
+        let response = match peel(&self.secret, &packet) {
+            Ok((Some(_), _)) => MailboxResponse {
+                ok: false,
+                error: Some("this node is mailbox-only: use privchat-relay for relaying".into()),
+                messages: None,
+            },
+            Ok((None, inner)) => handle_request(&self.mailbox, &inner).await,
             Err(error) => {
-                eprintln!("[onion] peel failed from {remote}: {error:#}");
-                let response = MailboxResponse {
+                eprintln!("[mailbox] onion peel failed from {remote}: {error:#}");
+                MailboxResponse {
                     ok: false,
                     error: Some(format!("onion peel failed: {error:#}")),
                     messages: None,
-                };
-                let _ = send
-                    .write_all(&serde_json::to_vec(&response).unwrap_or_default())
-                    .await;
-                let _ = send.finish();
+                }
             }
-        }
-        // 给对端一点时间读走最后一段响应再关闭连接（QUIC 关闭会丢弃
-        // 尚未被读取的流数据，实测直接返回会导致客户端读到 connection lost）。
+        };
+        let _ = send
+            .write_all(&serde_json::to_vec(&response).unwrap_or_default())
+            .await;
+        let _ = send.finish();
+        // 给对端一点时间读走最后一段响应再关连接。
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         Ok(())
     }
-}
-
-/// 把剩余洋葱包转发给下一跳（限制超时，避免慢节点拖死中继）。
-async fn forward_onion(endpoint: &iroh::Endpoint, next: &str, inner: Vec<u8>) -> Result<Vec<u8>> {
-    let id: iroh::EndpointId = next
-        .parse()
-        .map_err(|_| anyhow!("invalid next hop: {next}"))?;
-    let conn = tokio::time::timeout(
-        std::time::Duration::from_secs(90),
-        endpoint.connect(iroh::EndpointAddr::new(id), ONION_ALPN),
-    )
-    .await
-    .map_err(|_| anyhow!("connect {next} timed out"))??;
-    let (mut send, mut recv) = conn.open_bi().await?;
-    send.write_all(&inner).await?;
-    send.finish()?;
-    // 响应可能是一整批密文（queue_get），给足上限；中继只看长度不看内容。
-    let bytes = tokio::time::timeout(
-        std::time::Duration::from_secs(90),
-        recv.read_to_end(ONION_RESPONSE_MAX),
-    )
-    .await
-    .map_err(|_| anyhow!("waiting {next} response timed out"))??;
-    Ok(bytes)
 }
 
 async fn handle_request(handler: &MailboxHandler, payload: &[u8]) -> MailboxResponse {
@@ -360,16 +259,6 @@ async fn handle_queue_delete(handler: &MailboxHandler, req: MailboxRequest) -> M
     }
 }
 
-/// 日志里只打印 peer_id 前缀，减少节点日志泄露完整身份。
-fn short_id(id: &str) -> &str {
-    &id[..id.len().min(12)]
-}
-
-/// 单个洋葱包上限：内层载荷 64KB + 每层 94B 开销，留足余量。
-/// 中继按此上限读取，避免恶意客户端用 16MB 包做内存放大。
-const ONION_PACKET_MAX: usize = 128 * 1024;
-const ONION_RESPONSE_MAX: usize = 32 * 1024 * 1024;
-
 fn ok() -> MailboxResponse {
     MailboxResponse {
         ok: true,
@@ -409,9 +298,6 @@ struct NodeConfig {
     /// 固定监听地址，例如 "0.0.0.0:8443"；不写则随机端口。
     #[serde(default)]
     bind: Option<String>,
-    /// 洋葱转发白名单（逗号分隔的 peer_id 列表）；空 = 不限制。
-    #[serde(default)]
-    onion_peers: Option<Vec<String>>,
     /// 单队列条数上限。
     #[serde(default)]
     max_queue_msgs: Option<usize>,
@@ -430,7 +316,6 @@ struct ResolvedConfig {
     ttl_secs: u64,
     role: String,
     bind: Option<String>,
-    onion_peers: Vec<String>,
     max_queue_msgs: usize,
     max_queue_bytes: usize,
     max_queues: usize,
@@ -466,10 +351,6 @@ fn env_u64(key: &str) -> Option<u64> {
     env_string(key).and_then(|v| v.parse().ok())
 }
 
-fn is_peer_id(id: &str) -> bool {
-    id.len() == 64 && id.chars().all(|c| c.is_ascii_hexdigit())
-}
-
 fn resolve_config(file: NodeConfig) -> Result<ResolvedConfig> {
     let ttl_secs = env_u64("PRIVCHAT_MAILBOX_TTL_SECS")
         .or(file.ttl_secs)
@@ -480,25 +361,10 @@ fn resolve_config(file: NodeConfig) -> Result<ResolvedConfig> {
             .unwrap_or_else(|| "both".into()),
     )?;
     let bind = env_string("PRIVCHAT_MAILBOX_BIND").or(file.bind);
-    let onion_peers = match env_string("PRIVCHAT_MAILBOX_ONION_PEERS") {
-        Some(raw) => raw
-            .split(',')
-            .map(str::trim)
-            .filter(|p| is_peer_id(p))
-            .map(str::to_string)
-            .collect(),
-        None => file
-            .onion_peers
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|p| is_peer_id(p))
-            .collect(),
-    };
     Ok(ResolvedConfig {
         ttl_secs,
         role,
         bind,
-        onion_peers,
         max_queue_msgs: env_usize("PRIVCHAT_MAILBOX_MAX_QUEUE_MSGS")
             .or(file.max_queue_msgs)
             .unwrap_or(1000),
@@ -512,12 +378,15 @@ fn resolve_config(file: NodeConfig) -> Result<ResolvedConfig> {
 }
 
 fn validate_role(role: String) -> Result<String> {
-    if matches!(role.as_str(), "both" | "relay" | "mailbox") {
-        Ok(role)
-    } else {
-        Err(anyhow!(
-            "node role 只能是 both/relay/mailbox（config.json 的 role 或环境变量 PRIVCHAT_MAILBOX_ROLE），当前: {role}"
-        ))
+    match role.as_str() {
+        // both 是拆分前的旧值：现在信箱本身就是信箱终端，等价于 mailbox。
+        "both" | "mailbox" => Ok("mailbox".into()),
+        "relay" => Err(anyhow!(
+            "中继已经拆成独立程序：请改用 privchat-relay，而不是把信箱节点的 role 设成 relay"
+        )),
+        other => Err(anyhow!(
+            "role 只能是 mailbox（旧配置的 both 也接受），当前: {other}"
+        )),
     }
 }
 
@@ -532,11 +401,6 @@ fn ensure_config_files(data_dir: &std::path::Path, cfg: &ResolvedConfig) -> Resu
         ttl_secs: Some(cfg.ttl_secs),
         role: Some(cfg.role.clone()),
         bind: cfg.bind.clone(),
-        onion_peers: if cfg.onion_peers.is_empty() {
-            None
-        } else {
-            Some(cfg.onion_peers.clone())
-        },
         max_queue_msgs: Some(cfg.max_queue_msgs),
         max_queue_bytes: Some(cfg.max_queue_bytes),
         max_queues: Some(cfg.max_queues),
@@ -571,7 +435,6 @@ pub async fn run() -> Result<()> {
     let cfg = resolve_config(load_node_config(&data_dir))?;
     ensure_config_files(&data_dir, &cfg)?;
     let ttl_secs = cfg.ttl_secs;
-    let role = cfg.role.clone();
     let store = MailboxStore::open_with_limits(
         data_dir.join("mailbox.db"),
         cfg.ttl_secs,
@@ -599,32 +462,18 @@ pub async fn run() -> Result<()> {
         store: store.clone(),
     };
 
-    // P2：角色分离。relay 只转发洋葱、不落库；mailbox 只存取、不参与中继；
-    // both 兼容旧部署。角色来源：环境变量 > config.json > 默认 both。
-    let serve_mailbox = role != "relay";
-    let serve_onion = role != "mailbox";
-
-    let mut router_builder = Router::builder(endpoint.clone());
-    if serve_mailbox {
-        router_builder = router_builder.accept(ALPN, mailbox_handler.clone());
-    }
-    let _ = serve_onion;
-    router_builder = router_builder.accept(
-        ONION_ALPN,
-        OnionHandler {
-            mailbox: mailbox_handler,
-            secret: secret_key.clone(),
-            endpoint: endpoint.clone(),
-            allow_forward: role != "mailbox",
-            allow_terminal: role != "relay",
-            onion_allow: if cfg.onion_peers.is_empty() {
-                None
-            } else {
-                Some(Arc::new(cfg.onion_peers.clone()))
+    // 信箱节点只挂两个 ALPN：信箱请求 + 洋葱终点（收最内层）。
+    // 转发那一半已经拆到 privchat-relay，这里不再具备中继能力。
+    let router = Router::builder(endpoint.clone())
+        .accept(ALPN, mailbox_handler.clone())
+        .accept(
+            ONION_ALPN,
+            TerminalHandler {
+                mailbox: mailbox_handler,
+                secret: secret_key.clone(),
             },
-        },
-    );
-    let router = router_builder.spawn();
+        )
+        .spawn();
 
     // 到期消息清理任务：按 TTL/4 频率（夹在 1 分钟 ~ 1 小时）周期清除。
     if ttl_secs > 0 {
@@ -654,7 +503,7 @@ pub async fn run() -> Result<()> {
     println!("  store   : {}", store.path.display());
     println!("  ttl     : {} secs (0 = never expire)", ttl_secs);
     println!("  data_dir: {}", data_dir.display());
-    println!("  role    : {role} (mailbox={serve_mailbox}, onion_relay={serve_onion})");
+    println!("  role    : mailbox (onion terminal only; 中继请用 privchat-relay)");
     if let Some(bind) = &cfg.bind {
         println!("  bind    : {bind}");
     }
@@ -733,33 +582,27 @@ mod config_tests {
         assert_eq!(cfg.ttl_secs, Some(60));
         assert_eq!(cfg.role.as_deref(), Some("relay"));
         assert!(cfg.bind.is_none());
-        assert!(cfg.onion_peers.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn full_config_parses() {
         let dir = temp_dir("full");
-        let peer = "ab".repeat(32);
         std::fs::write(
             dir.join(CONFIG_FILE),
-            format!(
-                r#"{{
+            r#"{
                     "ttl_secs": 0,
                     "role": "both",
                     "bind": "0.0.0.0:8443",
-                    "onion_peers": ["{peer}"],
                     "max_queue_msgs": 10,
                     "max_queue_bytes": 4096,
                     "max_queues": 99
-                }}"#
-            ),
+                }"#,
         )
         .unwrap();
         let cfg = load_node_config(&dir);
         assert_eq!(cfg.ttl_secs, Some(0));
         assert_eq!(cfg.bind.as_deref(), Some("0.0.0.0:8443"));
-        assert_eq!(cfg.onion_peers.as_ref().unwrap()[0], peer);
         assert_eq!(cfg.max_queue_msgs, Some(10));
         assert_eq!(cfg.max_queue_bytes, Some(4096));
         assert_eq!(cfg.max_queues, Some(99));
@@ -778,9 +621,10 @@ mod config_tests {
 
     #[test]
     fn role_validation() {
-        assert!(validate_role("both".into()).is_ok());
-        assert!(validate_role("relay".into()).is_ok());
-        assert!(validate_role("mailbox".into()).is_ok());
+        assert_eq!(validate_role("both".into()).unwrap(), "mailbox");
+        assert_eq!(validate_role("mailbox".into()).unwrap(), "mailbox");
+        // 中继已经拆走了，配置里写 relay 要明确拒绝并给出去处。
+        assert!(validate_role("relay".into()).is_err());
         assert!(validate_role("nope".into()).is_err());
     }
 }

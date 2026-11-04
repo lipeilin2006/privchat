@@ -1,0 +1,14 @@
+[package]
+name = "privchat-relay"
+version = "0.1.0"
+edition = "2021"
+description = "PrivChat 洋葱中继节点：逐层剥离与转发，不存储任何消息"
+
+[dependencies]
+privchat-common = { path = "../privchat-common" }
+privchat-onion = { path = "../privchat-onion" }
+iroh = "1.0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"

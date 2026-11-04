@@ -37,6 +37,12 @@ pub const ONION_ALPN: &[u8] = b"privchat/onion";
 /// 单层固定开销：eph(32) + nonce(12) + tag(16) + next(32) + len(2)。
 pub const LAYER_OVERHEAD: usize = 32 + 12 + 16 + 32 + 2;
 
+/// 单个洋葱包的最大字节数（内层载荷 + 每层 94B 开销，留足余量）。
+pub const PACKET_MAX: usize = 128 * 1024;
+
+/// 中继等待下游响应的上限：可能是一整批密文（queue_get）。
+pub const RESPONSE_MAX: usize = 32 * 1024 * 1024;
+
 /// 单包内层有效载荷上限：内层长度用 u16 表示，留出每层 34 字节明文头，
 /// 所以这里必须明显小于 65536（写满会截断长度字段）。
 pub const MAX_INNER: usize = 60 * 1024;
