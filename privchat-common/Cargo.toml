@@ -9,7 +9,6 @@ anyhow = "1"
 iroh = "1.0.3"
 iroh-tickets = "1.0.0"
 serde = { version = "1", features = ["derive"] }
-base64 = "0.22"
 serde_json = "1"
 sha2 = "0.10"
 tokio = { version = "1", features = ["time"] }
