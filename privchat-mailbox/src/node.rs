@@ -31,9 +31,7 @@ use iroh::endpoint::Connection;
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::SecretKey;
 
-use privchat_common::{
-    hex_decode, MailboxRequest, MailboxResponse, Op, StoredMessage, ALPN,
-};
+use privchat_common::{hex_decode, MailboxRequest, MailboxResponse, Op, StoredMessage, ALPN};
 use privchat_onion::{peel, ONION_ALPN, PACKET_MAX};
 
 use crate::store::MailboxStore;

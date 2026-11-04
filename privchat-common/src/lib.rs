@@ -1,4 +1,4 @@
-//! PrivChat 共享协议层：mailbox 客户端与 mailbox 节点之间的 wire 协议与 PoW。
+//! PrivChat 共享协议层：mailbox 客户端与信箱节点之间的 wire 协议。
 //!
 //! 客户端（`privchat-client`）与节点（`privchat-mailbox`）各自依赖本 crate，
 //! 保证请求/响应结构与常量只维护一份，避免两处复制导致漂移。
@@ -12,7 +12,6 @@ use anyhow::{anyhow, Result};
 use iroh::endpoint::presets;
 use iroh::Endpoint;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 /// mailbox 节点唯一 ALPN：与客户端聊天 ALPN 区分。
 pub const ALPN: &[u8] = b"privchat/mailbox";
@@ -20,22 +19,6 @@ pub const ALPN: &[u8] = b"privchat/mailbox";
 /// 单条邮件容量上限（密文，含 overhead）。
 pub const MAX_PAYLOAD: usize = 16 * 1024 * 1024;
 
-/// PoW 难度：`SHA-256(to || payload || nonce)` 摘要的前导零**字节**数。
-///
-/// 平均约 `256^1 = 256` 次尝试，秒级完成，但足以把灌垃圾的成本抬高一个
-/// 数量级。当前队列协议用签名鉴权，尚未在 `QueueSend` 上强制执行 PoW。
-pub const POW_DIFFICULTY: usize = 1;
-
-/// 计算一次 PoW 挑战的摘要输入：`to || payload || nonce`（nonce 小端 8 字节）。
-fn pow_input(to: &str, payload: &[u8], nonce: u64) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(to.len() + payload.len() + 8);
-    buf.extend_from_slice(to.as_bytes());
-    buf.extend_from_slice(payload);
-    buf.extend_from_slice(&nonce.to_le_bytes());
-    buf
-}
-
-/// 校验 nonce 是否满足 PoW 难度。
 /// 十六进制编码（小写）。
 pub fn hex_encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -66,22 +49,6 @@ fn hex_val(b: u8) -> Option<u8> {
         b'a'..=b'f' => Some(b - b'a' + 10),
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
-    }
-}
-
-pub fn verify_pow(to: &str, payload: &[u8], nonce: u64) -> bool {
-    let digest = Sha256::digest(pow_input(to, payload, nonce));
-    digest[..POW_DIFFICULTY].iter().all(|&b| b == 0)
-}
-
-/// 暴力搜索满足难度的 nonce（从 0 递增）。对 1 字节难度平均 256 次。
-pub fn find_pow(to: &str, payload: &[u8]) -> u64 {
-    let mut nonce = 0u64;
-    loop {
-        if verify_pow(to, payload, nonce) {
-            return nonce;
-        }
-        nonce = nonce.wrapping_add(1);
     }
 }
 
@@ -300,31 +267,6 @@ pub fn unpad_plaintext(data: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn find_pow_yields_valid_nonce() {
-        let to = "recipient-peer-id";
-        let payload = b"ciphertext payload".to_vec();
-        let nonce = find_pow(to, &payload);
-        assert!(verify_pow(to, &payload, nonce));
-    }
-
-    #[test]
-    fn verify_pow_rejects_wrong_nonce() {
-        let to = "recipient-peer-id";
-        let payload = b"ciphertext payload".to_vec();
-        let nonce = find_pow(to, &payload);
-        assert!(
-            !verify_pow(to, &payload, nonce.wrapping_add(1)),
-            "neighbor nonce must fail"
-        );
-        // 改 payload 后原 nonce 不应再有效。
-        let other = b"different payload".to_vec();
-        assert!(
-            !verify_pow(to, &other, nonce),
-            "payload change must invalidate nonce"
-        );
-    }
 
     #[test]
     fn pad_roundtrip_and_buckets() {

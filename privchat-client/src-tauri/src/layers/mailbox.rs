@@ -4,7 +4,7 @@
 //! create / send / get / delete / ping。每个请求一条 QUIC bi-stream：
 //! 写入 JSON 请求，读回 JSON 响应。队列权限靠 Ed25519 签名，不依赖 TLS 身份。
 //!
-//! wire 协议（请求/响应/常量/PoW）统一由 `privchat-common` 提供，本层只
+//! wire 协议（请求/响应/常量）统一由 `privchat-common` 提供，本层只
 //! 保留客户端操作封装，避免与 mailbox 节点重复维护协议。
 
 use anyhow::{anyhow, Result};

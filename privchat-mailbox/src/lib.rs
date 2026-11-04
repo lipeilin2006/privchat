@@ -8,6 +8,6 @@ pub mod node;
 pub mod store;
 
 pub use privchat_common::{
-    find_pow, make_endpoint, send_request, verify_pow, MailboxRequest, MailboxResponse, Op,
-    StoredMessage, ALPN, MAX_PAYLOAD, POW_DIFFICULTY,
+    make_endpoint, send_request, MailboxRequest, MailboxResponse, Op, StoredMessage, ALPN,
+    MAX_PAYLOAD,
 };

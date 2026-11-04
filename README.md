@@ -70,7 +70,7 @@ privchat/
 │   ├── src-tauri/              Rust 后端（分层见上）
 │   └── dev/                    无浏览器 UI 测试（puppeteer + mock）
 │
-├── privchat-common/            wire 协议 / PoW / ALPN
+├── privchat-common/            wire 协议 / ALPN
 ├── privchat-mailbox/           信箱节点（队列存储 + 洋葱终点）
 ├── privchat-relay/             洋葱中继节点（只转发，不落库）
 ├── privchat-onion/             洋葱路由封装与剥离

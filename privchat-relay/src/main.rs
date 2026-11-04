@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
-use tokio::sync::Semaphore;
 use iroh::{Endpoint, SecretKey};
+use tokio::sync::Semaphore;
 
 use privchat_common::MailboxResponse;
 use privchat_onion::{peel, ONION_ALPN, PACKET_MAX, RESPONSE_MAX};
