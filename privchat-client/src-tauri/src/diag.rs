@@ -16,7 +16,6 @@ static BUF: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 const MAX_BUF: usize = 200;
 const LOG_NAME: &str = "boot.log";
-const PREV_NAME: &str = "boot.prev.log";
 
 fn elapsed_ms() -> u128 {
     let mut guard = match START.lock() {
@@ -62,8 +61,7 @@ pub fn trace(msg: &str) {
     }
 }
 
-/// 数据目录确定后调用：把上一轮日志轮换到 `boot.prev.log`，
-/// 再把内存里缓冲的记录落到新的 `boot.log`。
+/// 数据目录确定后调用：把内存里缓冲的记录落到 `boot.log`。
 pub fn set_dir(dir: PathBuf) {
     {
         let mut guard = match DIR.lock() {
@@ -73,9 +71,6 @@ pub fn set_dir(dir: PathBuf) {
         *guard = Some(dir.clone());
     }
     let log = dir.join(LOG_NAME);
-    if log.exists() {
-        let _ = fs::rename(&log, dir.join(PREV_NAME));
-    }
     let buffered: Vec<String> = {
         let mut buf = match BUF.lock() {
             Ok(g) => g,
@@ -89,7 +84,7 @@ pub fn set_dir(dir: PathBuf) {
     trace("diag ready");
 }
 
-/// 装上 panic hook：release 是 panic=abort，hook 是进程死前最后的落笔机会。
+/// 装上 panic hook：进程死前的最后一条记录（panic 信息）靠它落盘。
 pub fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {

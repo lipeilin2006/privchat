@@ -31,8 +31,6 @@ mod settings;
 pub use connections::{ConnMessage, ConnRow};
 pub use settings::MailboxPeer;
 
-pub const UNBOUND_IDENTITY_TTL_MS: u64 = 24 * 60 * 60 * 1000;
-
 /// SQLite 持久化门面。连接用 `Mutex` 包裹以保证线程安全，且所有操作
 /// 都很小（几十到几百行），同步执行即可。
 pub struct Store {

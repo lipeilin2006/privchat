@@ -26,7 +26,6 @@ tauri-plugin-app = "2.0.0-alpha.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 iroh = "1.0.3"
-iroh-tickets = "1.0.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util"] }
 anyhow = "1"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
@@ -45,3 +44,4 @@ jni = "0.21"
 
 [dev-dependencies]
 privchat-mailbox = { path = "../../privchat-mailbox" }
+iroh-tickets = "1.0.0"

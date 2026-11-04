@@ -140,8 +140,7 @@ bash scripts/build-android-arm64.sh
 
 > debug key 的口令是公开的，只适合自用 / 测试分发；对外发布请换自己的密钥。
 
-其他脚本：`build-windows-x86_64.sh`、`build-linux-x86_64.sh`、
-`build-android-wsl.sh`、`build-windows.ps1`。
+其他脚本：`build-windows-x86_64.sh`、`build-linux-x86_64.sh`、`build-windows.ps1`。
 
 
 

@@ -87,19 +87,9 @@ body {
   flex: 1;
 }
 
-.head-actions {
-  display: flex;
-  gap: 4px;
-}
-
 .search-wrap {
   padding: 8px 12px;
   background: var(--tg-bg);
-}
-
-.tg-search input {
-  border-radius: 10px;
-  background: #efeff0;
 }
 
 .chat-list {
@@ -273,17 +263,6 @@ body {
 }
 
 /* ---------- 设置 / 列表 ---------- */
-.tg-list {
-  flex: 1;
-  overflow-y: auto;
-  background: var(--tg-bg-2);
-}
-
-.cell-emoji {
-  font-size: 20px;
-  width: 28px;
-  text-align: center;
-}
 
 .form-row {
   display: flex;
@@ -350,14 +329,6 @@ body {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
-.add-contact {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  width: 100%;
-  padding: 6px 0;
-}
-
 /* ---------- 保险箱 ---------- */
 .vault-screen {
   height: 100%;
@@ -408,27 +379,6 @@ body {
 }
 
 /* ---------- 底部标签栏 ---------- */
-.tg-tabbar {
-  position: fixed !important;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  z-index: 50;
-  display: flex;
-  background: rgba(255, 255, 255, 0.96);
-  backdrop-filter: blur(12px);
-  border-top: 1px solid var(--tg-divider);
-  padding-bottom: env(safe-area-inset-bottom, 0px);
-}
-
-.tg-tabbar .tgui-TabbarItem {
-  flex: 1;
-  color: var(--tg-sub);
-}
-
-.tg-tabbar .tgui-TabbarItem--selected {
-  color: var(--tg-accent);
-}
 
 /* ---------- 弹窗 / Toast ---------- */
 .modal-card {
@@ -474,7 +424,6 @@ body {
 .ph-icon {
   font-size: 40px;
 }
-
 
 /* 纯输入框（避免 telegram-ui Input 的双层边框） */
 .plain-input {
@@ -665,14 +614,6 @@ body {
 }
 
 /* 搜索框（联系人页） */
-.search-box {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  background: #efeff0;
-  border-radius: 10px;
-  padding: 9px 12px;
-}
 .search-input {
   flex: 1;
   border: 0;
@@ -853,18 +794,6 @@ body {
 }
 
 /* 底部栏的个人头像 */
-.tab-avatar {
-  width: 24px;
-  height: 24px;
-  border-radius: 50%;
-  background: #ef8f36;
-  color: #fff;
-  font-size: 12px;
-  font-weight: 600;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-}
 
 /* 联系人行更接近参考图 */
 .group-card .tgui-Cell {
@@ -913,41 +842,6 @@ body {
   font-size: 24px;
   font-weight: 700;
   letter-spacing: 0.2px;
-}
-.menu-wrap {
-  position: relative;
-}
-.menu-backdrop {
-  position: fixed;
-  inset: 0;
-  z-index: 60;
-}
-.menu-sheet {
-  position: absolute;
-  right: 0;
-  top: 44px;
-  z-index: 61;
-  background: #fff;
-  border-radius: 12px;
-  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.16);
-  padding: 6px;
-  min-width: 170px;
-}
-.menu-item {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  width: 100%;
-  border: 0;
-  background: transparent;
-  padding: 10px 12px;
-  border-radius: 8px;
-  font-size: 15px;
-  color: var(--tg-text);
-  cursor: pointer;
-}
-.menu-item:active {
-  background: rgba(51, 144, 236, 0.08);
 }
 
 /* 聊天列表行：贴近 Telegram 比例 */
@@ -1121,17 +1015,6 @@ body {
   background: transparent;
   border-top: 0;
 }
-.composer-icon {
-  border: 0;
-  background: transparent;
-  color: #5d6b7a;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 32px;
-  height: 32px;
-  cursor: pointer;
-}
 .composer-input {
   flex: 1;
   min-width: 0;
@@ -1155,9 +1038,6 @@ body {
 }
 .send-btn.ready {
   background: #3390ec;
-}
-.menu-item.danger {
-  color: #df3e3e;
 }
 
 /* 聊天壁纸：平铺 */
@@ -1320,19 +1200,9 @@ body {
   flex: 1;
 }
 
-.head-actions {
-  display: flex;
-  gap: 4px;
-}
-
 .search-wrap {
   padding: 8px 12px;
   background: var(--tg-bg);
-}
-
-.tg-search input {
-  border-radius: 10px;
-  background: #efeff0;
 }
 
 .chat-list {
@@ -1506,17 +1376,6 @@ body {
 }
 
 /* ---------- 设置 / 列表 ---------- */
-.tg-list {
-  flex: 1;
-  overflow-y: auto;
-  background: var(--tg-bg-2);
-}
-
-.cell-emoji {
-  font-size: 20px;
-  width: 28px;
-  text-align: center;
-}
 
 .form-row {
   display: flex;
@@ -1583,14 +1442,6 @@ body {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
-.add-contact {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  width: 100%;
-  padding: 6px 0;
-}
-
 /* ---------- 保险箱 ---------- */
 .vault-screen {
   height: 100%;
@@ -1641,27 +1492,6 @@ body {
 }
 
 /* ---------- 底部标签栏 ---------- */
-.tg-tabbar {
-  position: fixed !important;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  z-index: 50;
-  display: flex;
-  background: rgba(255, 255, 255, 0.96);
-  backdrop-filter: blur(12px);
-  border-top: 1px solid var(--tg-divider);
-  padding-bottom: env(safe-area-inset-bottom, 0px);
-}
-
-.tg-tabbar .tgui-TabbarItem {
-  flex: 1;
-  color: var(--tg-sub);
-}
-
-.tg-tabbar .tgui-TabbarItem--selected {
-  color: var(--tg-accent);
-}
 
 /* ---------- 弹窗 / Toast ---------- */
 .modal-card {
@@ -1707,7 +1537,6 @@ body {
 .ph-icon {
   font-size: 40px;
 }
-
 
 /* 纯输入框（避免 telegram-ui Input 的双层边框） */
 .plain-input {
@@ -1898,14 +1727,6 @@ body {
 }
 
 /* 搜索框（联系人页） */
-.search-box {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  background: #efeff0;
-  border-radius: 10px;
-  padding: 9px 12px;
-}
 .search-input {
   flex: 1;
   border: 0;
@@ -2086,18 +1907,6 @@ body {
 }
 
 /* 底部栏的个人头像 */
-.tab-avatar {
-  width: 24px;
-  height: 24px;
-  border-radius: 50%;
-  background: #ef8f36;
-  color: #fff;
-  font-size: 12px;
-  font-weight: 600;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-}
 
 /* 联系人行更接近参考图 */
 .group-card .tgui-Cell {
@@ -2146,41 +1955,6 @@ body {
   font-size: 24px;
   font-weight: 700;
   letter-spacing: 0.2px;
-}
-.menu-wrap {
-  position: relative;
-}
-.menu-backdrop {
-  position: fixed;
-  inset: 0;
-  z-index: 60;
-}
-.menu-sheet {
-  position: absolute;
-  right: 0;
-  top: 44px;
-  z-index: 61;
-  background: #fff;
-  border-radius: 12px;
-  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.16);
-  padding: 6px;
-  min-width: 170px;
-}
-.menu-item {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  width: 100%;
-  border: 0;
-  background: transparent;
-  padding: 10px 12px;
-  border-radius: 8px;
-  font-size: 15px;
-  color: var(--tg-text);
-  cursor: pointer;
-}
-.menu-item:active {
-  background: rgba(51, 144, 236, 0.08);
 }
 
 /* 聊天列表行：贴近 Telegram 比例 */
@@ -2354,17 +2128,6 @@ body {
   background: transparent;
   border-top: 0;
 }
-.composer-icon {
-  border: 0;
-  background: transparent;
-  color: #5d6b7a;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 32px;
-  height: 32px;
-  cursor: pointer;
-}
 .composer-input {
   flex: 1;
   min-width: 0;
@@ -2388,9 +2151,6 @@ body {
 }
 .send-btn.ready {
   background: #3390ec;
-}
-.menu-item.danger {
-  color: #df3e3e;
 }
 
 /* 聊天壁纸：平铺 */
@@ -2465,12 +2225,6 @@ body {
 }
 
 /* ---------- 信箱节点 / 洋葱路由 ---------- */
-.hint-line {
-  padding: 2px 18px 10px;
-  font-size: 12px;
-  line-height: 1.5;
-  color: var(--tg-sub);
-}
 
 .peer-row {
   display: flex;
@@ -2606,20 +2360,6 @@ body {
 
 .path-arrow {
   opacity: 0.6;
-}
-
-.privacy-note {
-  display: flex;
-  align-items: flex-start;
-  gap: 8px;
-  padding: 4px 18px 22px;
-  font-size: 12px;
-  line-height: 1.5;
-  color: var(--tg-sub);
-}
-
-.muted {
-  opacity: 0.8;
 }
 
 /* 静态 / 动态 切换 */

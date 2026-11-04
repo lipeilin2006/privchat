@@ -36,11 +36,38 @@ export async function invoke(cmd, args) {
     case "rename_connection":
       return null;
     case "get_mailbox_peers":
-      return [B];
-    case "get_mailbox_write_count":
-      return 3;
+      return [{ peer_id: B, priority: 3 }];
+    case "add_mailbox_peer":
+    case "remove_mailbox_peer":
+    case "set_mailbox_priority":
+    case "set_mailbox_weight":
+    case "set_onion_config":
+      return null;
+    case "ping_mailbox":
+      return 42;
+    case "ping_mailboxes":
+      return [{ peer_id: B, ms: 42, error: null }];
+    case "mailbox_latency":
+      return { [B]: 42 };
+    case "get_mailbox_weight":
+      return 0.5;
     case "get_onion_config":
-      return { enabled: true, relays: [B, A] };
+      return {
+        enabled: true,
+        mode: "static",
+        relays: [
+          { peer_id: B, priority: 0 },
+          { peer_id: A, priority: 0 },
+        ],
+        hops: 2,
+        weight: 0.5,
+      };
+    case "test_onion_relays":
+      return [{ peer_id: B, ms: 55, error: null }];
+    case "onion_relay_latency":
+      return { [B]: 55 };
+    case "export_diagnostics":
+      return { app_version: "0.1.0", mailbox_count: 1 };
     case "get_auto_lock_minutes":
       return 5;
     default:
