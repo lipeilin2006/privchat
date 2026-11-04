@@ -120,13 +120,7 @@ impl IrohQueues {
             OnionMode::Static => pool.iter().map(|relay| relay.peer_id.clone()).collect(),
             OnionMode::Dynamic => {
                 let latencies = self.relay_latency.lock().await.clone();
-                sample_relays(
-                    &pool,
-                    config.hops as usize,
-                    config.weight_priority,
-                    config.weight_latency,
-                    &latencies,
-                )
+                sample_relays(&pool, config.hops as usize, config.weight, &latencies)
             }
         };
         if relays.is_empty() {
@@ -740,29 +734,22 @@ fn is_peer_id(id: &str) -> bool {
     id.len() == 64 && id.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-/// 一个中继被抽中的权重：优先级和延迟各占一份，权重大小由配置决定。
-fn relay_weight(
-    relay: &OnionRelay,
-    weight_priority: u8,
-    weight_latency: u8,
-    latencies: &HashMap<String, u64>,
-) -> u64 {
-    let priority = relay.priority.clamp(0, 9) as u64;
-    // 延迟越低分越高：0ms → 10 分，1s 以上 → 0 分；没测过给中间值。
-    let latency_score = match latencies.get(&relay.peer_id) {
-        Some(ms) => 10u64.saturating_sub((*ms / 100).min(10)),
-        None => 5,
-    };
-    // 两个权重都是 0 时退化成等概率（基础权重 1）。
-    1 + priority * weight_priority as u64 * 10 + latency_score * weight_latency as u64 * 10
+/// 抽样权重：分数越低（越快 / 优先级越高）越容易被抽中。
+fn relay_weight(relay: &OnionRelay, weight: f64, latencies: &HashMap<String, u64>) -> f64 {
+    let score = crate::layers::app::routing_score(
+        relay.priority,
+        latencies.get(&relay.peer_id).copied(),
+        weight,
+    );
+    // +0.05 防止除零；分数最低的节点权重最大。
+    1.0 / (score + 0.05)
 }
 
 /// 按权重不放回地抽 `hops` 个中继。
 fn sample_relays(
     pool: &[OnionRelay],
     hops: usize,
-    weight_priority: u8,
-    weight_latency: u8,
+    weight: f64,
     latencies: &HashMap<String, u64>,
 ) -> Vec<String> {
     if pool.is_empty() {
@@ -772,19 +759,22 @@ fn sample_relays(
     let want = hops.clamp(1, 5).min(remaining.len());
     let mut out = Vec::with_capacity(want);
     while out.len() < want {
-        let total: u64 = remaining
+        let weights: Vec<f64> = remaining
             .iter()
-            .map(|relay| relay_weight(relay, weight_priority, weight_latency, latencies))
-            .sum();
-        let mut pick = rand_core::RngCore::next_u64(&mut rand_core::OsRng) % total.max(1);
+            .map(|relay| relay_weight(relay, weight, latencies))
+            .collect();
+        let total: f64 = weights.iter().sum();
+        // 取 [0, total) 上的一点，落进哪段就选谁。
+        let point =
+            (rand_core::RngCore::next_u64(&mut rand_core::OsRng) as f64 / u64::MAX as f64) * total;
+        let mut acc = 0.0;
         let mut chosen = remaining.len() - 1;
-        for (i, relay) in remaining.iter().enumerate() {
-            let weight = relay_weight(relay, weight_priority, weight_latency, latencies);
-            if pick < weight {
+        for (i, w) in weights.iter().enumerate() {
+            acc += w;
+            if point <= acc {
                 chosen = i;
                 break;
             }
-            pick -= weight;
         }
         out.push(remaining.remove(chosen).peer_id);
     }

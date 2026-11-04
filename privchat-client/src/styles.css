@@ -2692,3 +2692,16 @@ body {
 .push-right {
   margin-left: auto;
 }
+
+.weight-row {
+  gap: 8px;
+}
+
+.weight-row .tune-label {
+  width: auto;
+  flex: none;
+}
+
+.weight-row .tune-label.right {
+  text-align: right;
+}

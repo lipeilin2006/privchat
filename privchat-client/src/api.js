@@ -28,6 +28,9 @@ export const api = {
     invoke("set_mailbox_priority", { peerId, priority }),
   pingMailbox: (peerId) => invoke("ping_mailbox", { peerId }),
   pingMailboxes: () => invoke("ping_mailboxes"),
+  mailboxLatency: () => invoke("mailbox_latency"),
+  getMailboxWeight: () => invoke("get_mailbox_weight"),
+  setMailboxWeight: (weight) => invoke("set_mailbox_weight", { weight }),
 
   getOnion: () => invoke("get_onion_config"),
   setOnion: (config) => invoke("set_onion_config", { config }),

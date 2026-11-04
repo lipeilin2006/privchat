@@ -315,7 +315,7 @@ fn dynamic_path_weights_priority_and_latency() {
 
     let mut fast_hits = 0;
     for _ in 0..200 {
-        let path = sample_relays(&pool, 1, 10, 10, &latencies);
+        let path = sample_relays(&pool, 1, 1.0, &latencies);
         if path[0] == fast {
             fast_hits += 1;
         }
@@ -325,16 +325,16 @@ fn dynamic_path_weights_priority_and_latency() {
         "priority+latency should favour the fast node, got {fast_hits}/200"
     );
 
-    // 两个权重都为 0：退化成等概率。
+    // 权重 0：只看优先级，快的仍然优先（优先级高的那台）。
     let mut fast_uniform = 0;
     for _ in 0..400 {
-        if sample_relays(&pool, 1, 0, 0, &latencies)[0] == fast {
+        if sample_relays(&pool, 1, 0.0, &latencies)[0] == fast {
             fast_uniform += 1;
         }
     }
     assert!(
-        (120..280).contains(&fast_uniform),
-        "zero weights should be near uniform, got {fast_uniform}/400"
+        fast_uniform > 300,
+        "weight 0 should follow priority, got {fast_uniform}/400"
     );
 }
 
@@ -347,7 +347,7 @@ fn dynamic_path_has_no_duplicates() {
             priority: 0,
         })
         .collect();
-    let path = sample_relays(&pool, 5, 5, 5, &HashMap::new());
+    let path = sample_relays(&pool, 5, 0.5, &HashMap::new());
     assert_eq!(path.len(), 3, "hops capped by pool size");
     let mut unique = path.clone();
     unique.sort();

@@ -52,6 +52,26 @@ impl MailboxPing {
     }
 }
 
+/// 统一的选点打分：`延迟(ms) * 0.01 * 权重 + 优先级 * (1 - 权重)`。
+///
+/// 权重 0 = 只看优先级，1 = 只看延迟。分数越低越好。
+/// 没测过延迟的节点按 300ms 估（中间值），不至于因为没测速就永远选不上。
+pub fn routing_score(priority: i64, latency_ms: Option<u64>, weight: f64) -> f64 {
+    let weight = weight.clamp(0.0, 1.0);
+    let latency = latency_ms.unwrap_or(300) as f64;
+    // 优先级 9 折算成 0 成本、0 折算成 9 —— 和「数值越大越先用」对齐。
+    let priority_cost = (9 - priority.clamp(0, 9)) as f64;
+    latency * 0.01 * weight + priority_cost * (1.0 - weight)
+}
+
+fn clamp_weight(weight: f64) -> f64 {
+    if weight.is_finite() {
+        weight.clamp(0.0, 1.0)
+    } else {
+        0.5
+    }
+}
+
 /// 优先级的合法区间：0..=9，数字越大越先用。
 fn clamp_priority(priority: i64) -> i64 {
     priority.clamp(0, 9)
@@ -61,17 +81,19 @@ fn peer_ids(peers: &[MailboxPeer]) -> Vec<String> {
     peers.iter().map(|p| p.peer_id.clone()).collect()
 }
 
-/// 选信箱：优先级最高的那一档里，挑实测延迟最低的；
-/// 都没测过就按列表顺序（列表本身已按优先级排序）。
+/// 选信箱：和中继用同一套打分（分数最低的赢）。
 fn choose_peer(
     peers: &[MailboxPeer],
     latencies: &std::collections::HashMap<String, u64>,
+    weight: f64,
 ) -> Option<String> {
-    let top = peers.iter().map(|p| p.priority).max()?;
     peers
         .iter()
-        .filter(|p| p.priority == top)
-        .min_by_key(|p| latencies.get(&p.peer_id).copied().unwrap_or(u64::MAX))
+        .min_by(|a, b| {
+            let sa = routing_score(a.priority, latencies.get(&a.peer_id).copied(), weight);
+            let sb = routing_score(b.priority, latencies.get(&b.peer_id).copied(), weight);
+            sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
+        })
         .map(|p| p.peer_id.clone())
 }
 
@@ -87,21 +109,55 @@ mod tests {
     }
 
     #[test]
-    fn picks_highest_priority_first() {
-        let peers = vec![peer("hi", 5), peer("lo", 0)];
+    fn weight_zero_follows_priority() {
+        let peers = vec![peer("hi", 9), peer("lo", 0)];
         let mut latencies = std::collections::HashMap::new();
         latencies.insert("lo".to_string(), 5);
         latencies.insert("hi".to_string(), 300);
-        assert_eq!(choose_peer(&peers, &latencies).as_deref(), Some("hi"));
+        assert_eq!(
+            choose_peer(&peers, &latencies, 0.0).as_deref(),
+            Some("hi"),
+            "weight 0 = priority only"
+        );
     }
 
     #[test]
-    fn ties_pick_lowest_latency() {
-        let peers = vec![peer("a", 3), peer("b", 3), peer("c", 1)];
+    fn weight_one_follows_latency() {
+        let peers = vec![peer("slow_hi_prio", 9), peer("fast", 0)];
         let mut latencies = std::collections::HashMap::new();
-        latencies.insert("a".to_string(), 120);
-        latencies.insert("b".to_string(), 40);
-        assert_eq!(choose_peer(&peers, &latencies).as_deref(), Some("b"));
+        latencies.insert("slow_hi_prio".to_string(), 300);
+        latencies.insert("fast".to_string(), 20);
+        assert_eq!(
+            choose_peer(&peers, &latencies, 1.0).as_deref(),
+            Some("fast"),
+            "weight 1 = latency only"
+        );
+    }
+
+    #[test]
+    fn score_blends_priority_and_latency() {
+        // prio 5 / 100ms：100*0.01*0.5 + 4*0.5 = 2.5
+        // prio 0 / 50ms ：50*0.01*0.5 + 9*0.5  = 4.75
+        let peers = vec![peer("balanced", 5), peer("fast_low_prio", 0)];
+        let mut latencies = std::collections::HashMap::new();
+        latencies.insert("balanced".to_string(), 100);
+        latencies.insert("fast_low_prio".to_string(), 50);
+        assert_eq!(
+            choose_peer(&peers, &latencies, 0.5).as_deref(),
+            Some("balanced")
+        );
+    }
+
+    #[test]
+    fn untested_latency_assumes_mid_value() {
+        // 没测过的按 300ms 估：会比实测 900ms 的更划算。
+        let peers = vec![peer("untested", 3), peer("slow", 3)];
+        let mut latencies = std::collections::HashMap::new();
+        latencies.insert("slow".to_string(), 900);
+        assert_eq!(
+            choose_peer(&peers, &latencies, 1.0).as_deref(),
+            Some("untested")
+        );
     }
 
     #[test]
@@ -114,7 +170,7 @@ mod tests {
         assert_eq!(cfg.relays[0].peer_id, id);
         assert_eq!(cfg.relays[0].priority, 0);
         assert_eq!(cfg.hops, 2);
-        assert_eq!(cfg.weight_priority, 5);
+        assert_eq!(cfg.weight, 0.5);
     }
 
     #[test]
@@ -127,28 +183,14 @@ mod tests {
                 priority: 7,
             }],
             hops: 3,
-            weight_priority: 8,
-            weight_latency: 2,
+            weight: 0.8,
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let back: OnionConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back.mode, OnionMode::Dynamic);
         assert_eq!(back.relays[0].priority, 7);
         assert_eq!(back.hops, 3);
-        assert_eq!(back.weight_priority, 8);
-    }
-
-    #[test]
-    fn untested_nodes_are_last_resort() {
-        let peers = vec![peer("slow", 3), peer("untested", 3)];
-        let mut latencies = std::collections::HashMap::new();
-        latencies.insert("slow".to_string(), 900);
-        assert_eq!(choose_peer(&peers, &latencies).as_deref(), Some("slow"));
-        assert_eq!(
-            choose_peer(&peers, &std::collections::HashMap::new()).as_deref(),
-            Some("slow"),
-            "no latencies -> first in list"
-        );
+        assert_eq!(back.weight, 0.8);
     }
 }
 
@@ -183,20 +225,17 @@ pub struct OnionConfig {
     /// 动态模式走几跳（1..=5，池子不够就全用上）。
     #[serde(default = "default_hops")]
     pub hops: u8,
-    /// 优先级权重（0..=10）。
+    /// 选路权重 0..=1：0 = 只看优先级，1 = 只看延迟。
     #[serde(default = "default_weight")]
-    pub weight_priority: u8,
-    /// 延迟权重（0..=10）。
-    #[serde(default = "default_weight")]
-    pub weight_latency: u8,
+    pub weight: f64,
 }
 
 fn default_hops() -> u8 {
     2
 }
 
-fn default_weight() -> u8 {
-    5
+fn default_weight() -> f64 {
+    0.5
 }
 
 impl Default for OnionConfig {
@@ -206,8 +245,7 @@ impl Default for OnionConfig {
             mode: OnionMode::Static,
             relays: Vec::new(),
             hops: default_hops(),
-            weight_priority: default_weight(),
-            weight_latency: default_weight(),
+            weight: default_weight(),
         }
     }
 }
@@ -249,6 +287,10 @@ pub struct App {
     onion: Arc<Mutex<OnionConfig>>,
     /// 中继实测延迟缓存（动态选路用；不落库）。
     relay_latency: Arc<Mutex<HashMap<String, u64>>>,
+    /// 信箱实测延迟缓存（选信箱用；不落库）。
+    mailbox_latency: Arc<Mutex<HashMap<String, u64>>>,
+    /// 信箱选路权重 0..=1。
+    mailbox_weight: Arc<Mutex<f64>>,
     stop_tx: watch::Sender<bool>,
 }
 
@@ -279,6 +321,8 @@ impl App {
                 .unwrap_or_default(),
         ));
         let relay_latency = Arc::new(Mutex::new(HashMap::new()));
+        let mailbox_latency = Arc::new(Mutex::new(HashMap::new()));
+        let mailbox_weight = Arc::new(Mutex::new(store.load_mailbox_weight().unwrap_or(0.5)));
         let queue_api = Arc::new(IrohQueues::new(
             transport.clone(),
             onion.clone(),
@@ -296,6 +340,8 @@ impl App {
             mailbox_peers,
             onion,
             relay_latency,
+            mailbox_latency,
+            mailbox_weight,
             stop_tx,
         })
     }
@@ -391,8 +437,7 @@ impl App {
     pub async fn set_onion_config(&self, mut config: OnionConfig) -> Result<()> {
         // 收一下边界，别让前端传进来的奇怪数值把选路算坏。
         config.hops = config.hops.clamp(1, 5);
-        config.weight_priority = config.weight_priority.min(10);
-        config.weight_latency = config.weight_latency.min(10);
+        config.weight = clamp_weight(config.weight);
         for relay in &mut config.relays {
             relay.priority = relay.priority.clamp(0, 9);
         }
@@ -578,6 +623,19 @@ impl App {
                 out.push(ping);
             }
         }
+        {
+            let mut cache = self.mailbox_latency.lock().await;
+            for ping in &out {
+                match ping.ms {
+                    Some(ms) => {
+                        cache.insert(ping.peer_id.clone(), ms);
+                    }
+                    None => {
+                        cache.remove(&ping.peer_id);
+                    }
+                }
+            }
+        }
         self.transport.forget(&local_id).await;
         out
     }
@@ -592,28 +650,39 @@ impl App {
         }
     }
 
-    /// 挑一台信箱建队列：先看优先级，最高的一档里挑延迟最低的。
+    /// 挑一台信箱建队列：优先级和延迟按权重打分，取分数最低的。
     pub async fn pick_mailbox(&self) -> Result<String> {
         let peers = self.mailbox_peers.lock().await.clone();
         if peers.is_empty() {
             return Err(anyhow!("还没有配置信箱节点"));
         }
-        let top = peers.iter().map(|p| p.priority).max().unwrap_or(0);
-        let candidates: Vec<String> = peers
-            .iter()
-            .filter(|p| p.priority == top)
-            .map(|p| p.peer_id.clone())
-            .collect();
-        if candidates.len() == 1 {
-            return Ok(candidates[0].clone());
+        let weight = *self.mailbox_weight.lock().await;
+        let mut latencies = self.mailbox_latency.lock().await.clone();
+        // 还没测过速就先测一轮——不然延迟这一项全是估的。
+        if latencies.is_empty() {
+            let ids: Vec<String> = peers.iter().map(|p| p.peer_id.clone()).collect();
+            for ping in self.ping_mailboxes(&ids).await {
+                if let Some(ms) = ping.ms {
+                    latencies.insert(ping.peer_id, ms);
+                }
+            }
         }
-        // 同优先级：实测一把，取最快的；全失败就退化成第一台。
-        let pings = self.ping_mailboxes(&candidates).await;
-        let latencies: std::collections::HashMap<String, u64> = pings
-            .into_iter()
-            .filter_map(|ping| ping.ms.map(|ms| (ping.peer_id, ms)))
-            .collect();
-        Ok(choose_peer(&peers, &latencies).unwrap_or_else(|| candidates[0].clone()))
+        Ok(choose_peer(&peers, &latencies, weight).unwrap_or_else(|| peers[0].peer_id.clone()))
+    }
+
+    pub async fn get_mailbox_weight(&self) -> f64 {
+        *self.mailbox_weight.lock().await
+    }
+
+    pub async fn set_mailbox_weight(&self, weight: f64) -> Result<()> {
+        let weight = clamp_weight(weight);
+        self.store.save_mailbox_weight(weight)?;
+        *self.mailbox_weight.lock().await = weight;
+        Ok(())
+    }
+
+    pub async fn get_mailbox_latency(&self) -> HashMap<String, u64> {
+        self.mailbox_latency.lock().await.clone()
     }
 
     pub fn get_auto_lock_minutes(&self) -> Result<u64> {

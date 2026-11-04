@@ -172,6 +172,32 @@ pub(crate) async fn get_mailbox_peers(
 }
 
 /// 一次给所有信箱测速（并发），返回各自的往返毫秒数。
+/// 信箱选路权重（0..=1）：0 = 只看优先级，1 = 只看延迟。
+#[tauri::command]
+pub(crate) async fn get_mailbox_weight(state: State<'_, AppState>) -> Result<f64, String> {
+    Ok(state.require_app()?.get_mailbox_weight().await)
+}
+
+#[tauri::command]
+pub(crate) async fn set_mailbox_weight(
+    weight: f64,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    state
+        .require_app()?
+        .set_mailbox_weight(weight)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// 最近一次信箱测速的缓存（peer_id → 毫秒）。
+#[tauri::command]
+pub(crate) async fn mailbox_latency(
+    state: State<'_, AppState>,
+) -> Result<std::collections::HashMap<String, u64>, String> {
+    Ok(state.require_app()?.get_mailbox_latency().await)
+}
+
 /// 测中继延迟（连一下就走，不真发请求）。
 #[tauri::command]
 pub(crate) async fn test_onion_relays(

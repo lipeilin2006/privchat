@@ -17,6 +17,7 @@ export default function MailboxPage({ notify, onClose }) {
   const [priority, setPriority] = useState(0);
   const [health, setHealth] = useState({});
   const [testing, setTesting] = useState(false);
+  const [weight, setWeight] = useState(0.5);
 
   const load = async () => {
     try {
@@ -28,7 +29,26 @@ export default function MailboxPage({ notify, onClose }) {
 
   useEffect(() => {
     load();
+    api
+      .mailboxLatency()
+      .then((cache) => {
+        const next = {};
+        for (const [id, ms] of Object.entries(cache || {})) next[id] = { ms };
+        setHealth(next);
+      })
+      .catch(() => {});
+    api.getMailboxWeight().then(setWeight).catch(() => {});
   }, []);
+
+  const changeWeight = async (value) => {
+    const next = Number(value);
+    setWeight(next);
+    try {
+      await api.setMailboxWeight(next);
+    } catch (e) {
+      notify(String(e), "err");
+    }
+  };
 
   const add = async () => {
     const id = input.trim();
@@ -153,7 +173,22 @@ export default function MailboxPage({ notify, onClose }) {
           </Button>
         </div>
 
-        <div className="hint-line">{t("priorityHint")}</div>
+        <div className="tune-block">
+          <div className="tune-row weight-row">
+          <span className="tune-label">{t("weightPrioritySide")}</span>
+          <input
+            className="tune-slider"
+            type="range"
+            min="0"
+            max="1"
+            step="0.05"
+            value={weight}
+            onChange={(e) => changeWeight(e.target.value)}
+          />
+          <span className="tune-label right">{t("weightLatencySide")}</span>
+          <span className="tune-value">{Number(weight).toFixed(2)}</span>
+          </div>
+        </div>
 
         <div className="group-card mailbox-card">
           {peers.length === 0 && <Placeholder description={t("mailboxHint")} />}

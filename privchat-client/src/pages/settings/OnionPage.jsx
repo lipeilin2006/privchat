@@ -6,7 +6,6 @@ import {
   ChevronUp,
   ChevronDown,
   X,
-  ShieldCheck,
   Activity,
 } from "lucide-react";
 import Group from "../../components/Group";
@@ -26,8 +25,7 @@ function emptyConfig() {
     mode: "static",
     relays: [],
     hops: 2,
-    weight_priority: 5,
-    weight_latency: 5,
+    weight: 0.5,
   };
 }
 
@@ -73,8 +71,7 @@ export default function OnionPage({ notify, onClose }) {
           priority: Number(r.priority) || 0,
         })),
         hops: Number(cfg.hops) || 1,
-        weight_priority: Number(cfg.weight_priority) || 0,
-        weight_latency: Number(cfg.weight_latency) || 0,
+        weight: Number(cfg.weight) || 0,
       });
       notify(t("saveOk"));
     } catch (e) {
@@ -185,10 +182,6 @@ export default function OnionPage({ notify, onClose }) {
               {t("dynamicMode")}
             </button>
           </div>
-          <div className="hint-line">
-            {dynamic ? t("dynamicHint") : t("onionModeHint")}
-          </div>
-
           {dynamic && (
             <div className="tune-block">
               <div className="tune-row">
@@ -205,35 +198,21 @@ export default function OnionPage({ notify, onClose }) {
                   ))}
                 </select>
               </div>
-              <div className="tune-row">
-                <span className="tune-label">{t("weightPriority")}</span>
+              <div className="tune-row weight-row">
+                <span className="tune-label">{t("weightPrioritySide")}</span>
                 <input
                   className="tune-slider"
                   type="range"
                   min="0"
-                  max="10"
-                  step="1"
-                  value={cfg.weight_priority}
+                  max="1"
+                  step="0.05"
+                  value={cfg.weight}
                   onChange={(e) =>
-                    setCfg((c) => ({ ...c, weight_priority: Number(e.target.value) }))
+                    setCfg((c) => ({ ...c, weight: Number(e.target.value) }))
                   }
                 />
-                <span className="tune-value">{cfg.weight_priority}</span>
-              </div>
-              <div className="tune-row">
-                <span className="tune-label">{t("weightLatency")}</span>
-                <input
-                  className="tune-slider"
-                  type="range"
-                  min="0"
-                  max="10"
-                  step="1"
-                  value={cfg.weight_latency}
-                  onChange={(e) =>
-                    setCfg((c) => ({ ...c, weight_latency: Number(e.target.value) }))
-                  }
-                />
-                <span className="tune-value">{cfg.weight_latency}</span>
+                <span className="tune-label right">{t("weightLatencySide")}</span>
+                <span className="tune-value">{Number(cfg.weight).toFixed(2)}</span>
               </div>
             </div>
           )}
@@ -298,9 +277,7 @@ export default function OnionPage({ notify, onClose }) {
                         ))}
                       </select>
                     </span>
-                  ) : (
-                    <span className="muted">{t("relayRole")}</span>
-                  )}
+                  ) : null}
                   {latency[r.peer_id] != null ? (
                     <span
                       className={`lat-badge ok${
@@ -347,10 +324,6 @@ export default function OnionPage({ notify, onClose }) {
           ))}
         </Group>
 
-        <div className="privacy-note">
-          <ShieldCheck size={16} />
-          <span>{t("onionPrivacy")}</span>
-        </div>
       </div>
     </div>
   );

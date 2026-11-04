@@ -33,6 +33,19 @@ impl Store {
         )?;
         Ok(())
     }
+    /// 信箱选路权重（0..=1）：0 = 只看优先级，1 = 只看延迟。
+    pub fn load_mailbox_weight(&self) -> Result<f64> {
+        Ok(self
+            .load_setting("mailbox_weight")?
+            .and_then(|v| v.parse::<f64>().ok())
+            .map(|w| w.clamp(0.0, 1.0))
+            .unwrap_or(0.5))
+    }
+
+    pub fn save_mailbox_weight(&self, weight: f64) -> Result<()> {
+        self.save_setting("mailbox_weight", &weight.clamp(0.0, 1.0).to_string())
+    }
+
     /// 洋葱路由配置（JSON：`{"enabled":bool,"relays":[peer_id,...]}`）。
     pub fn load_onion_config(&self) -> Result<String> {
         Ok(self
