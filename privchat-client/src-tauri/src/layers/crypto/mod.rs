@@ -55,6 +55,9 @@ use hkdf::Hkdf;
 use rand_core::RngCore;
 use sha2::{Digest, Sha256};
 
+/// 新协议（每连接独立密钥）尚未接入 app 层，暂不报 dead_code。
+#[allow(dead_code)]
+pub(super) mod connection;
 pub(super) mod header;
 pub(super) mod hex;
 pub(super) mod invite;
