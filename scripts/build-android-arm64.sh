@@ -3,7 +3,13 @@
 # PrivChat — Android arm64 (aarch64) APK 编译脚本
 #
 # 用法：
-#   bash scripts/build-android-arm64.sh [--sign <keystore> <alias> <pass>]
+#   bash scripts/build-android-arm64.sh                  # 用固定 debug key 自动签名
+#   bash scripts/build-android-arm64.sh --no-sign        # 只出未签名 APK
+#   bash scripts/build-android-arm64.sh --sign <keystore> <alias> <pass>
+#
+# 默认签名密钥由 scripts/android-keystore.sh 管理（首次自动生成到
+# ~/.privchat/android/debug.keystore），保证每次编译出来的 APK 可以
+# 直接覆盖安装；换密钥会让旧 APK 无法覆盖。
 #
 # 默认要求编译工具链完整：
 #   - Rust stable + aarch64-linux-android 目标
@@ -25,13 +31,15 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 CLIENT_DIR="$REPO_ROOT/privchat-client"
 ARCH_DIR="$REPO_ROOT/target/android-arm64"
 
-# —— 参数：--sign <keystore> <alias> <pass> ——
-SIGN_KS="" SIGN_ALIAS="" SIGN_PASS=""
+# —— 参数：--sign <keystore> <alias> <pass> / --no-sign ——
+SIGN_KS="" SIGN_ALIAS="" SIGN_PASS="" NO_SIGN=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --sign)
       [ $# -ge 4 ] || { echo "usage: --sign <keystore> <alias> <pass>" >&2; exit 1; }
       SIGN_KS="$2"; SIGN_ALIAS="$3"; SIGN_PASS="$4"; shift 4 ;;
+    --no-sign)
+      NO_SIGN=1; shift ;;
     *) echo "unknown arg: $1" >&2; exit 1 ;;
   esac
 done
@@ -109,8 +117,13 @@ echo "[build] unsigned apk: $UNSIGNED"
 cp -f "$UNSIGNED" "$ARCH_DIR/privchat-android-arm64-unsigned.apk"
 echo "[build] -> $ARCH_DIR/privchat-android-arm64-unsigned.apk"
 
-# —— 签名（可选）——
-if [ -n "$SIGN_KS" ]; then
+# —— 签名（默认用固定 debug key；--no-sign 跳过）——
+if [ "$NO_SIGN" -eq 0 ]; then
+  if [ -z "$SIGN_KS" ]; then
+    eval "$(bash "$SCRIPT_DIR/android-keystore.sh" --ensure --eval)"
+    SIGN_KS="$KEYSTORE"; SIGN_ALIAS="$ALIAS"; SIGN_PASS="$PASS"
+    echo "[build] default debug keystore: $SIGN_KS"
+  fi
   APKSIGNER=""
   for bt in "$SDK"/build-tools/*/apksigner; do
     [ -x "$bt" ] && { APKSIGNER="$bt"; break; }
@@ -127,7 +140,7 @@ if [ -n "$SIGN_KS" ]; then
   "$APKSIGNER" verify --print-certs "$ARCH_DIR/privchat-android-arm64.apk" | head -5 || true
   echo "[build] -> $ARCH_DIR/privchat-android-arm64.apk"
 else
-  echo "[build] (skipped signing; use --sign <keystore> <alias> <pass> to sign)"
+  echo "[build] (--no-sign: skipped signing)"
   cp -f "$UNSIGNED" "$ARCH_DIR/privchat-android-arm64.apk"
 fi
 

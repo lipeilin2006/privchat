@@ -118,9 +118,16 @@ cd privchat-client && npm run tauri build
 
 # Android arm64（APK）
 bash scripts/build-android-arm64.sh
-#   签名：bash scripts/build-android-arm64.sh --sign <keystore> <alias> <pass>
+#   默认用固定 debug key 自动签名：
+#   密钥由 scripts/android-keystore.sh 管理（首次生成到
+#   ~/.privchat/android/debug.keystore），同一把钥匙 → 可直接覆盖安装
+#   换自己的密钥：bash scripts/build-android-arm64.sh --sign <keystore> <alias> <pass>
+#   只出未签名包：bash scripts/build-android-arm64.sh --no-sign
+#   单独签一个已有 APK：bash scripts/sign-apk.sh <unsigned.apk> [out.apk]
 #   产物：target/android-arm64/privchat-android-arm64.apk
 ```
+
+> debug key 的口令是公开的，只适合自用 / 测试分发；对外发布请换自己的密钥。
 
 其他脚本：`build-windows-x86_64.sh`、`build-linux-x86_64.sh`、
 `build-android-wsl.sh`、`build-windows.ps1`。
