@@ -267,3 +267,29 @@ async fn draining_queues_survive_restart() {
         "restored draining queue must still be deletable"
     );
 }
+
+/// 反复进「我的」页只应复用同一个邀请，不能每次都在节点上新建队列。
+#[tokio::test]
+async fn create_reuses_pending_invite() {
+    let api = Arc::new(MemQueues::default());
+    let a = manager(api.clone() as Arc<dyn QueueApi>, "reuse").await;
+
+    let (id1, invite1) = a.create("m1").await.expect("first create");
+    let (id2, invite2) = a.create("m1").await.expect("second create");
+    assert_eq!(id1, id2, "pending connection should be reused");
+    assert_eq!(invite1, invite2, "invite text should be stable");
+    assert_eq!(
+        api.queues.lock().unwrap().len(),
+        1,
+        "only one queue should exist"
+    );
+
+    // 配对之后再来一次，应该建新的一条（旧的那条已经用掉了）。
+    let b = manager(api.clone() as Arc<dyn QueueApi>, "reuse-b").await;
+    let (b_id, b_invite) = b.create("m1").await.expect("b create");
+    a.accept(&id1, &b_invite).await.expect("a accept");
+    b.accept(&b_id, &invite1).await.expect("b accept");
+
+    let (id3, _) = a.create("m1").await.expect("create after pairing");
+    assert_ne!(id1, id3, "paired connection must not be reused");
+}

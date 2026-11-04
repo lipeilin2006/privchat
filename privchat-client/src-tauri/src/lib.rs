@@ -303,10 +303,6 @@ fn build_and_run() {
             connection_history,
             rename_connection,
             exit_app,
-            boot_prev_log,
-            boot_current_log,
-            boot_trace,
-            boot_prev_log_clear
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

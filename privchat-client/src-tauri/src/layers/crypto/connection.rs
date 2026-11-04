@@ -126,6 +126,11 @@ impl Connection {
         &self.sid
     }
 
+    /// 本端连接公钥（生成邀请时要用）。
+    pub fn own_ek_pub(&self) -> [u8; 32] {
+        self.own_ek_pub
+    }
+
     /// 当前链代号（测试与观测用）。
     pub fn epoch(&self) -> u32 {
         self.epoch

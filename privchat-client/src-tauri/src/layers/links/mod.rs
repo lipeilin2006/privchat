@@ -222,13 +222,49 @@ impl LinkManager {
     }
 
     pub async fn load(store: Arc<Store>, api: Arc<dyn QueueApi>) -> Result<Self> {
+        let rows = store.load_connections()?;
         let mut links = HashMap::new();
-        for row in store.load_connections()? {
-            match row_to_link(&row) {
+        for row in &rows {
+            match row_to_link(row) {
                 Ok(link) => {
                     links.insert(row.conn_id.clone(), link);
                 }
                 Err(e) => eprintln!("[links] skip broken connection {}: {e}", row.conn_id),
+            }
+        }
+
+        // 老版本每进一次「我的」页就建一条待配对连接，可能攒下好几条。
+        // 只留最新的一条，其余从库里删掉，队列在后台顺手删（失败就等 TTL）。
+        let mut pending: Vec<&ConnRow> = rows
+            .iter()
+            .filter(|row| state_from_str(&row.state) == LinkState::Pending)
+            .collect();
+        if pending.len() > 1 {
+            pending.sort_by_key(|row| row.created);
+            for stale in &pending[..pending.len() - 1] {
+                let _ = store.delete_connection(&stale.conn_id);
+                links.remove(&stale.conn_id);
+                let api = api.clone();
+                let conn_id = stale.conn_id.clone();
+                let mailbox = stale.in_mailbox.clone();
+                let queue = stale.in_queue.clone();
+                let owner = stale.owner_sk.clone();
+                tokio::spawn(async move {
+                    let Ok(owner_sk) = <[u8; 32]>::try_from(owner.as_slice()) else {
+                        return;
+                    };
+                    let Ok(bytes) = connection::hex_decode(&queue) else {
+                        return;
+                    };
+                    let Ok(queue_id) = <[u8; 16]>::try_from(bytes.as_slice()) else {
+                        return;
+                    };
+                    let sig = connection::sign_delete(
+                        &queue_id,
+                        &SigningKey::from_bytes(&owner_sk),
+                    );
+                    let _ = api.delete(&conn_id, &mailbox, &queue, &sig).await;
+                });
             }
         }
         Ok(Self {
@@ -240,7 +276,19 @@ impl LinkManager {
     }
 
     /// 建连接：在 mailbox 上创建接收队列，返回 `(conn_id, 邀请串)`。
+    ///
+    /// 已经有「还没配对」的连接就直接复用它的邀请——否则每进一次「我的」
+    /// 页、每重启一次都会在节点上多留一条没人用的队列。
     pub async fn create(&self, mailbox: &str) -> Result<(String, String)> {
+        {
+            let links = self.links.lock().await;
+            if let Some((conn_id, link)) = links
+                .iter()
+                .find(|(_, link)| link.state == LinkState::Pending)
+            {
+                return Ok((conn_id.clone(), link.invite().encode()));
+            }
+        }
         let (link, invite) = Link::create(mailbox);
         let conn_id = unique_conn_id();
         self.api

@@ -33,10 +33,4 @@ export const api = {
   setAutoLock: (minutes) => invoke("set_auto_lock_minutes", { minutes }),
   diagnostics: () => invoke("export_diagnostics"),
   exitApp: () => invoke("exit_app"),
-
-  // 启动诊断：上一轮日志 + 打点
-  bootPrevLog: () => invoke("boot_prev_log"),
-  bootCurrentLog: () => invoke("boot_current_log"),
-  bootTrace: (msg) => invoke("boot_trace", { msg }),
-  bootPrevLogClear: () => invoke("boot_prev_log_clear"),
 };

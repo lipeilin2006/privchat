@@ -32,28 +32,6 @@ pub(crate) async fn vault_status(state: State<'_, AppState>) -> Result<VaultStat
     Ok(status(&state))
 }
 
-/// 上一轮启动的日志（崩溃现场）；正常退出时为空。
-#[tauri::command]
-pub(crate) fn boot_prev_log() -> String {
-    crate::diag::read_prev()
-}
-
-/// 本轮启动到目前为止的日志。
-#[tauri::command]
-pub(crate) fn boot_current_log() -> String {
-    crate::diag::read_current()
-}
-
-#[tauri::command]
-pub(crate) fn boot_trace(msg: String) {
-    crate::diag::trace(&msg);
-}
-
-#[tauri::command]
-pub(crate) fn boot_prev_log_clear() {
-    crate::diag::clear_prev();
-}
-
 #[tauri::command]
 pub(crate) async fn create_vault(
     password: String,

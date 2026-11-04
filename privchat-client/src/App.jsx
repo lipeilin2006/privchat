@@ -8,6 +8,7 @@ import {
 } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
 import { onBackButtonPress } from "@tauri-apps/api/app";
+import { cancel as cancelScan } from "@tauri-apps/plugin-barcode-scanner";
 
 import { api } from "./api";
 import { t } from "./i18n";
@@ -44,22 +45,23 @@ export default function App() {
       } catch {
         setVaultState("locked");
       }
-      // 走到这里说明 UI 真的起来了，下一轮启动就不会误报「上次崩溃」。
-      api.bootTrace("ui mounted").catch(() => {});
     })();
   }, []);
 
   const loadAll = useCallback(async () => {
     try {
       const list = await api.listConnections();
-      const mapped = (list || []).map((c) => ({
-        peer_id: c.conn_id,
-        name: c.name,
-        state: c.state,
-      }));
+      // 未配对的连接只是「还没扫完的邀请」，不算联系人。
+      const mapped = (list || [])
+        .filter((c) => c.state === "established")
+        .map((c) => ({
+          peer_id: c.conn_id,
+          name: c.name,
+          state: c.state,
+        }));
       setContacts(mapped);
       const entries = await Promise.all(
-        mapped.map(async (c) => [c.conn_id, await api.connectionHistory(c.conn_id)])
+        mapped.map(async (c) => [c.peer_id, await api.connectionHistory(c.peer_id)])
       );
       const map = {};
       for (const [connId, msgs] of entries) map[connId] = msgs || [];
@@ -162,7 +164,15 @@ export default function App() {
     [notify]
   );
 
+  const scanningRef = useRef(false);
+
   const goBack = useCallback(() => {
+    // 正在扫码：返回键先关相机，别把页面带走。
+    if (scanningRef.current) {
+      scanningRef.current = false;
+      cancelScan().catch(() => {});
+      return;
+    }
     if (page === "chat") setPage("chats");
     else if (page === "mailbox" || page === "onion") setPage("settings");
     else if (page === "settings" || page === "add" || page === "contacts") setPage("chats");
@@ -271,6 +281,9 @@ export default function App() {
             {page === "add" && (
               <MyIdPage
                 notify={notify}
+                onScanStateChange={(active) => {
+                  scanningRef.current = active;
+                }}
                 onAdded={async () => {
                   await loadAll();
                   setPage("chats");

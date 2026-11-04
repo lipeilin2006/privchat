@@ -1,10 +1,6 @@
-//! 启动诊断：把关键步骤和 panic 写进数据目录，供下一次启动显示。
+//! 启动留痕：把关键步骤和 panic 写进数据目录的 `boot.log`。
 //!
-//! 手机上没有 adb / logcat 的时候，这是唯一能拿到的现场：
-//! 每次启动把上一轮的 `boot.log` 轮换成 `boot.prev.log`，
-//! 前端在保险箱界面读它——如果上一轮没走到「ui mounted」，
-//! 就把那份日志摊开给用户看。
-//!
+//! 不给用户看，只在拿不到 logcat 的时候能翻出来定位闪退。
 //! 数据目录在 setup 之后才知道，之前发生的记录先缓冲在内存里，
 //! 等 `set_dir` 时一并落盘。
 
@@ -91,31 +87,6 @@ pub fn set_dir(dir: PathBuf) {
         append_line(&log, &line);
     }
     trace("diag ready");
-}
-
-fn with_dir<T>(f: impl FnOnce(&PathBuf) -> T) -> Option<T> {
-    let dir = match DIR.lock() {
-        Ok(g) => g.clone(),
-        Err(p) => p.into_inner().clone(),
-    };
-    dir.as_ref().map(f)
-}
-
-/// 上一轮启动的日志（崩溃现场）。
-pub fn read_prev() -> String {
-    with_dir(|dir| fs::read_to_string(dir.join(PREV_NAME)).unwrap_or_default()).unwrap_or_default()
-}
-
-/// 本轮启动的日志。
-pub fn read_current() -> String {
-    with_dir(|dir| fs::read_to_string(dir.join(LOG_NAME)).unwrap_or_default()).unwrap_or_default()
-}
-
-/// 丢掉上一轮日志（前端展示过一次之后调用）。
-pub fn clear_prev() {
-    if let Some(dir) = with_dir(|d| d.clone()) {
-        let _ = fs::remove_file(dir.join(PREV_NAME));
-    }
 }
 
 /// 装上 panic hook：release 是 panic=abort，hook 是进程死前最后的落笔机会。

@@ -7,6 +7,7 @@ import {
   Format,
   checkPermissions,
   requestPermissions,
+  cancel as cancelScan,
 } from "@tauri-apps/plugin-barcode-scanner";
 import { api } from "../api";
 import { t } from "../i18n";
@@ -15,7 +16,7 @@ import { t } from "../i18n";
 const CAN_SCAN =
   typeof navigator !== "undefined" && /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
 
-export default function MyIdPage({ onClose, onAdded, notify }) {
+export default function MyIdPage({ onClose, onAdded, notify, onScanStateChange }) {
   const [connId, setConnId] = useState("");
   const [myId, setMyId] = useState("");
   const [qr, setQr] = useState("");
@@ -83,6 +84,7 @@ export default function MyIdPage({ onClose, onAdded, notify }) {
   /** 移动端扫码：扫到就填进输入框并直接连上。 */
   const scanAndConnect = async () => {
     setBusy(true);
+    onScanStateChange?.(true);
     try {
       const current = await checkPermissions();
       const permission =
@@ -109,9 +111,18 @@ export default function MyIdPage({ onClose, onAdded, notify }) {
       }
       notify(message || t("scanFailed"), "err");
     } finally {
+      onScanStateChange?.(false);
       setBusy(false);
     }
   };
+
+  // 页面被切走时把相机收掉，别让取景框盖在别的页面上。
+  useEffect(() => {
+    return () => {
+      if (CAN_SCAN) cancelScan().catch(() => {});
+      onScanStateChange?.(false);
+    };
+  }, [onScanStateChange]);
 
   /** 扫不了（没相机 / 没 Google 服务）时的退路：从剪贴板粘贴。 */
   const pasteInvite = async () => {
@@ -128,7 +139,7 @@ export default function MyIdPage({ onClose, onAdded, notify }) {
   };
 
   return (
-    <div className="page">
+    <div className="page page-scroll">
       <header className="page-head">
         <div className="page-title">{t("profile")}</div>
       </header>

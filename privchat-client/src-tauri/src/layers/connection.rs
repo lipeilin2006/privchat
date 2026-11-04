@@ -302,6 +302,17 @@ impl Link {
     }
 
     /// 互扫到对方邀请后配对：派生 E2E 会话并登记对方队列。
+    /// 重新生成自己的邀请：等对方来扫时用（队列和密钥都没变）。
+    pub fn invite(&self) -> Invite {
+        Invite {
+            mailbox: self.in_mailbox.clone(),
+            queue_id: self.in_queue,
+            ek: self.e2e.own_ek_pub(),
+            sender_sk: self.owner_keys.sender.to_bytes(),
+            ticket: None,
+        }
+    }
+
     pub fn accept(&mut self, their: &Invite) -> anyhow::Result<()> {
         self.e2e.pair_with(&their.ek)?;
         self.out = Some(OutQueue {
