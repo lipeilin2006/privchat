@@ -78,8 +78,8 @@ privchat/
 └── README.md
 ```
 
-各 crate 规模：client ≈ 5.3k 行 Rust + 1.6k 行前端，mailbox ≈ 1.3k，
-onion ≈ 240，common ≈ 260，cli ≈ 860。
+各 crate 规模：client ≈ 5.2k 行 Rust + 2.0k 行前端（另有 2.4k 行样式），
+mailbox ≈ 1.2k，relay ≈ 280，onion ≈ 250，common ≈ 300。
 
 ---
 

@@ -267,6 +267,8 @@ pub struct Link {
     pub user_rotate: bool,
     /// 轮换后待排空的旧入站队列。
     pub draining: Vec<DrainingQueue>,
+    /// 创建时间（毫秒）：用来在启动清理时分辨哪条待配对连接更新。
+    pub created: u64,
 }
 
 impl Link {
@@ -296,6 +298,7 @@ impl Link {
                 sent_since_rotate: 0,
                 user_rotate: false,
                 draining: Vec::new(),
+                created: now_ms(),
             },
             invite,
         )
@@ -323,6 +326,13 @@ impl Link {
         self.state = LinkState::Established;
         Ok(())
     }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

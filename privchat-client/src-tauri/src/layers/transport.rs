@@ -77,14 +77,6 @@ impl Transport {
             id.endpoint.close().await;
         }
     }
-
-    /// 关闭全部端点。
-    pub async fn close(&self) {
-        let ids: Vec<Arc<Identity>> = self.identities.read().await.values().cloned().collect();
-        for id in ids {
-            id.endpoint.close().await;
-        }
-    }
 }
 
 async fn build_identity(secret: SecretKey, use_relay: bool) -> Result<Identity> {

@@ -131,11 +131,6 @@ impl Connection {
         self.own_ek_pub
     }
 
-    /// 当前链代号（测试与观测用）。
-    pub fn epoch(&self) -> u32 {
-        self.epoch
-    }
-
     /// 加密一条消息；需要换钥时先换。
     pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>> {
         if !self.established {

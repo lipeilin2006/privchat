@@ -698,10 +698,6 @@ impl App {
     pub async fn shutdown(&self) {
         let _ = self.stop_tx.send(true);
     }
-
-    pub async fn close(&self) {
-        self.transport.close().await;
-    }
 }
 
 /// 同一毫秒连发两条也不会撞主键：时间戳 + 进程内自增。

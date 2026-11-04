@@ -618,8 +618,8 @@ impl LinkManager {
             out_sender_sk: out.as_ref().map(|q| q.sender_sk.to_vec()),
             owner_sk: owner_sk.to_vec(),
             e2e_state: link.e2e.to_bytes(),
-            created: 0,
-            last_used: 0,
+            created: link.created,
+            last_used: now_ms(),
             draining: draining_to_json(&link.draining),
         };
         self.store.save_connection(&row)
@@ -677,6 +677,7 @@ fn row_to_link(row: &ConnRow) -> Result<Link> {
         sent_since_rotate: 0,
         user_rotate: false,
         draining: draining_from_json(&row.draining),
+        created: row.created,
     })
 }
 
@@ -728,6 +729,13 @@ fn draining_from_json(text: &str) -> Vec<DrainingQueue> {
             })
         })
         .collect()
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn is_peer_id(id: &str) -> bool {

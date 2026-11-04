@@ -354,3 +354,26 @@ fn dynamic_path_has_no_duplicates() {
     unique.dedup();
     assert_eq!(unique.len(), 3, "no duplicate relay in one path");
 }
+
+/// 待配对连接的创建时间要落库：启动清理靠它判断哪条更新。
+#[tokio::test]
+async fn connection_created_timestamp_survives_reload() {
+    let api = Arc::new(MemQueues::default());
+    let path = std::env::temp_dir().join(format!("privchat-links-created-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&path);
+    std::fs::create_dir_all(&path).unwrap();
+    let store = Arc::new(Store::open(&path, [3u8; 32]).unwrap());
+
+    let a = LinkManager::load(store.clone(), api.clone() as Arc<dyn QueueApi>)
+        .await
+        .expect("load");
+    let (id, _) = a.create("m1").await.expect("create");
+    drop(a);
+
+    let reloaded = LinkManager::load(store, api as Arc<dyn QueueApi>)
+        .await
+        .expect("reload");
+    let links = reloaded.links.lock().await;
+    let link = links.get(&id).expect("link restored");
+    assert!(link.created > 0, "created timestamp must be persisted");
+}
