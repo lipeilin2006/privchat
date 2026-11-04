@@ -31,8 +31,8 @@ const INFO_J2O: &[u8] = b"privchat/conn/j2o/v1";
 const INFO_O2J: &[u8] = b"privchat/conn/o2j/v1";
 const INFO_CK: &[u8] = b"privchat/conn/ck/v1";
 const INFO_SID: &[u8] = b"privchat/conn/id/v1";
-/// 状态序列化版本。
-const STATE_VERSION: u8 = 3;
+/// 状态序列化版本（4 = 多一个「待轮换」标志；3 仍可读）。
+const STATE_VERSION: u8 = 4;
 
 /// 一条连接的 E2E 会话。
 #[derive(Clone)]
@@ -55,6 +55,8 @@ pub struct Connection {
     skipped: Vec<(u32, [u8; 32])>,
     /// 上一 epoch 的宽限状态（换钥瞬间在路上的消息）。
     prev: Option<PrevEpoch>,
+    /// 对方刚换过钥，本端下一次发送时要把自己的密钥也换掉。
+    owe_rotate: bool,
     sid: String,
 }
 
@@ -95,6 +97,7 @@ impl Connection {
             recv_n: 0,
             skipped: Vec::new(),
             prev: None,
+            owe_rotate: false,
             sid: String::new(),
         };
         (conn, ek_pub)
@@ -133,7 +136,11 @@ impl Connection {
         if !self.established {
             return Err(anyhow!("connection not established yet"));
         }
-        if self.initiator && self.send_n + self.recv_n >= REKEY_EVERY {
+        if self.owe_rotate {
+            // 对方刚换钥（epoch+1），本端跟着换自己的密钥：
+            // 只有两边都换，「设备被拿走再归还」之后的消息才解不开。
+            self.rotate_own()?;
+        } else if self.initiator && self.send_n + self.recv_n >= REKEY_EVERY {
             self.rekey()?;
         }
         let (next_ck, mk) = kdf_ck(&self.send_ck);
@@ -195,6 +202,36 @@ impl Connection {
         Ok(())
     }
 
+    /// 同一 epoch 内换掉自己的连接密钥（回应对方换钥）。
+    ///
+    /// 不推进 epoch：对方靠消息头里的 `ek` 变化发现新密钥，
+    /// 用同一个 epoch 号派生同一组链，所以两边算出来是一致的。
+    fn rotate_own(&mut self) -> Result<()> {
+        let peer = self
+            .peer_ek
+            .ok_or_else(|| anyhow!("cannot rotate without peer key"))?;
+        let (ek, ek_pub) = new_ek();
+        let root = epoch_root(&dh(&ek, &peer)?, self.epoch);
+        let (send_ck, recv_ck) = chains_by_order(&root, &ek_pub, &peer);
+
+        self.prev = Some(PrevEpoch {
+            epoch: self.epoch,
+            send_ck: self.send_ck,
+            recv_ck: self.recv_ck,
+            send_n: self.send_n,
+            recv_n: self.recv_n,
+            skipped: std::mem::take(&mut self.skipped),
+        });
+        self.own_ek = ek;
+        self.own_ek_pub = ek_pub;
+        self.send_ck = send_ck;
+        self.recv_ck = recv_ck;
+        self.send_n = 0;
+        self.recv_n = 0;
+        self.owe_rotate = false;
+        Ok(())
+    }
+
     /// 解密一条消息（失败不改状态）。
     pub fn decrypt(&mut self, blob: &[u8]) -> Result<Vec<u8>> {
         let mut trial = self.clone();
@@ -224,6 +261,26 @@ impl Connection {
             self.recv_ck = recv_ck;
             self.send_n = 0;
             self.recv_n = 0;
+            // 对方换钥了，本端下一次发送也要换，别让一边的密钥长期不变。
+            self.owe_rotate = true;
+        } else if hdr.epoch == self.epoch && Some(hdr.ek) != self.peer_ek {
+            // 同一 epoch 内的新密钥：对方在回应我方的换钥。
+            let new_root = epoch_root(&dh(&self.own_ek, &hdr.ek)?, self.epoch);
+            let (send_ck, recv_ck) = chains_by_order(&new_root, &self.own_ek_pub, &hdr.ek);
+            self.prev = Some(PrevEpoch {
+                epoch: self.epoch,
+                send_ck: self.send_ck,
+                recv_ck: self.recv_ck,
+                send_n: self.send_n,
+                recv_n: self.recv_n,
+                skipped: std::mem::take(&mut self.skipped),
+            });
+            self.peer_ek = Some(hdr.ek);
+            self.send_ck = send_ck;
+            self.recv_ck = recv_ck;
+            self.send_n = 0;
+            self.recv_n = 0;
+            self.owe_rotate = false;
         }
 
         // 当前 epoch。
@@ -289,12 +346,15 @@ impl Connection {
             }
             None => out.push(0),
         }
+        out.push(u8::from(self.owe_rotate));
         out
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let mut cur = Cursor { bytes, pos: 0 };
-        if cur.u8()? != STATE_VERSION {
+        let version = cur.u8()?;
+        // 3 = 旧格式（没有 owe_rotate 字节），照样能读。
+        if version != 3 && version != STATE_VERSION {
             return Err(anyhow!("unsupported connection state version"));
         }
         let established = cur.u8()? == 1;
@@ -330,6 +390,7 @@ impl Connection {
         } else {
             None
         };
+        let owe_rotate = if version >= 4 { cur.u8()? == 1 } else { false };
         if cur.pos != bytes.len() {
             return Err(anyhow!("trailing bytes in connection state"));
         }
@@ -349,6 +410,7 @@ impl Connection {
             recv_n,
             skipped,
             prev,
+            owe_rotate,
             sid,
         })
     }
@@ -613,6 +675,42 @@ mod tests {
         assert_eq!(a.decrypt(&m).unwrap(), b"after rekey");
         let m = a.encrypt(b"and back").unwrap();
         assert_eq!(b.decrypt(&m).unwrap(), b"and back");
+    }
+
+    /// 换钥必须两边都换：否则谁的那一半没换，谁被拿走一次就永久可见。
+    #[test]
+    fn rekey_rotates_both_sides_keys() {
+        let (mut a, mut b) = pair();
+        let a0 = a.own_ek_pub;
+        let b0 = b.own_ek_pub;
+        let a_is_init = a.initiator;
+
+        for i in 0..160 {
+            let a_sends = (i % 2 == 0) == a_is_init;
+            if a_sends {
+                let m = a.encrypt(format!("a{i}").as_bytes()).unwrap();
+                assert_eq!(b.decrypt(&m).unwrap(), format!("a{i}").as_bytes());
+            } else {
+                let m = b.encrypt(format!("b{i}").as_bytes()).unwrap();
+                assert_eq!(a.decrypt(&m).unwrap(), format!("b{i}").as_bytes());
+            }
+        }
+        assert_ne!(a.own_ek_pub, a0, "initiator key must rotate");
+        assert_ne!(b.own_ek_pub, b0, "responder key must rotate as well");
+        assert_eq!(a.epoch, b.epoch);
+    }
+
+    /// 旧格式（v3，没有 owe_rotate 字节）要能读，别让老连接升级后解不开。
+    #[test]
+    fn reads_legacy_state_format() {
+        let (a, _b) = pair();
+        let mut bytes = a.to_bytes();
+        assert_eq!(bytes[0], STATE_VERSION);
+        bytes[0] = 3;
+        bytes.pop();
+        let restored = Connection::from_bytes(&bytes).unwrap();
+        assert_eq!(restored.own_ek_pub, a.own_ek_pub);
+        assert!(!restored.owe_rotate);
     }
 
     #[test]

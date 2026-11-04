@@ -30,6 +30,8 @@ pub struct ConnRow {
     pub e2e_state: Vec<u8>,
     pub created: u64,
     pub last_used: u64,
+    /// 轮换后还在排空的旧队列（JSON 数组）。
+    pub draining: String,
 }
 
 impl Store {
@@ -39,8 +41,8 @@ impl Store {
         conn.execute(
             "INSERT OR REPLACE INTO connections
              (conn_id, name, role, state, in_queue, in_mailbox, out_queue, out_mailbox,
-              out_sender_sk, owner_sk, e2e_state, created, last_used)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+              out_sender_sk, owner_sk, e2e_state, created, last_used, draining)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
             params![
                 row.conn_id,
                 row.name,
@@ -55,6 +57,7 @@ impl Store {
                 row.e2e_state,
                 row.created as i64,
                 row.last_used as i64,
+                row.draining,
             ],
         )?;
         Ok(())
@@ -65,7 +68,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT conn_id, name, role, state, in_queue, in_mailbox, out_queue, out_mailbox,
-                    out_sender_sk, owner_sk, e2e_state, created, last_used
+                    out_sender_sk, owner_sk, e2e_state, created, last_used, draining
              FROM connections ORDER BY created",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -83,6 +86,7 @@ impl Store {
                 e2e_state: row.get(10)?,
                 created: row.get::<_, i64>(11)? as u64,
                 last_used: row.get::<_, i64>(12)? as u64,
+                draining: row.get(13)?,
             })
         })?;
         let mut out = Vec::new();
@@ -98,7 +102,7 @@ impl Store {
         let row = conn
             .query_row(
                 "SELECT conn_id, name, role, state, in_queue, in_mailbox, out_queue, out_mailbox,
-                        out_sender_sk, owner_sk, e2e_state, created, last_used
+                        out_sender_sk, owner_sk, e2e_state, created, last_used, draining
                  FROM connections WHERE conn_id = ?1",
                 params![conn_id],
                 |row| {
@@ -116,6 +120,7 @@ impl Store {
                         e2e_state: row.get(10)?,
                         created: row.get::<_, i64>(11)? as u64,
                         last_used: row.get::<_, i64>(12)? as u64,
+                        draining: row.get(13)?,
                     })
                 },
             )

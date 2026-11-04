@@ -217,3 +217,53 @@ async fn mutual_scan_end_to_end() {
     // 取回即删。
     assert!(a.poll(&a_id).await.unwrap().is_empty());
 }
+
+/// 轮换后重启：排空列表必须跟着连接一起回来，否则旧队列里的消息永远没人取。
+#[tokio::test]
+async fn draining_queues_survive_restart() {
+    let api = Arc::new(MemQueues::default());
+    let path = std::env::temp_dir().join(format!("privchat-links-drain-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&path);
+    std::fs::create_dir_all(&path).unwrap();
+    let store = Arc::new(Store::open(&path, [3u8; 32]).unwrap());
+
+    let a = LinkManager::load(store.clone(), api.clone() as Arc<dyn QueueApi>)
+        .await
+        .expect("load a");
+    let b = manager(api.clone() as Arc<dyn QueueApi>, "drain-b").await;
+
+    let (a_id, a_invite) = a.create("m1").await.expect("a create");
+    let (b_id, b_invite) = b.create("m1").await.expect("b create");
+    a.accept(&a_id, &b_invite).await.expect("a accept");
+    b.accept(&b_id, &a_invite).await.expect("b accept");
+
+    a.set_pool(vec!["m1".to_string(), "m2".to_string()]).await;
+    a.rotate(&a_id).await.expect("rotate");
+    let old_hex = {
+        let links = a.links.lock().await;
+        assert_eq!(links[&a_id].draining.len(), 1);
+        connection::hex_encode(&links[&a_id].draining[0].queue_id)
+    };
+    drop(a);
+
+    // 重新加载：排空队列应该还在。
+    let a2 = LinkManager::load(store, api.clone() as Arc<dyn QueueApi>)
+        .await
+        .expect("reload a");
+    {
+        let links = a2.links.lock().await;
+        let link = links.get(&a_id).expect("link restored");
+        assert_eq!(link.draining.len(), 1, "draining queue lost on reload");
+        assert_eq!(connection::hex_encode(&link.draining[0].queue_id), old_hex);
+        assert_eq!(link.draining[0].polls_left, 3);
+    }
+
+    // 继续排空：几次空轮询之后旧队列按 owner 签名删掉。
+    for _ in 0..4 {
+        let _ = a2.poll(&a_id).await.expect("poll drain after reload");
+    }
+    assert!(
+        !api.queues.lock().unwrap().contains_key(&old_hex),
+        "restored draining queue must still be deletable"
+    );
+}

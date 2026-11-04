@@ -302,7 +302,8 @@ impl LinkManager {
             &blob,
             &SigningKey::from_bytes(&out.sender_sk),
         );
-        self.api
+        if let Err(err) = self
+            .api
             .send(
                 conn_id,
                 &out.mailbox,
@@ -310,7 +311,21 @@ impl LinkManager {
                 blob,
                 &sig,
             )
-            .await?;
+            .await
+        {
+            // 通知没送出去：把刚建的新队列删掉，别在节点上留孤儿占配额。
+            let sig = connection::sign_delete(&queue_id, &keys.owner);
+            let _ = self
+                .api
+                .delete(
+                    conn_id,
+                    &next_mailbox,
+                    &connection::hex_encode(&queue_id),
+                    &sig,
+                )
+                .await;
+            return Err(err);
+        }
 
         // 旧队列转入排空列表，新队列接管。
         let old = std::mem::replace(&mut link.in_queue, queue_id);
@@ -479,6 +494,7 @@ impl LinkManager {
             e2e_state: link.e2e.to_bytes(),
             created: 0,
             last_used: 0,
+            draining: draining_to_json(&link.draining),
         };
         self.store.save_connection(&row)
     }
@@ -534,8 +550,58 @@ fn row_to_link(row: &ConnRow) -> Result<Link> {
         state: state_from_str(&row.state),
         sent_since_rotate: 0,
         user_rotate: false,
-        draining: Vec::new(),
+        draining: draining_from_json(&row.draining),
     })
+}
+
+/// 排空队列的持久化形态（JSON 存在 connections.draining）。
+#[derive(serde::Serialize, serde::Deserialize)]
+struct DrainingRecord {
+    mailbox: String,
+    queue_id: String,
+    owner_sk: String,
+    polls_left: u32,
+}
+
+fn draining_to_json(queues: &[DrainingQueue]) -> String {
+    let list: Vec<DrainingRecord> = queues
+        .iter()
+        .map(|q| DrainingRecord {
+            mailbox: q.mailbox.clone(),
+            queue_id: connection::hex_encode(&q.queue_id),
+            owner_sk: connection::hex_encode(&q.keys.owner.to_bytes()),
+            polls_left: q.polls_left,
+        })
+        .collect();
+    serde_json::to_string(&list).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// 解析失败就当成空列表：排空的只是旧队列，宁可少删也不能让连接加载不出来。
+fn draining_from_json(text: &str) -> Vec<DrainingQueue> {
+    let Ok(list) = serde_json::from_str::<Vec<DrainingRecord>>(text) else {
+        return Vec::new();
+    };
+    list.into_iter()
+        .filter_map(|r| {
+            let queue_id: [u8; 16] = connection::hex_decode(&r.queue_id)
+                .ok()?
+                .as_slice()
+                .try_into()
+                .ok()?;
+            let owner: [u8; 32] = connection::hex_decode(&r.owner_sk)
+                .ok()?
+                .as_slice()
+                .try_into()
+                .ok()?;
+            Some(DrainingQueue {
+                mailbox: r.mailbox,
+                queue_id,
+                // 排空只需要 owner 钥（读/删），sender 钥没有用处。
+                keys: QueueKeys::from_bytes([0u8; 32], owner),
+                polls_left: r.polls_left,
+            })
+        })
+        .collect()
 }
 
 fn unique_conn_id() -> String {

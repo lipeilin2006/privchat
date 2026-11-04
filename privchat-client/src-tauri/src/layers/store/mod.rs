@@ -69,7 +69,8 @@ impl Store {
                  owner_sk BLOB NOT NULL,
                  e2e_state BLOB NOT NULL,
                  created INTEGER NOT NULL,
-                 last_used INTEGER NOT NULL
+                 last_used INTEGER NOT NULL,
+                 draining TEXT NOT NULL DEFAULT '[]'
              );
              CREATE TABLE IF NOT EXISTS conn_messages (
                  conn_id TEXT NOT NULL,
@@ -84,6 +85,18 @@ impl Store {
                      value TEXT NOT NULL
                  );",
         )?;
+        // 旧库升级：早先的 connections 表没有 draining 列。
+        let has_draining: i64 = conn.query_row(
+            "SELECT count(*) FROM pragma_table_info('connections') WHERE name = 'draining'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_draining == 0 {
+            conn.execute(
+                "ALTER TABLE connections ADD COLUMN draining TEXT NOT NULL DEFAULT '[]'",
+                [],
+            )?;
+        }
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -186,10 +199,12 @@ mod tests {
             e2e_state: vec![2u8; 8],
             created: 1,
             last_used: 1,
+            draining: "[]".into(),
         };
         store.save_connection(&row).expect("save");
         let loaded = store.load_connections().expect("load");
         assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].draining, "[]");
         assert_eq!(loaded[0].conn_id, "c1");
         assert_eq!(loaded[0].name.as_deref(), Some("Alice"));
 
