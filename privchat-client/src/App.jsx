@@ -49,13 +49,18 @@ export default function App() {
 
   const loadAll = useCallback(async () => {
     try {
-      const list = await api.listContacts();
-      setContacts(list || []);
+      const list = await api.listConnections();
+      const mapped = (list || []).map((c) => ({
+        peer_id: c.conn_id,
+        name: c.name,
+        state: c.state,
+      }));
+      setContacts(mapped);
       const entries = await Promise.all(
-        (list || []).map(async (c) => [c.peer_id, await api.getHistory(c.peer_id)])
+        mapped.map(async (c) => [c.conn_id, await api.connectionHistory(c.conn_id)])
       );
       const map = {};
-      for (const [peer, msgs] of entries) map[peer] = msgs || [];
+      for (const [connId, msgs] of entries) map[connId] = msgs || [];
       setHistory(map);
     } catch (e) {
       notify(String(e), "err");
@@ -65,6 +70,32 @@ export default function App() {
   useEffect(() => {
     if (vaultState === "unlocked") loadAll();
   }, [vaultState, loadAll]);
+
+  useEffect(() => {
+    if (vaultState !== "unlocked") return;
+    let stopped = false;
+    const tick = async () => {
+      if (stopped) return;
+      try {
+        const list = await api.listConnections();
+        for (const c of list || []) {
+          if (c.state !== "established") continue;
+          const got = await api.pollConnection(c.conn_id);
+          if (got && got.length) {
+            const msgs = await api.connectionHistory(c.conn_id);
+            setHistory((prev) => ({ ...prev, [c.conn_id]: msgs || [] }));
+          }
+        }
+      } catch {
+        // 网络抖动：下一轮再试
+      }
+    };
+    const timer = setInterval(tick, 3000);
+    return () => {
+      stopped = true;
+      clearInterval(timer);
+    };
+  }, [vaultState]);
 
   useEffect(() => {
     if (vaultState !== "unlocked") return;
@@ -113,13 +144,9 @@ export default function App() {
       };
       setHistory((prev) => ({ ...prev, [peerId]: [...(prev[peerId] || []), optimistic] }));
       try {
-        const msg = await api.sendMessage(peerId, text);
-        setHistory((prev) => {
-          const list = (prev[peerId] || []).map((m) =>
-            m.id === optimistic.id ? { ...msg, status: "sent" } : m
-          );
-          return { ...prev, [peerId]: list };
-        });
+        await api.sendOnConnection(peerId, text);
+        const msgs = await api.connectionHistory(peerId);
+        setHistory((prev) => ({ ...prev, [peerId]: msgs || [] }));
       } catch (e) {
         setHistory((prev) => ({
           ...prev,

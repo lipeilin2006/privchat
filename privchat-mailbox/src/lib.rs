@@ -4,6 +4,9 @@
 //! 只是转发，供 `main.rs`（节点本体）与 `examples/client.rs`（命令行测试
 //! 客户端）按原有路径 `privchat_mailbox::*` 引用。
 
+pub mod node;
+pub mod store;
+
 pub use privchat_common::{
     find_pow, make_endpoint, send_request, verify_pow, MailboxRequest, MailboxResponse, Op,
     StoredMessage, ALPN, MAX_PAYLOAD, POW_DIFFICULTY,

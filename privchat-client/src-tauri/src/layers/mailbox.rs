@@ -26,8 +26,7 @@ use iroh::Endpoint;
 use iroh::SecretKey;
 #[cfg(test)]
 use privchat_common::ALPN;
-use privchat_common::{find_pow, send_request, MailboxRequest, MailboxResponse};
-use tokio::task::JoinSet;
+use privchat_common::{send_request, MailboxRequest, MailboxResponse};
 
 pub use privchat_common::StoredMessage;
 
@@ -49,6 +48,10 @@ impl MailboxClient {
                 payload: None,
                 nonce: None,
                 msg: None,
+                queue: None,
+                sender_auth: None,
+                owner_auth: None,
+                sig: None,
             },
         )
         .await?;
@@ -94,153 +97,87 @@ impl MailboxClient {
         send_request(endpoint, mailbox, req).await
     }
 
-    /// 上传一条密文邮件。先计算 PoW nonce（防垃圾），随请求提交。
-    /// 发送方由拨号 Endpoint 的 TLS 身份决定，无需显式传 from。
-    #[cfg(test)]
-    pub async fn put(
+    // ---- 单向队列（SimpleX 式） ----
+
+    /// 在 mailbox 上创建接收队列（登记 sender / owner 两把公钥）。
+    pub async fn queue_create(
         endpoint: &Endpoint,
         mailbox: &str,
-        to: &str,
-        id: &str,
-        payload: Vec<u8>,
-    ) -> Result<()> {
-        let nonce = Self::pow_nonce(to, &payload).await?;
-        Self::put_with_nonce(endpoint, mailbox, to, id, payload, nonce).await
-    }
-
-    /// 在独立线程算 PoW，避免阻塞 IO 任务。
-    async fn pow_nonce(to: &str, payload: &[u8]) -> Result<u64> {
-        let to_owned = to.to_string();
-        let payload_owned = payload.to_vec();
-        tokio::task::spawn_blocking(move || find_pow(&to_owned, &payload_owned))
-            .await
-            .map_err(|e| anyhow!("pow task failed: {e}"))
-    }
-
-    /// 上传一条密文邮件（复用已算好的 nonce）。
-    async fn put_with_nonce(
-        endpoint: &Endpoint,
-        mailbox: &str,
-        to: &str,
-        id: &str,
-        payload: Vec<u8>,
-        nonce: u64,
+        queue: &str,
+        sender_auth: &str,
+        owner_auth: &str,
     ) -> Result<()> {
         let resp = Self::call(
             endpoint,
             mailbox,
-            &MailboxRequest::put(to, id, payload, nonce),
+            &MailboxRequest::queue_create(queue, sender_auth, owner_auth),
         )
         .await?;
         if resp.ok {
             Ok(())
         } else {
             Err(anyhow!(
-                "mailbox put failed: {}",
+                "queue_create failed: {}",
                 resp.error.unwrap_or_default()
             ))
         }
     }
 
-    /// 把同一条密文投放到多个 mailbox 节点（多副本冗余）。
-    ///
-    /// PoW nonce 只算一次、全部节点复用（同一 `(to, payload)` 的 nonce
-    /// 相同，各节点均可验证）。最多同时请求 `count` 个节点，失败时再用
-    /// 后续节点补位，直到达到目标副本数或耗尽节点；`count = 0` 表示并发
-    /// 投到全部已配置节点。返回成功投放的节点数。
-    pub async fn put_multi(
+    /// 向队列投递一条密文（`sig` 覆盖 domain || queue || payload）。
+    pub async fn queue_send(
         endpoint: &Endpoint,
-        mailboxes: &[String],
-        to: &str,
-        id: &str,
+        mailbox: &str,
+        queue: &str,
         payload: Vec<u8>,
-        count: usize,
-    ) -> Result<usize> {
-        if mailboxes.is_empty() {
-            return Ok(0);
-        }
-        let target = if count == 0 {
-            mailboxes.len()
+        sig: &str,
+    ) -> Result<()> {
+        let resp = Self::call(
+            endpoint,
+            mailbox,
+            &MailboxRequest::queue_send(queue, payload, sig),
+        )
+        .await?;
+        if resp.ok {
+            Ok(())
         } else {
-            count.min(mailboxes.len())
-        };
-        let nonce = Self::pow_nonce(to, &payload).await?;
-        let mut remaining = mailboxes.iter().cloned();
-        let mut requests = JoinSet::new();
-        for _ in 0..target {
-            if let Some(mailbox) = remaining.next() {
-                Self::spawn_put(
-                    &mut requests,
-                    endpoint.clone(),
-                    mailbox,
-                    to.to_string(),
-                    id.to_string(),
-                    payload.clone(),
-                    nonce,
-                );
-            }
+            Err(anyhow!(
+                "queue_send failed: {}",
+                resp.error.unwrap_or_default()
+            ))
         }
-
-        let mut ok = 0;
-        while let Some(result) = requests.join_next().await {
-            let succeeded = match result {
-                Ok((_mailbox, Ok(()))) => {
-                    ok += 1;
-                    true
-                }
-                Ok((mailbox, Err(e))) => {
-                    eprintln!("[mailbox] put to {mailbox} failed: {e}");
-                    false
-                }
-                Err(e) => {
-                    eprintln!("[mailbox] put task failed: {e}");
-                    false
-                }
-            };
-            if ok >= target {
-                requests.abort_all();
-                break;
-            }
-            if !succeeded {
-                if let Some(mailbox) = remaining.next() {
-                    Self::spawn_put(
-                        &mut requests,
-                        endpoint.clone(),
-                        mailbox,
-                        to.to_string(),
-                        id.to_string(),
-                        payload.clone(),
-                        nonce,
-                    );
-                }
-            }
-        }
-        Ok(ok)
     }
 
-    fn spawn_put(
-        requests: &mut JoinSet<(String, Result<()>)>,
-        endpoint: Endpoint,
-        mailbox: String,
-        to: String,
-        id: String,
-        payload: Vec<u8>,
-        nonce: u64,
-    ) {
-        requests.spawn(async move {
-            let result = Self::put_with_nonce(&endpoint, &mailbox, &to, &id, payload, nonce).await;
-            (mailbox, result)
-        });
-    }
-
-    /// 拉取本端全部待收密文（节点侧「取回即删」并广播删除同步）。
-    pub async fn fetch(endpoint: &Endpoint, mailbox: &str, me: &str) -> Result<Vec<StoredMessage>> {
-        let resp = Self::call(endpoint, mailbox, &MailboxRequest::fetch(me)).await?;
+    /// 取走队列里的全部消息（owner 签名）。
+    pub async fn queue_get(
+        endpoint: &Endpoint,
+        mailbox: &str,
+        queue: &str,
+        sig: &str,
+    ) -> Result<Vec<StoredMessage>> {
+        let resp = Self::call(endpoint, mailbox, &MailboxRequest::queue_get(queue, sig)).await?;
         if resp.ok {
             Ok(resp.messages.unwrap_or_default())
         } else {
             Err(anyhow!(
-                "mailbox fetch failed: {}",
+                "queue_get failed: {}",
+                resp.error.unwrap_or_default()
+            ))
+        }
+    }
+
+    /// 删除队列（owner 签名）。
+    pub async fn queue_delete(
+        endpoint: &Endpoint,
+        mailbox: &str,
+        queue: &str,
+        sig: &str,
+    ) -> Result<()> {
+        let resp = Self::call(endpoint, mailbox, &MailboxRequest::queue_delete(queue, sig)).await?;
+        if resp.ok {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "queue_delete failed: {}",
                 resp.error.unwrap_or_default()
             ))
         }

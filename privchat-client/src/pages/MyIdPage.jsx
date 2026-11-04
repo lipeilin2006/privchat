@@ -6,18 +6,26 @@ import { api } from "../api";
 import { t } from "../i18n";
 
 export default function MyIdPage({ onClose, onAdded, notify }) {
+  const [connId, setConnId] = useState("");
   const [myId, setMyId] = useState("");
   const [qr, setQr] = useState("");
   const [invite, setInvite] = useState("");
   const [name, setName] = useState("");
   const [busy, setBusy] = useState(false);
 
+  // 生成邀请 = 在 mailbox 上建一条接收队列，把地址 + 写权限给对方。
   const refresh = async () => {
     setBusy(true);
     try {
-      const ticket = await api.selfTicket();
-      setMyId(ticket);
-      setQr(await QRCode.toDataURL(ticket, { width: 220, margin: 1 }));
+      const mailboxes = await api.mailboxPeers();
+      if (!mailboxes || mailboxes.length === 0) {
+        notify(t("noMailbox"), "err");
+        return;
+      }
+      const [id, text] = await api.createConnection(mailboxes[0]);
+      setConnId(id);
+      setMyId(text);
+      setQr(await QRCode.toDataURL(text, { width: 220, margin: 1 }));
     } catch (e) {
       notify(String(e), "err");
     } finally {
@@ -40,9 +48,14 @@ export default function MyIdPage({ onClose, onAdded, notify }) {
 
   const connect = async () => {
     if (!invite.trim()) return;
+    if (!connId) {
+      notify(t("refreshId"), "err");
+      return;
+    }
     setBusy(true);
     try {
-      await api.connectPeer(invite.trim(), name.trim() || null);
+      await api.acceptConnection(connId, invite.trim());
+      if (name.trim()) await api.renameConnection(connId, name.trim());
       notify(t("saveOk"));
       onAdded?.();
     } catch (e) {

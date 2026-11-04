@@ -78,7 +78,6 @@ privchat/
 ├── privchat-common/            wire 协议 / PoW / ALPN
 ├── privchat-mailbox/           离线消息节点（角色 / PEX / 同步）
 ├── privchat-onion/             洋葱路由封装与剥离
-├── privchat-cli/               命令行测试客户端
 ├── scripts/                    一键构建脚本
 └── README.md
 ```
@@ -131,23 +130,7 @@ bash scripts/build-android-arm64.sh
 其他脚本：`build-windows-x86_64.sh`、`build-linux-x86_64.sh`、
 `build-android-wsl.sh`、`build-windows.ps1`。
 
-### 4. 命令行端到端验证（无需 GUI）
 
-```bash
-cd privchat-cli
-cargo run -- init alice
-cargo run -- init bob
-cargo run -- derive bob alice      # 为联系人派生专属身份
-cargo run -- contact bob <alice>   # 登记联系人
-cargo run -- send alice bob "hi" --mailbox <node_id>
-cargo run -- recv bob --mailbox <node_id>
-cargo run -- demo <node_id>        # 一键自测
-cargo run -- send-image alice bob ./a.png --mailbox <node_id>
-```
-
-完整用法与洋葱路径示例见 [privchat-cli/README.md](privchat-cli/README.md)。
-
----
 
 ## ⚙️ 配置
 
@@ -214,14 +197,13 @@ npm run uitest
 - 未做固定长度分片/填充，包长会泄漏跳数与大致内容长度
 - 未实现路径选择策略与守卫节点，恶意中继可做流量关联
 - PEX 只扩充邻居表，不做历史消息的全量反熵同步
-- GUI 尚未迁移：消息搜索、扫码添加、会话信息面板（CLI 已支持）
+- GUI 尚未迁移：消息搜索、会话信息面板
 
 ---
 
 ## 📚 文档
 
 - [privchat-mailbox/CONFIG.md](privchat-mailbox/CONFIG.md) — 节点配置、角色、PEX
-- [privchat-cli/README.md](privchat-cli/README.md) — CLI 用法、图片与洋葱路径
 - [docs/SECURITY.md](docs/SECURITY.md) — 威胁模型、安全审查与抗追踪分析
 
 ---

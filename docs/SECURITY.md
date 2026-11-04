@@ -92,6 +92,66 @@
 旧版无头消息原样兼容。仍未覆盖的是**跳数**（洋葱层数会改变总长）与跨桶
 的粗粒度差异——下一步是固定信元（所有包等长）。
 
+### 3.7 X3DH 会话密钥（v7）
+
+早期 root0 只由静态-静态 ECDH 派生：长期私钥一泄漏，**全部 gen0 消息**
+（含历史、含单向会话整段）都能被离线解开，也能直接冒充。v7 起改为 X3DH
+三组 DH（SDK 里的 signed prekey）：
+
+```
+dh1 = DH(IK_own, SPK_peer)
+dh2 = DH(EK,     IK_peer)
+dh3 = DH(EK,     SPK_peer)
+root0 = HKDF(dh1 || dh2 || dh3, "privchat/session/root/v1")
+```
+
+- `IK`：每联系人专属身份（Ed25519，= peer_id），只做认证与签名。
+- `SPK`：每个 `local_id` 一把 X25519 预密钥，公钥随邀请串下发，由 IK 签名。
+- `EK`：发起方每次会话新生成，随首条消息头（`dh_pub`）下发，用完即弃。
+
+角色由「谁先发」决定：先发的是发起方，收到首条消息的一方是响应方；
+响应方在拿到 `EK` 之前不能发送。效果：
+
+- 只泄漏 IK：算不出 root0（还缺 SPK 私钥或 EK）——**不能解密、不能冒充**；
+- 只泄漏 SPK：同样不够（还缺 IK 或 EK）；
+- 事后泄漏 IK+SPK：过去的会话仍安全（EK 已丢）——前向保密。
+
+邀请串格式：`pc1:` + hex(IK_pub || SPK_pub || sig_IK || u16 len || ticket)。
+签名只覆盖 `IK||SPK`，`ticket` 只是拨号地址（可省，省了就走 DNS 发现）。
+
+**会话表**：`sessions(session_id, local_id, peer_id, role, active, state)`
+一条联系人可有多段会话。并发发起（双方都没收到对方就先发）时各建一段，
+按 `session_id` 字典序取最小者为主会话——两边算出的 ID 集合相同，选出的
+主会话也一致；其余会话保留为只读，继续尝试解密，不丢消息。收消息时先试
+主会话再试其余，都失败才按「本端是响应方」新建一段。
+
+**邀请串长度**：为了能进二维码，邀请串用 base64url 编码（不是 hex），且
+只带 `IK + SPK + 签名`（约 176 字符；`pc1:` 前缀后不再塞 OPK 或票据）。
+票据只在无 DNS 的测试环境里显式带上。
+
+**一次性预密钥（OPK）**：每个 `local_id` 在创建时生成 8 把 OPK，私钥存在
+本地 `opks` 表。正式邀请**不再携带** OPK 公钥——它留给 mailbox 的 prekey
+目录按需分发（见 SESSION_DESIGN P3）；目录上线前，发起方拿不到 OPK 时
+自动退回 3-DH。发起方建会话时取一把做第四组 DH
+`dh4 = DH(EK, OPK)`，并把 `opk_id` 写进消息头；响应方按 id 取出私钥派生，
+**解出首条消息后立刻删除**。于是即便 IK+SPK 同时泄漏，没用过的 OPK 仍然
+保护新会话（攻击者拿不到那组的私钥）。
+
+**边界**：SPK 目前不轮换，OPK 池也只有 8 把、用完不会自动补货（需要重新
+生成邀请）。完整方案见 SESSION_DESIGN 的 P3。
+
+### 3.8 每消息身份签名（v7）
+
+每条消息末尾追加 64 字节 Ed25519 签名，覆盖 `header + ciphertext`
+（带域分隔前缀 `privchat/msg/sig/v1`）。收端**先验签、再动棘轮状态**：
+
+- 伪造/篡改的消息在进入 X3DH 派生与 AEAD 解密之前就被拒绝；
+- 身份与消息显式绑定，杜绝「实现层把消息解到错误会话 / 错误联系人」。
+
+**边界**：签名密钥就是 IK 本身，所以签名不提供「IK 泄漏后仍不可冒充」的
+保证——那由 X3DH（§3.7）负责：没有 SPK 私钥就签不出对方认可的会话，
+即便能签也没法让对方解出正确的 root0。
+
 ### 3.5 WebView 与打包层
 
 - **CSP**：已配置 `default-src 'self'; script-src 'self'; style-src 'self'
@@ -118,9 +178,10 @@
 
 | 项 | 取值 |
 |---|---|
-| 消息加密 | ChaCha20-Poly1305（AEAD，头部作为 AAD） |
+| 消息加密 | ChaCha20-Poly1305（AEAD，头部作为 AAD）+ 每条 Ed25519 签名 |
+| 密钥协商 | X3DH：DH(IK,SPK) + DH(EK,IK) + DH(EK,SPK) [+ DH(EK,OPK)]，HKDF-SHA256 |
 | 密钥交换 | X25519（Ed25519 身份转 Montgomery） |
-| 棘轮 | 双棘轮，跳窗 200，skipped 池上限 1000 |
+| 棘轮 | 双棘轮，跳窗 200，skipped 池上限 1000；X3DH 建会话；消息签名（v7） |
 | 洋葱层密钥 | HKDF-SHA256，info=`privchat/onion/key/v1`，AAD=`privchat/onion/v1` |
 | 保险箱 KDF | PBKDF2-HMAC-SHA256，600,000 次，16B salt |
 | 本地库 | SQLCipher（全库加密） |
