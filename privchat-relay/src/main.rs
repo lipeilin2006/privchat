@@ -66,8 +66,19 @@ fn ensure_config(data_dir: &std::path::Path, cfg: &RelayConfig) -> Result<()> {
     if path.exists() {
         return Ok(());
     }
-    std::fs::write(&path, serde_json::to_string_pretty(cfg)?)?;
+    write_private(&path, serde_json::to_string_pretty(cfg)?.as_bytes())?;
     eprintln!("[relay] wrote {}", path.display());
+    Ok(())
+}
+
+/// 写敏感文件：创建后立刻收到 0600。
+fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    std::fs::write(path, bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
     Ok(())
 }
 
@@ -207,7 +218,7 @@ async fn main() -> Result<()> {
         SecretKey::try_from(bytes.as_slice())?
     } else {
         let key = SecretKey::generate();
-        std::fs::write(&secret_path, key.to_bytes())?;
+        write_private(&secret_path, &key.to_bytes())?;
         key
     };
 

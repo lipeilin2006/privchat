@@ -380,6 +380,17 @@ fn err(e: &str) -> MailboxResponse {
 }
 
 /// 当前 UTC 毫秒时间戳。
+/// 写敏感文件：创建后立刻收到 0600（默认 umask 会留下 0644）。
+fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    std::fs::write(path, bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -509,7 +520,7 @@ fn ensure_config_files(data_dir: &std::path::Path, cfg: &ResolvedConfig) -> Resu
         max_queue_bytes: Some(cfg.max_queue_bytes),
         max_queues: Some(cfg.max_queues),
     };
-    std::fs::write(&cfg_path, serde_json::to_string_pretty(&file)?)?;
+    write_private(&cfg_path, serde_json::to_string_pretty(&file)?.as_bytes())?;
     eprintln!("[mailbox] wrote {}", cfg_path.display());
     Ok(())
 }
@@ -531,7 +542,7 @@ pub async fn run() -> Result<()> {
         SecretKey::try_from(bytes.as_slice())?
     } else {
         let key = SecretKey::generate();
-        std::fs::write(&secret_path, key.to_bytes())?;
+        write_private(&secret_path, &key.to_bytes())?;
         key
     };
 
