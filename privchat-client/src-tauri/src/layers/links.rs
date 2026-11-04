@@ -184,7 +184,9 @@ impl LinkManager {
             .out
             .clone()
             .ok_or_else(|| anyhow!("connection not paired yet"))?;
-        let blob = link.e2e.encrypt(plaintext)?;
+        // 加密前做桶填充：同桶消息密文等长，削弱长度侧信道。
+        let padded = privchat_common::pad_plaintext(plaintext);
+        let blob = link.e2e.encrypt(&padded)?;
         self.persist(conn_id, link)?;
         drop(links);
 
@@ -226,7 +228,7 @@ impl LinkManager {
             .ok_or_else(|| anyhow!("unknown connection {conn_id}"))?;
         for blob in blobs {
             match link.e2e.decrypt(&blob) {
-                Ok(plain) => out.push(plain),
+                Ok(plain) => out.push(privchat_common::unpad_plaintext(&plain)),
                 Err(e) => eprintln!("[links] decrypt failed: {e}"),
             }
         }

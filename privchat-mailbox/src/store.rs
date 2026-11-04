@@ -25,6 +25,10 @@ pub(crate) struct MailboxStore {
     pub(crate) path: PathBuf,
     /// 消息最长保留秒数；0 = 永不过期。
     ttl_secs: u64,
+    /// 单队列消息条数上限（防灌满）。
+    max_queue_msgs: usize,
+    /// 单队列总字节上限。
+    max_queue_bytes: usize,
 }
 
 impl std::fmt::Debug for MailboxStore {
@@ -38,6 +42,16 @@ impl std::fmt::Debug for MailboxStore {
 impl MailboxStore {
     /// 打开（或创建）当前版本 SQLite 库并建立表结构。
     pub(crate) fn open(path: PathBuf, ttl_secs: u64) -> Result<Self> {
+        Self::open_with_limits(path, ttl_secs, 1000, 64 * 1024 * 1024)
+    }
+
+    /// 指定队列限额打开（测试或运营自定义用）。
+    pub(crate) fn open_with_limits(
+        path: PathBuf,
+        ttl_secs: u64,
+        max_queue_msgs: usize,
+        max_queue_bytes: usize,
+    ) -> Result<Self> {
         let conn = SqlConn::open(&path)?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
@@ -67,6 +81,8 @@ impl MailboxStore {
             conn: Arc::new(Mutex::new(conn)),
             path,
             ttl_secs,
+            max_queue_msgs,
+            max_queue_bytes,
         })
     }
 
@@ -103,6 +119,18 @@ impl MailboxStore {
     /// 往队列追加一条密文，返回序号。
     pub(crate) async fn push_queue(&self, queue_id: &str, payload: &[u8], now: u64) -> Result<i64> {
         let conn = self.conn.lock().await;
+        // 单队列限额：条数 + 总字节（防灌满）
+        let (count, bytes): (i64, i64) = conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(LENGTH(payload)), 0) FROM queue_msgs WHERE queue_id = ?1",
+            params![queue_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if count as usize >= self.max_queue_msgs {
+            return Err(anyhow!("queue full: {} messages", self.max_queue_msgs));
+        }
+        if bytes as usize + payload.len() > self.max_queue_bytes {
+            return Err(anyhow!("queue full: {} bytes", self.max_queue_bytes));
+        }
         let seq: i64 = conn.query_row(
             "SELECT COALESCE(MAX(seq), 0) + 1 FROM queue_msgs WHERE queue_id = ?1",
             params![queue_id],

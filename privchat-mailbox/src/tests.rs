@@ -492,3 +492,28 @@ async fn queue_create_send_get_delete() {
     assert!(resp.ok, "delete: {:?}", resp.error);
     assert!(handler.store.queue_auth(queue).await.unwrap().is_none());
 }
+
+/// 单队列容量上限：条数满了再投递应被拒。
+#[tokio::test]
+async fn queue_capacity_limits() {
+    let dir = std::env::temp_dir().join(format!("privchat-qcap-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = MailboxStore::open_with_limits(dir.join("mb.db"), 0, 2, 1024).expect("open");
+    let q = "00112233445566778899aabbccddeeff";
+    assert!(store
+        .create_queue(q, &[1u8; 32], &[2u8; 32], 0)
+        .await
+        .expect("create"));
+    assert!(store.push_queue(q, b"a", 0).await.is_ok());
+    assert!(store.push_queue(q, b"b", 0).await.is_ok());
+    assert!(
+        store.push_queue(q, b"c", 0).await.is_err(),
+        "third message must be rejected"
+    );
+
+    // 取走清空后可以继续写。
+    let got = store.take_queue(q).await.expect("take");
+    assert_eq!(got.len(), 2);
+    assert!(store.push_queue(q, b"d", 0).await.is_ok());
+}
