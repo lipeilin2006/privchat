@@ -53,7 +53,7 @@ use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use ed25519_dalek::SigningKey;
 use hkdf::Hkdf;
 use rand_core::RngCore;
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use x25519_dalek::StaticSecret;
 
 /// wire 消息头魔数。
@@ -195,6 +195,11 @@ impl Ratchet {
             skipped: HashMap::new(),
             pending: None,
         })
+    }
+
+    /// 本端作为发起方时，本会话的 EK 公钥（用于计算 session_id）。
+    pub fn own_ek(&self) -> Option<[u8; 32]> {
+        self.our_eph_pub
     }
 
     /// 会话是否已建立（响应方收到发起方首条消息前为 false）。
@@ -625,6 +630,39 @@ fn new_eph() -> ([u8; 32], [u8; 32]) {
     let secret = StaticSecret::from(seed);
     let public = x25519_dalek::PublicKey::from(&secret);
     (secret.to_bytes(), public.to_bytes())
+}
+
+/// 会话标识：`H("privchat/session/id/v1" || IK_lo || IK_hi || EK_initiator)`。
+///
+/// 双方都能算：IK 是双方身份公钥（排序后拼接），EK 是发起方首条消息里的
+/// 临时公钥。并发发起时按这个 ID 字典序取小者为主会话，两边结果一致。
+pub fn session_id(ek: &[u8; 32], a_ik: &[u8; 32], b_ik: &[u8; 32]) -> String {
+    let (lo, hi) = if a_ik < b_ik {
+        (a_ik, b_ik)
+    } else {
+        (b_ik, a_ik)
+    };
+    let mut h = Sha256::new();
+    h.update(b"privchat/session/id/v1");
+    h.update(lo);
+    h.update(hi);
+    h.update(ek);
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// 把 peer_id（hex 的 Ed25519 公钥）解成原始 32 字节，供 session_id 使用。
+pub fn peer_pub_bytes(peer_id: &str) -> Result<[u8; 32]> {
+    decode_peer_pub(peer_id)
+}
+
+/// 从消息头取发起方的会话 EK：gen0 用 `dh_pub`，gen1 用 `prev_eph`。
+pub fn header_ek(blob: &[u8]) -> Result<[u8; 32]> {
+    let hdr = parse_header(blob)?;
+    match hdr.gen {
+        0 => Ok(hdr.dh_pub),
+        1 => Ok(hdr.prev_eph),
+        gen => Err(anyhow!("cannot recover EK from gen {gen}")),
+    }
 }
 
 /// 邀请串前缀。

@@ -119,8 +119,14 @@ root0 = HKDF(dh1 || dh2 || dh3, "privchat/session/root/v1")
 邀请串格式：`pc1:` + hex(IK_pub || SPK_pub || sig_IK || u16 len || ticket)。
 签名只覆盖 `IK||SPK`，`ticket` 只是拨号地址（可省，省了就走 DNS 发现）。
 
-**边界**：SPK 目前不轮换，且响应方没有一次性预密钥（OPK）。要覆盖
-「IK+SPK 同时泄漏后的新会话」还需要 OPK 池与轮换策略（见 SESSION_DESIGN）。
+**会话表**：`sessions(session_id, local_id, peer_id, role, active, state)`
+一条联系人可有多段会话。并发发起（双方都没收到对方就先发）时各建一段，
+按 `session_id` 字典序取最小者为主会话——两边算出的 ID 集合相同，选出的
+主会话也一致；其余会话保留为只读，继续尝试解密，不丢消息。收消息时先试
+主会话再试其余，都失败才按「本端是响应方」新建一段。
+
+**边界**：SPK 目前不轮换，且没有一次性预密钥（OPK）。要覆盖「IK+SPK
+同时泄漏后的新会话」还需要 OPK 池与轮换策略（见 SESSION_DESIGN）。
 
 ### 3.8 每消息身份签名（v7）
 

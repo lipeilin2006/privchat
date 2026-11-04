@@ -1,3 +1,4 @@
+#![allow(unused_variables)]
 use super::*;
 
 const TEST_KEY: [u8; 32] = [0x42; 32];
@@ -443,8 +444,6 @@ async fn two_clients_roundtrip_with_relay() {
     let (bob, mut rx_b) = App::start(dir_b.clone(), TEST_KEY).await.expect("start b");
 
     // 生产邀请 = 专属身份的 peer_id（几十字符，可进二维码），靠 DNS/Pkarr 解析地址。
-    let alice_invite = alice.self_ticket().await;
-    let bob_invite = bob.self_ticket().await;
     let (alice_for_bob, alice_invite) = new_invite(&alice).await;
     let (bob_for_alice, bob_invite) = new_invite(&bob).await;
 
@@ -626,4 +625,97 @@ fn test_msg_id() -> String {
     let mut rnd = [0u8; 16];
     rand_core::OsRng.fill_bytes(&mut rnd);
     rnd.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// 并发发起：双方都还没收到对方就先各发一条，会各产生两段会话。
+/// 主会话按 session_id 取小，两边选出的必须是同一段；两条消息都不能丢。
+#[tokio::test]
+async fn concurrent_first_send_converges_on_one_active_session() {
+    let dir_a = std::env::temp_dir().join(format!("privchat-cc-a-{}", std::process::id()));
+    let dir_b = std::env::temp_dir().join(format!("privchat-cc-b-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+
+    let (alice, mut rx_a) = App::start_no_relay(dir_a.clone(), TEST_KEY)
+        .await
+        .expect("start a");
+    let (bob, mut rx_b) = App::start_no_relay(dir_b.clone(), TEST_KEY)
+        .await
+        .expect("start b");
+
+    let (alice_for_bob, alice_invite) = new_invite(&alice).await;
+    let (bob_for_alice, bob_invite) = new_invite(&bob).await;
+    let bob_id = alice.connect_peer(&bob_invite, None).await.expect("a->b");
+    let alice_id = bob.connect_peer(&alice_invite, None).await.expect("b->a");
+
+    // 谁都没收过对方：两边同时发，各自成为发起方。
+    alice
+        .send_message(&bob_id, "a-first")
+        .await
+        .expect("a send");
+    bob.send_message(&alice_id, "b-first")
+        .await
+        .expect("b send");
+    let env_b = rx_b.recv().await.expect("bob envelope");
+    let env_a = rx_a.recv().await.expect("alice envelope");
+
+    let msg_b = bob
+        .handle_incoming(env_b)
+        .await
+        .expect("bob recv")
+        .expect("text");
+    assert_eq!(msg_b.text, "a-first");
+    let msg_a = alice
+        .handle_incoming(env_a)
+        .await
+        .expect("alice recv")
+        .expect("text");
+    assert_eq!(msg_a.text, "b-first");
+
+    // 两边都应有两条会话，且选出的主会话 ID 一致。
+    let key_a = (alice_for_bob.clone(), bob_id.clone());
+    let key_b = (bob_for_alice.clone(), alice_id.clone());
+    let (active_a, count_a) = {
+        let map = alice.sessions.lock().await;
+        let entries = map.get(&key_a).expect("alice sessions");
+        (
+            entries.iter().find(|e| e.active).map(|e| e.id.clone()),
+            entries.len(),
+        )
+    };
+    let (active_b, count_b) = {
+        let map = bob.sessions.lock().await;
+        let entries = map.get(&key_b).expect("bob sessions");
+        (
+            entries.iter().find(|e| e.active).map(|e| e.id.clone()),
+            entries.len(),
+        )
+    };
+    assert_eq!(count_a, 2, "alice should keep both concurrent sessions");
+    assert_eq!(count_b, 2, "bob should keep both concurrent sessions");
+    assert_eq!(active_a, active_b, "both sides must elect the same session");
+
+    // 继续双向通信：主会话一致，消息不丢。
+    alice.send_message(&bob_id, "a2").await.expect("a send 2");
+    let env = rx_b.recv().await.expect("bob envelope 2");
+    let m = bob
+        .handle_incoming(env)
+        .await
+        .expect("bob recv 2")
+        .expect("text");
+    assert_eq!(m.text, "a2");
+
+    bob.send_message(&alice_id, "b2").await.expect("b send 2");
+    let env = rx_a.recv().await.expect("alice envelope 2");
+    let m = alice
+        .handle_incoming(env)
+        .await
+        .expect("alice recv 2")
+        .expect("text");
+    assert_eq!(m.text, "b2");
+
+    alice.close().await;
+    bob.close().await;
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
 }

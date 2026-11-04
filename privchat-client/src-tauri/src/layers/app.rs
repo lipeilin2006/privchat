@@ -107,6 +107,66 @@ fn now_ms() -> u64 {
 }
 
 /// 每会话发送队列表：`(local_id, peer_id) -> 该会话发送 worker 的投递通道`。
+/// 会话角色：第一个发消息的一方是发起方，另一方是响应方。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SessionRole {
+    Initiator,
+    Responder,
+}
+
+impl SessionRole {
+    fn as_str(self) -> &'static str {
+        match self {
+            SessionRole::Initiator => "initiator",
+            SessionRole::Responder => "responder",
+        }
+    }
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "initiator" => Some(SessionRole::Initiator),
+            "responder" => Some(SessionRole::Responder),
+            _ => None,
+        }
+    }
+}
+
+/// 一条会话：session_id + 角色 + 棘轮状态。
+/// 一个联系人可以同时存在多条（并发发起时），按 session_id 字典序取最小者为主。
+#[derive(Clone)]
+struct SessionEntry {
+    id: String,
+    role: SessionRole,
+    ratchet: crypto::Ratchet,
+    active: bool,
+}
+
+type SessionMap = Arc<Mutex<HashMap<(String, String), Vec<SessionEntry>>>>;
+
+/// 主会话选举：按 session_id 排序后取最小者。
+///
+/// 并发发起时双方各有一段会话，但两边看到的 ID 集合相同（ID 由双方 IK 与
+/// 发起方 EK 算出），所以选出的主会话也一致，不会来回抖。
+fn session_rows(entries: &[SessionEntry]) -> Vec<(String, String, bool, Vec<u8>)> {
+    entries
+        .iter()
+        .map(|e| {
+            (
+                e.id.clone(),
+                e.role.as_str().to_string(),
+                e.active,
+                e.ratchet.to_bytes(),
+            )
+        })
+        .collect()
+}
+
+fn elect_active(entries: &mut Vec<SessionEntry>) {
+    entries.sort_by(|a, b| a.id.cmp(&b.id));
+    for (i, e) in entries.iter_mut().enumerate() {
+        e.active = i == 0;
+    }
+}
+
 type SendQueues = Arc<Mutex<HashMap<(String, String), mpsc::UnboundedSender<SendJob>>>>;
 
 /// 发送 worker 所需的最小状态：仅传需要的字段克隆，避免把整个 `App`
@@ -117,7 +177,7 @@ type SendQueues = Arc<Mutex<HashMap<(String, String), mpsc::UnboundedSender<Send
 struct SendCtx {
     transport: Transport,
     store: Arc<super::store::Store>,
-    ratchets: Arc<Mutex<HashMap<(String, String), crypto::Ratchet>>>,
+    sessions: SessionMap,
     mailbox_peers: Arc<Mutex<Vec<String>>>,
     /// 每条离线消息写入的 mailbox 节点数（0 = 全部已配置节点）。
     mailbox_write_count: Arc<AtomicUsize>,
@@ -224,12 +284,15 @@ impl SendCtx {
         // 只有消息确认送达（直连成功，或有 mailbox 兜底）后才调用
         // `Ratchet::next` 提交并持久化。发送失败则状态保持加密前，
         // 不会污染棘轮链（gen/n 不提前、不发生收敛失步）。
-        let blob = {
+        let (sid, blob) = {
             let key = (local_id.to_string(), peer_id.to_string());
-            let mut ratchets = self.ratchets.lock().await;
-            if !ratchets.contains_key(&key) {
-                // 没有会话就新建：发送方即发起方，需要对方 SPK 公钥（邀请串携带）。
-                // 若本端是响应方（对方先发的），会话已存在，不查 SPK。
+            let mut map = self.sessions.lock().await;
+            let entries = map.entry(key.clone()).or_default();
+            // 没有已建立的主会话：新建一段发起方会话（需要对方 SPK，邀请串携带）。
+            if !entries
+                .iter()
+                .any(|e| e.active && e.ratchet.is_established())
+            {
                 let peer_spk = {
                     let contacts = self.contacts.lock().await;
                     contacts
@@ -241,12 +304,29 @@ impl SendCtx {
                     .as_slice()
                     .try_into()
                     .map_err(|_| anyhow!("stored peer SPK has bad length"))?;
-                ratchets.insert(
-                    key.clone(),
-                    crypto::Ratchet::new_initiator(&secret, peer_id, &peer_spk)?,
+                let ratchet = crypto::Ratchet::new_initiator(&secret, peer_id, &peer_spk)?;
+                let ek = ratchet
+                    .own_ek()
+                    .ok_or_else(|| anyhow!("initiator session has no EK"))?;
+                let id = crypto::session_id(
+                    &ek,
+                    secret.public().as_bytes(),
+                    &crypto::peer_pub_bytes(peer_id)?,
                 );
+                entries.push(SessionEntry {
+                    id,
+                    role: SessionRole::Initiator,
+                    ratchet,
+                    active: false,
+                });
+                elect_active(entries);
             }
-            ratchets.get_mut(&key).unwrap().encrypt(&job.plain_bytes)?
+            let idx = entries
+                .iter()
+                .position(|e| e.active)
+                .ok_or_else(|| anyhow!("no active session"))?;
+            let blob = entries[idx].ratchet.encrypt(&job.plain_bytes)?;
+            (entries[idx].id.clone(), blob)
         };
 
         // 消息 ID 由加密头 (gen, n) 派生：mailbox 按其字典序返回即等于棘轮
@@ -324,12 +404,17 @@ impl SendCtx {
         // 送达确认（直连成功或有 mailbox 兜底）：提交棘轮推进并持久化。
         {
             let key = (local_id.to_string(), peer_id.to_string());
-            let mut ratchets = self.ratchets.lock().await;
-            let r = ratchets.get_mut(&key).unwrap();
-            r.next();
-            let state = r.to_bytes();
-            if let Err(e) = self.store.save_ratchet(local_id, peer_id, &state) {
-                eprintln!("[app] failed to persist ratchet: {e}");
+            let mut map = self.sessions.lock().await;
+            if let Some(entries) = map.get_mut(&key) {
+                if let Some(entry) = entries.iter_mut().find(|e| e.id == sid) {
+                    entry.ratchet.next();
+                }
+                if let Err(e) = self
+                    .store
+                    .save_sessions(local_id, peer_id, &session_rows(entries))
+                {
+                    eprintln!("[app] failed to persist sessions: {e}");
+                }
             }
         }
 
@@ -383,9 +468,9 @@ pub struct App {
     allow_direct: bool,
     /// 待绑定专属身份（已生成邀请但尚未被连接的 local_id）。
     pending: Arc<Mutex<Vec<String>>>,
-    /// 双棘轮会话缓存：`(local_id, peer_id) -> Ratchet`，随发送/接收推进并
-    /// 落盘 `ratchets` 表（重启后续链）。
-    ratchets: Arc<Mutex<HashMap<(String, String), crypto::Ratchet>>>,
+    /// 会话缓存：`(local_id, peer_id) -> Vec<SessionEntry>`。
+    /// 一条联系人可有多条会话（并发发起），主会话负责发送，其余只解密。
+    sessions: SessionMap,
     /// 每会话发送队列：`(local_id, peer_id) -> 发送 worker 的投递通道`。
     ///
     /// 发送在同一会话内串行化（一条一条发）：保证每条消息拿到递增且唯一的
@@ -494,26 +579,40 @@ impl App {
         // 每条离线消息写入的 mailbox 节点数（0 = 全部已配置节点）。
         let mailbox_write_count = Arc::new(AtomicUsize::new(store.load_mailbox_write_count()?));
 
-        // 双棘轮会话：从磁盘恢复（需要各专属身份私钥还原 root₀ 与链状态）。
+        // 会话：从磁盘恢复（需要各专属身份私钥还原 root₀ 与链状态）。
         let identities = store.load_identities()?;
-        let mut ratchet_map = HashMap::new();
-        for (local_id, peer_id, state) in store.load_ratchets()? {
+        let mut session_map: HashMap<(String, String), Vec<SessionEntry>> = HashMap::new();
+        for (sid, local_id, peer_id, role, active, state) in store.load_sessions()? {
             let Some(secret_bytes) = identities.get(&local_id) else {
                 continue;
             };
             let Ok(secret) = iroh::SecretKey::try_from(secret_bytes.as_slice()) else {
                 continue;
             };
+            let Some(role) = SessionRole::from_str(&role) else {
+                continue;
+            };
             match crypto::Ratchet::from_bytes(&secret, &peer_id, &state) {
-                Ok(r) => {
-                    ratchet_map.insert((local_id, peer_id), r);
+                Ok(ratchet) => {
+                    session_map
+                        .entry((local_id, peer_id))
+                        .or_default()
+                        .push(SessionEntry {
+                            id: sid,
+                            role,
+                            ratchet,
+                            active,
+                        })
                 }
                 Err(e) => {
-                    eprintln!("[app] discarded incompatible ratchet state for {local_id}: {e}");
+                    eprintln!("[app] discarded incompatible session state: {e}");
                 }
             }
         }
-        let ratchets = Arc::new(Mutex::new(ratchet_map));
+        for entries in session_map.values_mut() {
+            elect_active(entries);
+        }
+        let sessions = Arc::new(Mutex::new(session_map));
         let send_queues = Arc::new(Mutex::new(HashMap::new()));
         let mailbox_poll_started = Arc::new(AtomicBool::new(false));
         let mailbox_poll_task = Arc::new(Mutex::new(None));
@@ -537,7 +636,7 @@ impl App {
             onion,
             allow_direct: !use_relay,
             pending,
-            ratchets,
+            sessions,
             send_queues,
             mailbox_poll_started,
             mailbox_poll_task,
@@ -733,7 +832,7 @@ impl App {
         for task in tasks {
             let _ = task.await;
         }
-        self.ratchets.lock().await.clear();
+        self.sessions.lock().await.clear();
         self.transport.close().await;
     }
 
@@ -803,11 +902,11 @@ impl App {
                 .await
                 .remove(&(local_id.clone(), peer_id.to_string()));
             // 删除专属身份与会话：会话密钥（棘轮）一并销毁，实现会话级前向保密。
-            self.ratchets
+            self.sessions
                 .lock()
                 .await
                 .remove(&(local_id.clone(), peer_id.to_string()));
-            if let Err(e) = self.store.delete_ratchet(&local_id) {
+            if let Err(e) = self.store.delete_sessions(&local_id) {
                 eprintln!("[app] failed to delete ratchet for {local_id}: {e}");
             }
             self.transport.drop_identity(&local_id).await;
@@ -950,7 +1049,7 @@ impl App {
                 let ctx = SendCtx {
                     transport: self.transport.clone(),
                     store: self.store.clone(),
-                    ratchets: self.ratchets.clone(),
+                    sessions: self.sessions.clone(),
                     mailbox_peers: self.mailbox_peers.clone(),
                     mailbox_write_count: self.mailbox_write_count.clone(),
                     history: self.history.clone(),
@@ -1044,27 +1143,53 @@ impl App {
         }
 
         let secret = self.transport.secret_for(&local_id).await?;
+        let own_ik = secret.public().as_bytes().to_owned();
+        let peer_ik = crypto::peer_pub_bytes(&sender)?;
+        let spk = self.transport.spk_for(&local_id).await?;
         let plain = {
             let key = (local_id.clone(), sender.clone());
-            let mut ratchets = self.ratchets.lock().await;
-            if !ratchets.contains_key(&key) {
-                // 收到对方首条消息：本端是响应方，用本端 SPK 私钥完成 X3DH。
-                let spk = self.transport.spk_for(&local_id).await?;
-                ratchets.insert(
-                    key.clone(),
-                    crypto::Ratchet::new_responder(&secret, &sender, &spk)?,
-                );
+            let mut map = self.sessions.lock().await;
+            let entries = map.entry(key.clone()).or_default();
+
+            // 先试主会话，再试其余（并发发起时可能有两条）。
+            let mut order: Vec<usize> = (0..entries.len()).collect();
+            order.sort_by_key(|&i| !entries[i].active);
+            let mut plain = None;
+            for i in order {
+                let mut trial = entries[i].ratchet.clone();
+                if let Ok(p) = trial.decrypt(&wire.msg) {
+                    entries[i].ratchet = trial;
+                    plain = Some(p);
+                    break;
+                }
             }
-            ratchets.get_mut(&key).unwrap().decrypt(&wire.msg)?
+
+            // 所有会话都解不开：本端作为响应方新建一段（对方是发起方）。
+            if plain.is_none() {
+                let mut ratchet = crypto::Ratchet::new_responder(&secret, &sender, &spk)?;
+                let p = ratchet
+                    .decrypt(&wire.msg)
+                    .map_err(|e| anyhow!("no session could decrypt message: {e}"))?;
+                let ek = crypto::header_ek(&wire.msg)?;
+                let id = crypto::session_id(&ek, &own_ik, &peer_ik);
+                entries.push(SessionEntry {
+                    id,
+                    role: SessionRole::Responder,
+                    ratchet,
+                    active: false,
+                });
+                elect_active(entries);
+                plain = Some(p);
+            }
+
+            if let Err(e) = self
+                .store
+                .save_sessions(&local_id, &sender, &session_rows(entries))
+            {
+                eprintln!("[app] failed to persist sessions: {e}");
+            }
+            plain.expect("plain set above")
         };
-        let state = {
-            let key = (local_id.clone(), sender.clone());
-            let ratchets = self.ratchets.lock().await;
-            ratchets.get(&key).unwrap().to_bytes()
-        };
-        if let Err(e) = self.store.save_ratchet(&local_id, &sender, &state) {
-            eprintln!("[app] failed to persist ratchet: {e}");
-        }
         let plain = privchat_common::unpad_plaintext(&plain);
         let inner: PlainMsg = serde_json::from_slice(&plain)?;
 
