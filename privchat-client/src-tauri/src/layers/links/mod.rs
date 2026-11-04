@@ -13,6 +13,7 @@ use ed25519_dalek::SigningKey;
 use iroh::Endpoint;
 use tokio::sync::Mutex;
 
+use crate::layers::app::OnionConfig;
 use crate::layers::connection::{
     self, DrainingQueue, Invite, Link, LinkState, OutQueue, QueueKeys,
 };
@@ -20,6 +21,7 @@ use crate::layers::crypto::connection::Connection as E2e;
 use crate::layers::mailbox::MailboxClient;
 use crate::layers::store::{ConnRow, Store};
 use crate::layers::transport::Transport;
+use privchat_common::{send_request, MailboxRequest, MailboxResponse};
 
 pub type BoxFut<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 
@@ -64,13 +66,16 @@ pub trait QueueApi: Send + Sync {
 pub struct IrohQueues {
     transport: Transport,
     endpoints: Mutex<HashMap<String, Endpoint>>,
+    /// 洋葱配置：开了就把请求逐层包好再送出去。
+    onion: Arc<Mutex<OnionConfig>>,
 }
 
 impl IrohQueues {
-    pub fn new(transport: Transport) -> Self {
+    pub fn new(transport: Transport, onion: Arc<Mutex<OnionConfig>>) -> Self {
         Self {
             transport,
             endpoints: Mutex::new(HashMap::new()),
+            onion,
         }
     }
 
@@ -84,6 +89,51 @@ impl IrohQueues {
         map.insert(conn_id.to_string(), ep.clone());
         Ok(ep)
     }
+
+    /// 洋葱路径：配置里的中继 + 终点 mailbox。没开或没配中继就返回 None。
+    async fn onion_path(&self, mailbox: &str) -> Option<Vec<String>> {
+        let config = self.onion.lock().await.clone();
+        if !config.enabled {
+            return None;
+        }
+        let mut path: Vec<String> = config
+            .relays
+            .into_iter()
+            .map(|r| r.trim().to_string())
+            .filter(|r| r.len() == 64 && r.chars().all(|c| c.is_ascii_hexdigit()))
+            .filter(|r| r != mailbox)
+            .collect();
+        if path.is_empty() {
+            return None;
+        }
+        path.push(mailbox.to_string());
+        Some(path)
+    }
+
+    async fn call(
+        &self,
+        conn_id: &str,
+        mailbox: &str,
+        req: &MailboxRequest,
+    ) -> Result<MailboxResponse> {
+        let endpoint = self.endpoint(conn_id).await?;
+        match self.onion_path(mailbox).await {
+            Some(path) => {
+                let body = serde_json::to_vec(req)?;
+                let packet = privchat_onion::wrap(&path, &body)?;
+                MailboxClient::request_via_onion(&endpoint, &path[0], packet).await
+            }
+            None => send_request(&endpoint, mailbox, req).await,
+        }
+    }
+
+    fn check(resp: MailboxResponse, what: &str) -> Result<MailboxResponse> {
+        if resp.ok {
+            Ok(resp)
+        } else {
+            Err(anyhow!("{what} failed: {}", resp.error.unwrap_or_default()))
+        }
+    }
 }
 
 impl QueueApi for IrohQueues {
@@ -96,8 +146,9 @@ impl QueueApi for IrohQueues {
         owner_pub: &'a str,
     ) -> BoxFut<'a, ()> {
         Box::pin(async move {
-            let ep = self.endpoint(conn_id).await?;
-            MailboxClient::queue_create(&ep, mailbox, queue, sender_pub, owner_pub).await
+            let req = MailboxRequest::queue_create(queue, sender_pub, owner_pub);
+            let resp = self.call(conn_id, mailbox, &req).await?;
+            Self::check(resp, "queue_create").map(|_| ())
         })
     }
 
@@ -110,8 +161,9 @@ impl QueueApi for IrohQueues {
         sig: &'a str,
     ) -> BoxFut<'a, ()> {
         Box::pin(async move {
-            let ep = self.endpoint(conn_id).await?;
-            MailboxClient::queue_send(&ep, mailbox, queue, payload, sig).await
+            let req = MailboxRequest::queue_send(queue, payload, sig);
+            let resp = self.call(conn_id, mailbox, &req).await?;
+            Self::check(resp, "queue_send").map(|_| ())
         })
     }
 
@@ -123,9 +175,15 @@ impl QueueApi for IrohQueues {
         sig: &'a str,
     ) -> BoxFut<'a, Vec<Vec<u8>>> {
         Box::pin(async move {
-            let ep = self.endpoint(conn_id).await?;
-            let rows = MailboxClient::queue_get(&ep, mailbox, queue, sig).await?;
-            Ok(rows.into_iter().map(|m| m.msg).collect())
+            let req = MailboxRequest::queue_get(queue, sig);
+            let resp = self.call(conn_id, mailbox, &req).await?;
+            let resp = Self::check(resp, "queue_get")?;
+            Ok(resp
+                .messages
+                .unwrap_or_default()
+                .into_iter()
+                .map(|m| m.msg)
+                .collect())
         })
     }
 
@@ -137,8 +195,9 @@ impl QueueApi for IrohQueues {
         sig: &'a str,
     ) -> BoxFut<'a, ()> {
         Box::pin(async move {
-            let ep = self.endpoint(conn_id).await?;
-            MailboxClient::queue_delete(&ep, mailbox, queue, sig).await
+            let req = MailboxRequest::queue_delete(queue, sig);
+            let resp = self.call(conn_id, mailbox, &req).await?;
+            Self::check(resp, "queue_delete").map(|_| ())
         })
     }
 }

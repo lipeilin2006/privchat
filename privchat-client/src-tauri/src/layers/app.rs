@@ -52,9 +52,6 @@ impl App {
 
         let mailbox_peers = Arc::new(Mutex::new(store.load_mailbox_peers().unwrap_or_default()));
 
-        let queue_api = Arc::new(IrohQueues::new(transport.clone()));
-        let links = Arc::new(LinkManager::load(store.clone(), queue_api).await?);
-        links.set_pool(mailbox_peers.lock().await.clone()).await;
         let onion = Arc::new(Mutex::new(
             store
                 .load_onion_config()
@@ -62,6 +59,9 @@ impl App {
                 .and_then(|json| serde_json::from_str::<OnionConfig>(&json).ok())
                 .unwrap_or_default(),
         ));
+        let queue_api = Arc::new(IrohQueues::new(transport.clone(), onion.clone()));
+        let links = Arc::new(LinkManager::load(store.clone(), queue_api).await?);
+        links.set_pool(mailbox_peers.lock().await.clone()).await;
         let (stop_tx, _) = watch::channel(false);
         Ok(Self {
             transport,

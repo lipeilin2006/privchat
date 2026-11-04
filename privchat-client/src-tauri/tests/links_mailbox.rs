@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use iroh_tickets::endpoint::EndpointTicket;
 use iroh_tickets::Ticket;
+use privchat_client_lib::layers::app::OnionConfig;
 use privchat_client_lib::layers::links::{IrohQueues, LinkManager};
 use privchat_client_lib::layers::store::Store;
 use privchat_client_lib::layers::transport::Transport;
@@ -16,7 +17,8 @@ async fn manager(dir: &str, transport: Transport) -> (LinkManager, Arc<Store>) {
     let _ = std::fs::remove_dir_all(&path);
     std::fs::create_dir_all(&path).unwrap();
     let store = Arc::new(Store::open(&path, KEY).expect("store"));
-    let api = Arc::new(IrohQueues::new(transport));
+    let onion = Arc::new(tokio::sync::Mutex::new(OnionConfig::default()));
+    let api = Arc::new(IrohQueues::new(transport, onion));
     let links = LinkManager::load(store.clone(), api).await.expect("load");
     (links, store)
 }

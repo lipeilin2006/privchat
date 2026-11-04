@@ -131,38 +131,24 @@ impl ProtocolHandler for OnionHandler {
                     short_id(&next)
                 );
                 let endpoint = self.endpoint.clone();
-                let forwarded = forward_onion(&endpoint, &next, inner).await;
-                eprintln!(
-                    "[onion] forward result: {}",
-                    match &forwarded {
-                        Ok(resp) => format!("ok={}", resp.ok),
-                        Err(error) => format!("err={error:#}"),
+                match forward_onion(&endpoint, &next, inner).await {
+                    // 原样回传：中继不解析内容，也就不会把 messages 弄丢。
+                    Ok(raw) => {
+                        let wrote = send.write_all(&raw).await;
+                        eprintln!("[onion] response relayed ok={}", wrote.is_ok());
                     }
-                );
-                let response = match forwarded {
-                    Ok(resp) if resp.ok => MailboxResponse {
-                        ok: true,
-                        error: None,
-                        messages: None,
-                    },
-                    Ok(resp) => MailboxResponse {
-                        ok: false,
-                        error: Some(format!(
-                            "downstream {next} rejected: {}",
-                            resp.error.unwrap_or_default()
-                        )),
-                        messages: None,
-                    },
-                    Err(error) => MailboxResponse {
-                        ok: false,
-                        error: Some(format!("relay to {next} failed: {error:#}")),
-                        messages: None,
-                    },
-                };
-                let wrote = send
-                    .write_all(&serde_json::to_vec(&response).unwrap_or_default())
-                    .await;
-                eprintln!("[onion] response write ok={}", wrote.is_ok());
+                    Err(error) => {
+                        eprintln!("[onion] forward to {next} failed: {error:#}");
+                        let response = MailboxResponse {
+                            ok: false,
+                            error: Some(format!("relay to {next} failed: {error:#}")),
+                            messages: None,
+                        };
+                        let _ = send
+                            .write_all(&serde_json::to_vec(&response).unwrap_or_default())
+                            .await;
+                    }
+                }
                 let _ = send.finish();
             }
             Ok((None, inner)) => {
@@ -207,11 +193,7 @@ impl ProtocolHandler for OnionHandler {
 }
 
 /// 把剩余洋葱包转发给下一跳（限制超时，避免慢节点拖死中继）。
-async fn forward_onion(
-    endpoint: &iroh::Endpoint,
-    next: &str,
-    inner: Vec<u8>,
-) -> Result<MailboxResponse> {
+async fn forward_onion(endpoint: &iroh::Endpoint, next: &str, inner: Vec<u8>) -> Result<Vec<u8>> {
     let id: iroh::EndpointId = next
         .parse()
         .map_err(|_| anyhow!("invalid next hop: {next}"))?;
@@ -224,12 +206,14 @@ async fn forward_onion(
     let (mut send, mut recv) = conn.open_bi().await?;
     send.write_all(&inner).await?;
     send.finish()?;
-    let bytes = tokio::time::timeout(std::time::Duration::from_secs(90), recv.read_to_end(4096))
-        .await
-        .map_err(|_| anyhow!("waiting {next} response timed out"))??;
-    let response: MailboxResponse =
-        serde_json::from_slice(&bytes).map_err(|e| anyhow!("bad response from {next}: {e}"))?;
-    Ok(response)
+    // 响应可能是一整批密文（queue_get），给足上限；中继只看长度不看内容。
+    let bytes = tokio::time::timeout(
+        std::time::Duration::from_secs(90),
+        recv.read_to_end(ONION_RESPONSE_MAX),
+    )
+    .await
+    .map_err(|_| anyhow!("waiting {next} response timed out"))??;
+    Ok(bytes)
 }
 
 async fn handle_request(handler: &MailboxHandler, payload: &[u8]) -> MailboxResponse {
@@ -399,6 +383,7 @@ fn short_id(id: &str) -> &str {
 /// 单个洋葱包上限：内层载荷 64KB + 每层 94B 开销，留足余量。
 /// 中继按此上限读取，避免恶意客户端用 16MB 包做内存放大。
 const ONION_PACKET_MAX: usize = 128 * 1024;
+const ONION_RESPONSE_MAX: usize = 32 * 1024 * 1024;
 
 fn ok() -> MailboxResponse {
     MailboxResponse {

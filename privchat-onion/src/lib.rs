@@ -37,8 +37,9 @@ pub const ONION_ALPN: &[u8] = b"privchat/onion";
 /// 单层固定开销：eph(32) + nonce(12) + tag(16) + next(32) + len(2)。
 pub const LAYER_OVERHEAD: usize = 32 + 12 + 16 + 32 + 2;
 
-/// 单包内层有效载荷上限（受 u16 长度字段限制，再含 N 层开销）。
-pub const MAX_INNER: usize = 64 * 1024;
+/// 单包内层有效载荷上限：内层长度用 u16 表示，留出每层 34 字节明文头，
+/// 所以这里必须明显小于 65536（写满会截断长度字段）。
+pub const MAX_INNER: usize = 60 * 1024;
 
 const AAD: &[u8] = b"privchat/onion/v1";
 const INFO: &[u8] = b"privchat/onion/key/v1";

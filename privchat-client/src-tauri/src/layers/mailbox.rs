@@ -10,6 +10,7 @@
 use anyhow::{anyhow, Result};
 use iroh::Endpoint;
 use privchat_common::{send_request, MailboxRequest, MailboxResponse};
+use privchat_onion::ONION_ALPN;
 
 pub use privchat_common::StoredMessage;
 
@@ -37,6 +38,34 @@ impl MailboxClient {
         req: &MailboxRequest,
     ) -> Result<MailboxResponse> {
         send_request(endpoint, mailbox, req).await
+    }
+
+    /// 走洋葱中继发一个请求：包已经按路径封好，这里只负责送到第一跳并读回响应。
+    /// 响应对中继是黑盒，它们只转发字节，不解包。
+    pub async fn request_via_onion(
+        endpoint: &Endpoint,
+        first_hop: &str,
+        packet: Vec<u8>,
+    ) -> Result<MailboxResponse> {
+        let id: iroh::EndpointId = first_hop
+            .parse()
+            .map_err(|_| anyhow!("invalid onion first hop: {first_hop}"))?;
+        let conn = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            endpoint.connect(iroh::EndpointAddr::new(id), ONION_ALPN),
+        )
+        .await
+        .map_err(|_| anyhow!("connect onion relay timed out"))??;
+        let (mut send, mut recv) = conn.open_bi().await?;
+        send.write_all(&packet).await?;
+        send.finish()?;
+        let bytes = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            recv.read_to_end(32 * 1024 * 1024),
+        )
+        .await
+        .map_err(|_| anyhow!("waiting onion response timed out"))??;
+        serde_json::from_slice(&bytes).map_err(|e| anyhow!("bad onion response: {e}"))
     }
 
     // ---- 单向队列（SimpleX 式） ----

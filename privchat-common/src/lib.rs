@@ -85,6 +85,90 @@ pub fn find_pow(to: &str, payload: &[u8]) -> u64 {
     }
 }
 
+/// `#[serde(with)]` 需要模块名里正好有 serialize/deserialize。
+mod bytes_wire_opt {
+    use serde::{Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(v: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
+        super::bytes_wire::ser_opt(v, s)
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<u8>>, D::Error> {
+        super::bytes_wire::de_opt(d)
+    }
+}
+
+mod bytes_wire_vec {
+    use serde::{Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(v: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        super::bytes_wire::ser_vec(v, s)
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        super::bytes_wire::de_vec(d)
+    }
+}
+
+/// 线上把字节串用 base64 传，而不是 JSON 数字数组：
+/// 同样 1KB 的密文，数组要 ~4KB，base64 只要 ~1.4KB（洋葱单包上限 64KB，
+/// 用数组的话稍微大一点的消息就塞不进去）。
+/// 反序列化同时接受旧的数字数组，老客户端/老节点仍能读。
+mod bytes_wire {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+    use serde::de::{self, SeqAccess, Visitor};
+    use serde::{Deserializer, Serializer};
+
+    pub fn ser_vec<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&STANDARD.encode(bytes))
+    }
+
+    pub fn de_vec<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        struct BytesVisitor;
+        impl<'de> Visitor<'de> for BytesVisitor {
+            type Value = Vec<u8>;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("base64 string or byte array")
+            }
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<Vec<u8>, E> {
+                STANDARD.decode(value).map_err(E::custom)
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<u8>, A::Error> {
+                let mut out = Vec::new();
+                while let Some(byte) = seq.next_element::<u8>()? {
+                    out.push(byte);
+                }
+                Ok(out)
+            }
+        }
+        d.deserialize_any(BytesVisitor)
+    }
+
+    pub fn ser_opt<S: Serializer>(bytes: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
+        match bytes {
+            Some(bytes) => s.serialize_some(&STANDARD.encode(bytes)),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn de_opt<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<u8>>, D::Error> {
+        struct OptVisitor;
+        impl<'de> Visitor<'de> for OptVisitor {
+            type Value = Option<Vec<u8>>;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("optional base64 string or byte array")
+            }
+            fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+            fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+            fn visit_some<D2: Deserializer<'de>>(self, d: D2) -> Result<Self::Value, D2::Error> {
+                de_vec(d).map(Some)
+            }
+        }
+        d.deserialize_option(OptVisitor)
+    }
+}
+
 /// 请求方 → 节点请求。
 ///
 /// 只带当前 op 需要的字段；其余留 `None`，serde 不序列化。
@@ -104,8 +188,12 @@ pub struct MailboxRequest {
     /// 队列读/删的签名（hex）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sig: Option<String>,
-    /// `QueueSend` 的密文消息体。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// `QueueSend` 的密文消息体（base64；兼容旧的数字数组）。
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "bytes_wire_opt"
+    )]
     pub payload: Option<Vec<u8>>,
 }
 
@@ -204,7 +292,8 @@ pub struct StoredMessage {
     pub msg_id: String,
     /// 接收方 peer_id（按此分类队列）。
     pub to_peer_id: String,
-    /// 应用层加密后的消息内容（含文本与时间）。
+    /// 应用层加密后的消息内容（含文本与时间；base64，兼容旧的数字数组）。
+    #[serde(with = "bytes_wire_vec")]
     pub msg: Vec<u8>,
 }
 
@@ -350,6 +439,27 @@ mod tests {
         let a = pad_plaintext(&[1u8; 10]);
         let b = pad_plaintext(&[1u8; 200]);
         assert_eq!(a.len(), b.len(), "同桶内长度应一致");
+    }
+
+    #[test]
+    fn payload_goes_base64_on_the_wire() {
+        let req =
+            MailboxRequest::queue_send("00112233445566778899aabbccddeeff", vec![1, 2, 3], "sig");
+        let value = serde_json::to_value(&req).unwrap();
+        assert!(
+            value["payload"].is_string(),
+            "payload should serialize as a base64 string, got {}",
+            value["payload"]
+        );
+        let back: MailboxRequest = serde_json::from_value(value).unwrap();
+        assert_eq!(back.payload.as_deref(), Some(&[1u8, 2, 3][..]));
+    }
+
+    #[test]
+    fn legacy_byte_array_still_parses() {
+        let json = r#"{"op":"queue_send","queue":"00112233445566778899aabbccddeeff","payload":[1,2,3],"sig":"s"}"#;
+        let req: MailboxRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.payload.as_deref(), Some(&[1u8, 2, 3][..]));
     }
 
     #[test]
