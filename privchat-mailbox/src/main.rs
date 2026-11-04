@@ -260,165 +260,151 @@ async fn handle_request(
         Ok(r) => r,
         Err(e) => return err(&format!("bad request: {e}")),
     };
-    if matches!(req.op, Op::Sync | Op::SyncAck)
-        && !handler
-            .peers
-            .lock()
-            .await
-            .iter()
-            .any(|peer| peer == remote_id)
-    {
+    if matches!(req.op, Op::Sync | Op::SyncAck) && !is_trusted_peer(handler, remote_id).await {
         return err("mailbox sync forbidden: sender is not a configured peer");
     }
 
     match req.op {
         Op::Ping => ok(),
-        Op::Peers => {
-            let known: Vec<String> = handler.peers.lock().await.clone();
+        Op::Peers => peers_response(handler).await,
+        Op::Put => handle_put(handler, req).await,
+        Op::Fetch => handle_fetch(handler, remote_id, req).await,
+        Op::Sync => handle_sync(handler, req).await,
+        Op::SyncAck => handle_sync_ack(handler, req).await,
+    }
+}
+
+/// 只有配置过的 peer 才能发网格同步（防止任意客户端伪造删除/注入）。
+async fn is_trusted_peer(handler: &MailboxHandler, remote_id: &str) -> bool {
+    handler
+        .peers
+        .lock()
+        .await
+        .iter()
+        .any(|peer| peer == remote_id)
+}
+
+/// PEX：把已知 mailbox 列表回给请求方。
+async fn peers_response(handler: &MailboxHandler) -> MailboxResponse {
+    let known: Vec<String> = handler.peers.lock().await.clone();
+    MailboxResponse {
+        ok: true,
+        error: None,
+        messages: None,
+        peers: Some(known),
+    }
+}
+
+/// `put`：验 PoW → 落库 → 后台广播同步（不阻塞响应，避免客户端超时回滚棘轮）。
+async fn handle_put(handler: &MailboxHandler, req: MailboxRequest) -> MailboxResponse {
+    let msg = match StoredMessage::from_request(&req) {
+        Ok(msg) => msg,
+        Err(e) => return err(&e.to_string()),
+    };
+    if msg.msg.len() > MAX_PAYLOAD {
+        return err("payload too large");
+    }
+    let nonce = req.nonce.unwrap_or(0);
+    if !privchat_mailbox::verify_pow(&msg.to_peer_id, &msg.msg, nonce) {
+        return err("pow verification failed");
+    }
+    match handler.store.put(msg.clone(), now_ms()).await {
+        Ok(_) => {
+            // true = 新增；false = msg_id 已存在，幂等。两种都广播一次，
+            // 多跳链路由「已存在不再广播」自然截断。
+            broadcast(handler, Op::Sync, Some(msg), None, None).await;
+            ok()
+        }
+        Err(e) => err(&format!("store failed: {e}")),
+    }
+}
+
+/// `fetch`：只能拉自己身份的队列（防「取回即删」式 DoS），取回后广播删除。
+async fn handle_fetch(
+    handler: &MailboxHandler,
+    remote_id: &str,
+    req: MailboxRequest,
+) -> MailboxResponse {
+    let recipient = match req.for_peer {
+        Some(r) => r,
+        None => return err("fetch missing for"),
+    };
+    if recipient != remote_id {
+        return err("fetch forbidden: queue belongs to another identity");
+    }
+    match handler.store.fetch(&recipient).await {
+        Ok(messages) => {
+            if !messages.is_empty() {
+                let ids: Vec<String> = messages.iter().map(|m| m.msg_id.clone()).collect();
+                broadcast(handler, Op::SyncAck, None, Some(recipient), Some(ids)).await;
+            }
             MailboxResponse {
                 ok: true,
                 error: None,
-                messages: None,
-                peers: Some(known),
+                messages: Some(messages),
+                peers: None,
             }
         }
-        Op::Put => match StoredMessage::from_request(&req) {
-            Ok(msg) => {
-                if msg.msg.len() > MAX_PAYLOAD {
-                    return err("payload too large");
-                }
-                // 防垃圾：校验工作量证明，不满足直接拒绝（不存储、不广播）。
-                let nonce = req.nonce.unwrap_or(0);
-                if !privchat_mailbox::verify_pow(&msg.to_peer_id, &msg.msg, nonce) {
-                    return err("pow verification failed");
-                }
-                match handler.store.put(msg.clone(), now_ms()).await {
-                    Ok(true) => {
-                        // 本地持久化后立即响应；网格同步转后台，避免慢 peer
-                        // 让客户端误判 PUT 超时并回滚发送棘轮。
-                        spawn_broadcast(
-                            handler.endpoint.clone(),
-                            handler.peers.lock().await.clone(),
-                            MailboxRequest {
-                                op: Op::Sync,
-                                msg: Some(msg),
-                                to: None,
-                                for_peer: None,
-                                id: None,
-                                ids: None,
-                                payload: None,
-                                nonce: None,
-                            },
-                        );
-                        ok()
-                    }
-                    Ok(false) => ok(), // msg_id 已存在，幂等
-                    Err(e) => err(&format!("store failed: {e}")),
-                }
-            }
-            Err(e) => err(&e.to_string()),
-        },
-        Op::Fetch => {
-            let recipient = match req.for_peer {
-                Some(r) => r,
-                None => return err("fetch missing for"),
-            };
-            // 队列归属认证：只能拉取自己身份的队列，防他人「取回即删」式 DoS。
-            if recipient != remote_id {
-                return err("fetch forbidden: queue belongs to another identity");
-            }
-            match handler.store.fetch(&recipient).await {
-                Ok(messages) => {
-                    // 取回即删：本节点已删除，向 peer 广播删除意图，
-                    // 网格同步清掉其他节点的副本。
-                    if !messages.is_empty() {
-                        let ids: Vec<String> = messages.iter().map(|m| m.msg_id.clone()).collect();
-                        spawn_broadcast(
-                            handler.endpoint.clone(),
-                            handler.peers.lock().await.clone(),
-                            MailboxRequest {
-                                op: Op::SyncAck,
-                                to: Some(recipient),
-                                ids: Some(ids),
-                                for_peer: None,
-                                id: None,
-                                payload: None,
-                                msg: None,
-                                nonce: None,
-                            },
-                        );
-                    }
-                    MailboxResponse {
-                        ok: true,
-                        error: None,
-                        messages: Some(messages),
-                        peers: None,
-                    }
-                }
-                Err(e) => err(&format!("fetch failed: {e}")),
-            }
-        }
-        Op::Sync => {
-            // 来自其他 mailbox 的同步广播：仅在**真正新增**时继续转发，
-            // msg_id 主键幂等保证每条消息每节点至多处理一次 → 多跳链路可通、
-            // 环路被截断（新增过一次后必为 0，不再广播）。
-            match req.msg {
-                Some(msg) => match handler.store.put(msg.clone(), now_ms()).await {
-                    Ok(true) => {
-                        spawn_broadcast(
-                            handler.endpoint.clone(),
-                            handler.peers.lock().await.clone(),
-                            MailboxRequest {
-                                op: Op::Sync,
-                                msg: Some(msg),
-                                to: None,
-                                for_peer: None,
-                                id: None,
-                                ids: None,
-                                payload: None,
-                                nonce: None,
-                            },
-                        );
-                        ok()
-                    }
-                    Ok(false) => ok(), // 已存在，幂等，不再转发
-                    Err(e) => err(&format!("store failed: {e}")),
-                },
-                None => err("sync missing msg"),
-            }
-        }
-        Op::SyncAck => {
-            let recipient = match req.to {
-                Some(t) => t,
-                None => return err("sync_ack missing to"),
-            };
-            let ids = req.ids.unwrap_or_default();
-            match handler.store.ack(&recipient, &ids).await {
-                Ok(deleted) => {
-                    // 本节点确实删除了消息才继续转发；否则说明已删除过，
-                    // 不再广播，切断环路。
-                    if deleted > 0 {
-                        spawn_broadcast(
-                            handler.endpoint.clone(),
-                            handler.peers.lock().await.clone(),
-                            MailboxRequest {
-                                op: Op::SyncAck,
-                                to: Some(recipient),
-                                ids: Some(ids),
-                                for_peer: None,
-                                id: None,
-                                payload: None,
-                                msg: None,
-                                nonce: None,
-                            },
-                        );
-                    }
-                    ok()
-                }
-                Err(e) => err(&format!("ack failed: {e}")),
-            }
-        }
+        Err(e) => err(&format!("fetch failed: {e}")),
     }
+}
+
+/// `sync`：节点间补副本。只有真正新增才继续转发（主键幂等 → 环路截断）。
+async fn handle_sync(handler: &MailboxHandler, req: MailboxRequest) -> MailboxResponse {
+    let msg = match req.msg {
+        Some(msg) => msg,
+        None => return err("sync missing msg"),
+    };
+    match handler.store.put(msg.clone(), now_ms()).await {
+        Ok(true) => {
+            broadcast(handler, Op::Sync, Some(msg), None, None).await;
+            ok()
+        }
+        Ok(false) => ok(),
+        Err(e) => err(&format!("store failed: {e}")),
+    }
+}
+
+/// `sync_ack`：删除同步。确实删掉了才继续转发，否则说明处理过，切断环路。
+async fn handle_sync_ack(handler: &MailboxHandler, req: MailboxRequest) -> MailboxResponse {
+    let recipient = match req.to {
+        Some(t) => t,
+        None => return err("sync_ack missing to"),
+    };
+    let ids = req.ids.unwrap_or_default();
+    match handler.store.ack(&recipient, &ids).await {
+        Ok(deleted) => {
+            if deleted > 0 {
+                broadcast(handler, Op::SyncAck, None, Some(recipient), Some(ids)).await;
+            }
+            ok()
+        }
+        Err(e) => err(&format!("ack failed: {e}")),
+    }
+}
+
+/// 后台向所有 peer 广播一条同步请求（不等待结果）。
+async fn broadcast(
+    handler: &MailboxHandler,
+    op: Op,
+    msg: Option<StoredMessage>,
+    to: Option<String>,
+    ids: Option<Vec<String>>,
+) {
+    spawn_broadcast(
+        handler.endpoint.clone(),
+        handler.peers.lock().await.clone(),
+        MailboxRequest {
+            op,
+            msg,
+            to,
+            for_peer: None,
+            id: None,
+            ids,
+            payload: None,
+            nonce: None,
+        },
+    );
 }
 
 /// 本地操作完成后在后台向所有 peer mailbox 并发广播，避免阻塞客户端响应。

@@ -118,6 +118,76 @@ use session::SessionMap;
 
 type SendQueues = Arc<Mutex<HashMap<(String, String), mpsc::UnboundedSender<SendJob>>>>;
 
+/// 恢复联系人、待绑定身份，并重新绑定各联系人的专属身份端点。
+async fn restore_contacts(
+    store: &crate::layers::store::Store,
+    transport: &Transport,
+) -> Result<(
+    Arc<Mutex<HashMap<String, Contact>>>,
+    Arc<Mutex<Vec<String>>>,
+    Arc<Mutex<HashMap<String, Vec<ChatMessage>>>>,
+)> {
+    let contacts = store.load_contacts()?;
+    let bound_ids: HashSet<String> = contacts
+        .values()
+        .map(|contact| contact.local_id.clone())
+        .collect();
+    let cutoff = now_ms().saturating_sub(super::store::UNBOUND_IDENTITY_TTL_MS);
+    for local_id in store.delete_expired_unbound_identities(&bound_ids, cutoff)? {
+        eprintln!("[app] removed expired unbound identity {local_id}");
+    }
+    let contacts = Arc::new(Mutex::new(contacts));
+    let history = Arc::new(Mutex::new(store.load_history()?));
+
+    // 待绑定身份：磁盘上已持久化、但未被任何联系人引用的专属身份。
+    let pending = Arc::new(Mutex::new(Vec::new()));
+    {
+        let mut pend = pending.lock().await;
+        for id in transport.local_ids().await {
+            let used = contacts.lock().await.values().any(|c| c.local_id == id);
+            if !used {
+                pend.push(id);
+            }
+        }
+    }
+
+    // 重启后重放已有联系人的专属身份与拨号注册。
+    for contact in contacts.lock().await.values().cloned().collect::<Vec<_>>() {
+        transport.ensure_identity(&contact.local_id).await?;
+        // 单边邀请建立的联系人可能没有对方票据，只能等对方先连。
+        let addr = contact.ticket.as_deref().unwrap_or(&contact.peer_id);
+        transport.connect_peer(&contact.local_id, addr).await?;
+    }
+
+    // mailbox 客户端：复用各联系人专属身份的 Endpoint。仅生产模式
+    // （relay）启动轮询；no-relay 集成测试不启用，避免后台任务持有
+    // 端口阻塞重启。
+    Ok((contacts, pending, history))
+}
+
+/// 读取 mailbox / 洋葱等设置（坏数据一律回退默认值，不阻塞启动）。
+fn load_settings(
+    store: &crate::layers::store::Store,
+) -> (
+    Arc<Mutex<Vec<String>>>,
+    Arc<AtomicUsize>,
+    Arc<Mutex<OnionConfig>>,
+) {
+    let peers = Arc::new(Mutex::new(store.load_mailbox_peers().unwrap_or_default()));
+    // 每条离线消息写入的 mailbox 节点数（0 = 全部已配置节点）。
+    let write_count = Arc::new(AtomicUsize::new(
+        store.load_mailbox_write_count().unwrap_or(0),
+    ));
+    let onion = Arc::new(Mutex::new(
+        store
+            .load_onion_config()
+            .ok()
+            .and_then(|json| serde_json::from_str::<OnionConfig>(&json).ok())
+            .unwrap_or_default(),
+    ));
+    (peers, write_count, onion)
+}
+
 /// L4 应用门面。
 #[derive(Clone)]
 pub struct App {
@@ -210,44 +280,8 @@ impl App {
             Transport::start_no_relay(store.clone()).await?
         };
 
-        let contacts = store.load_contacts()?;
-        let bound_ids: HashSet<String> = contacts
-            .values()
-            .map(|contact| contact.local_id.clone())
-            .collect();
-        let cutoff = now_ms().saturating_sub(super::store::UNBOUND_IDENTITY_TTL_MS);
-        for local_id in store.delete_expired_unbound_identities(&bound_ids, cutoff)? {
-            eprintln!("[app] removed expired unbound identity {local_id}");
-        }
-        let contacts = Arc::new(Mutex::new(contacts));
-        let history = Arc::new(Mutex::new(store.load_history()?));
-
-        // 待绑定身份：磁盘上已持久化、但未被任何联系人引用的专属身份。
-        let pending = Arc::new(Mutex::new(Vec::new()));
-        {
-            let mut pend = pending.lock().await;
-            for id in transport.local_ids().await {
-                let used = contacts.lock().await.values().any(|c| c.local_id == id);
-                if !used {
-                    pend.push(id);
-                }
-            }
-        }
-
-        // 重启后重放已有联系人的专属身份与拨号注册。
-        for contact in contacts.lock().await.values().cloned().collect::<Vec<_>>() {
-            transport.ensure_identity(&contact.local_id).await?;
-            // 单边邀请建立的联系人可能没有对方票据，只能等对方先连。
-            let addr = contact.ticket.as_deref().unwrap_or(&contact.peer_id);
-            transport.connect_peer(&contact.local_id, addr).await?;
-        }
-
-        // mailbox 客户端：复用各联系人专属身份的 Endpoint。仅生产模式
-        // （relay）启动轮询；no-relay 集成测试不启用，避免后台任务持有
-        // 端口阻塞重启。
-        let mailbox_peers = Arc::new(Mutex::new(store.load_mailbox_peers()?));
-        // 每条离线消息写入的 mailbox 节点数（0 = 全部已配置节点）。
-        let mailbox_write_count = Arc::new(AtomicUsize::new(store.load_mailbox_write_count()?));
+        let (contacts, pending, history) = restore_contacts(&store, &transport).await?;
+        let (mailbox_peers, mailbox_write_count, onion) = load_settings(&store);
 
         // 会话：从磁盘恢复（需要各专属身份私钥还原 root₀ 与链状态）。
         let session_map = session::load_map(&store, &store.load_identities()?);
@@ -257,13 +291,6 @@ impl App {
         let mailbox_poll_task = Arc::new(Mutex::new(None));
         let (stop_tx, _) = watch::channel(false);
         let worker_tasks = Arc::new(Mutex::new(Vec::new()));
-        let onion = Arc::new(Mutex::new(
-            store
-                .load_onion_config()
-                .ok()
-                .and_then(|json| serde_json::from_str::<OnionConfig>(&json).ok())
-                .unwrap_or_default(),
-        ));
 
         let app = Self {
             transport,
