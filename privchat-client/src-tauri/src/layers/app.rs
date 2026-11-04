@@ -62,10 +62,11 @@ impl App {
             Transport::start_no_relay(store.clone()).await?
         };
 
+        let mailbox_peers = Arc::new(Mutex::new(store.load_mailbox_peers().unwrap_or_default()));
+
         let queue_api = Arc::new(IrohQueues::new(transport.clone()));
         let links = Arc::new(LinkManager::load(store.clone(), queue_api).await?);
-
-        let mailbox_peers = Arc::new(Mutex::new(store.load_mailbox_peers().unwrap_or_default()));
+        links.set_pool(mailbox_peers.lock().await.clone()).await;
         let mailbox_write_count = Arc::new(AtomicUsize::new(
             store.load_mailbox_write_count().unwrap_or(0),
         ));
@@ -90,11 +91,9 @@ impl App {
 
     // ---- 连接 ----
 
-    /// 生成邀请：在**所有已配置 mailbox** 上建同一接收队列（多副本），
-    /// 返回 `(conn_id, 邀请串)`。
-    pub async fn create_connection(&self) -> Result<(String, String)> {
-        let mailboxes = self.mailbox_peers.lock().await.clone();
-        self.links.create(&mailboxes).await
+    /// 生成邀请：在 mailbox 上建接收队列，返回 `(conn_id, 邀请串)`。
+    pub async fn create_connection(&self, mailbox: &str) -> Result<(String, String)> {
+        self.links.create(mailbox).await
     }
 
     /// 互扫到对方邀请后配对。

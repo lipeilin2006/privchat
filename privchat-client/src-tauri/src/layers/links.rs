@@ -13,7 +13,9 @@ use ed25519_dalek::SigningKey;
 use iroh::Endpoint;
 use tokio::sync::Mutex;
 
-use crate::layers::connection::{self, Invite, Link, LinkState, OutQueue, QueueKeys};
+use crate::layers::connection::{
+    self, DrainingQueue, Invite, Link, LinkState, OutQueue, QueueKeys,
+};
 use crate::layers::crypto::connection::Connection as E2e;
 use crate::layers::mailbox::MailboxClient;
 use crate::layers::store::{ConnRow, Store};
@@ -48,6 +50,14 @@ pub trait QueueApi: Send + Sync {
         queue: &'a str,
         sig: &'a str,
     ) -> BoxFut<'a, Vec<Vec<u8>>>;
+
+    fn delete<'a>(
+        &'a self,
+        conn_id: &'a str,
+        mailbox: &'a str,
+        queue: &'a str,
+        sig: &'a str,
+    ) -> BoxFut<'a, ()>;
 }
 
 /// 生产实现：每个连接一条临时拨号端点（队列权限靠签名，不靠 TLS 身份）。
@@ -118,15 +128,40 @@ impl QueueApi for IrohQueues {
             Ok(rows.into_iter().map(|m| m.msg).collect())
         })
     }
+
+    fn delete<'a>(
+        &'a self,
+        conn_id: &'a str,
+        mailbox: &'a str,
+        queue: &'a str,
+        sig: &'a str,
+    ) -> BoxFut<'a, ()> {
+        Box::pin(async move {
+            let ep = self.endpoint(conn_id).await?;
+            MailboxClient::queue_delete(&ep, mailbox, queue, sig).await
+        })
+    }
 }
 
 pub struct LinkManager {
     store: Arc<Store>,
     api: Arc<dyn QueueApi>,
     links: Mutex<HashMap<String, Link>>,
+    /// 可用的 mailbox 池；轮换时依次换一台。
+    pool: Mutex<Vec<String>>,
 }
 
+/// 每多少条消息轮换一次入站队列。
+const ROTATE_EVERY: u32 = 500;
+/// 帧类型：0 = 文本，1 = 队列轮换通知。
+const FRAME_TEXT: u8 = 0;
+const FRAME_ROTATE: u8 = 1;
+
 impl LinkManager {
+    pub async fn set_pool(&self, mailboxes: Vec<String>) {
+        *self.pool.lock().await = mailboxes;
+    }
+
     pub async fn load(store: Arc<Store>, api: Arc<dyn QueueApi>) -> Result<Self> {
         let mut links = HashMap::new();
         for row in store.load_connections()? {
@@ -141,37 +176,23 @@ impl LinkManager {
             store,
             api,
             links: Mutex::new(links),
+            pool: Mutex::new(Vec::new()),
         })
     }
 
     /// 建连接：在 mailbox 上创建接收队列，返回 `(conn_id, 邀请串)`。
-    pub async fn create(&self, mailboxes: &[String]) -> Result<(String, String)> {
-        if mailboxes.is_empty() {
-            return Err(anyhow!("no mailbox configured"));
-        }
-        let (link, invite) = Link::create(mailboxes);
+    pub async fn create(&self, mailbox: &str) -> Result<(String, String)> {
+        let (link, invite) = Link::create(mailbox);
         let conn_id = unique_conn_id();
-        let mut ok = 0;
-        for mailbox in mailboxes {
-            match self
-                .api
-                .create(
-                    &conn_id,
-                    mailbox,
-                    &connection::hex_encode(&link.in_queue),
-                    &link.owner_keys.sender_pub_hex(),
-                    &link.owner_keys.owner_pub_hex(),
-                )
-                .await
-            {
-                Ok(()) => ok += 1,
-                // 单台失败不影响其它副本；已存在的队列（重试）也算成功。
-                Err(e) => eprintln!("[links] create queue on {mailbox} failed: {e}"),
-            }
-        }
-        if ok == 0 {
-            return Err(anyhow!("failed to create queue on any mailbox"));
-        }
+        self.api
+            .create(
+                &conn_id,
+                mailbox,
+                &connection::hex_encode(&link.in_queue),
+                &link.owner_keys.sender_pub_hex(),
+                &link.owner_keys.owner_pub_hex(),
+            )
+            .await?;
         self.persist(&conn_id, &link)?;
         self.links.lock().await.insert(conn_id.clone(), link);
         Ok((conn_id, invite.encode()))
@@ -189,8 +210,10 @@ impl LinkManager {
         Ok(())
     }
 
-    /// 发一条消息（必须先配对）。
+    /// 发一条消息（必须先配对）；到阈值先轮换入站队列。
     pub async fn send(&self, conn_id: &str, plaintext: &[u8]) -> Result<()> {
+        self.maybe_rotate(conn_id).await?;
+
         let mut links = self.links.lock().await;
         let link = links
             .get_mut(conn_id)
@@ -199,9 +222,12 @@ impl LinkManager {
             .out
             .clone()
             .ok_or_else(|| anyhow!("connection not paired yet"))?;
-        // 加密前做桶填充：同桶消息密文等长，削弱长度侧信道。
-        let padded = privchat_common::pad_plaintext(plaintext);
-        let blob = link.e2e.encrypt(&padded)?;
+        // 帧：类型(1) + 正文；填充后同桶等长。
+        let mut frame = Vec::with_capacity(plaintext.len() + 1);
+        frame.push(FRAME_TEXT);
+        frame.extend_from_slice(plaintext);
+        let blob = link.e2e.encrypt(&privchat_common::pad_plaintext(&frame))?;
+        link.sent_since_rotate += 1;
         self.persist(conn_id, link)?;
         drop(links);
 
@@ -210,47 +236,146 @@ impl LinkManager {
             &blob,
             &SigningKey::from_bytes(&out.sender_sk),
         );
-        // 多副本：写成功任意一台即可；其余失败只记日志。
-        let mut ok = 0;
-        for mailbox in &out.mailboxes {
-            match self
-                .api
-                .send(
-                    conn_id,
-                    mailbox,
-                    &connection::hex_encode(&out.queue_id),
-                    blob.clone(),
-                    &sig,
-                )
-                .await
-            {
-                Ok(()) => ok += 1,
-                Err(e) => eprintln!("[links] send via {mailbox} failed: {e}"),
-            }
+        self.api
+            .send(
+                conn_id,
+                &out.mailbox,
+                &connection::hex_encode(&out.queue_id),
+                blob,
+                &sig,
+            )
+            .await
+    }
+
+    /// 到阈值就换一条新入站队列（可以换到另一台 mailbox），并通知对方。
+    async fn maybe_rotate(&self, conn_id: &str) -> Result<()> {
+        let mut links = self.links.lock().await;
+        let Some(link) = links.get_mut(conn_id) else {
+            return Ok(());
+        };
+        if link.user_rotate == false && link.sent_since_rotate < ROTATE_EVERY {
+            return Ok(());
         }
-        if ok == 0 {
-            return Err(anyhow!("failed to deliver to any mailbox"));
-        }
+        let Some(out) = link.out.clone() else {
+            return Ok(());
+        };
+
+        // 选下一台 mailbox：优先换一台，池里只有一台就留在原地。
+        let pool = self.pool.lock().await.clone();
+        let next_mailbox = if pool.len() > 1 {
+            let pos = pool
+                .iter()
+                .position(|m| m == &link.in_mailbox)
+                .map(|i| (i + 1) % pool.len())
+                .unwrap_or(0);
+            pool[pos].clone()
+        } else {
+            link.in_mailbox.clone()
+        };
+
+        let keys = QueueKeys::generate();
+        let mut queue_id = [0u8; 16];
+        rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut queue_id);
+        self.api
+            .create(
+                conn_id,
+                &next_mailbox,
+                &connection::hex_encode(&queue_id),
+                &keys.sender_pub_hex(),
+                &keys.owner_pub_hex(),
+            )
+            .await?;
+
+        // 把新队列地址告诉对方（走 E2E，别人看不到）。
+        let new_out = OutQueue {
+            mailbox: next_mailbox.clone(),
+            queue_id,
+            sender_sk: keys.sender.to_bytes(),
+        };
+        let body = serde_json::to_vec(&new_out)?;
+        let mut frame = Vec::with_capacity(body.len() + 1);
+        frame.push(FRAME_ROTATE);
+        frame.extend_from_slice(&body);
+        let blob = link.e2e.encrypt(&privchat_common::pad_plaintext(&frame))?;
+        let sig = connection::sign_send(
+            &out.queue_id,
+            &blob,
+            &SigningKey::from_bytes(&out.sender_sk),
+        );
+        self.api
+            .send(
+                conn_id,
+                &out.mailbox,
+                &connection::hex_encode(&out.queue_id),
+                blob,
+                &sig,
+            )
+            .await?;
+
+        // 旧队列转入排空列表，新队列接管。
+        let old = std::mem::replace(&mut link.in_queue, queue_id);
+        let old_mailbox = std::mem::replace(&mut link.in_mailbox, next_mailbox);
+        let old_keys = std::mem::replace(&mut link.owner_keys, keys);
+        link.draining.push(DrainingQueue {
+            mailbox: old_mailbox,
+            queue_id: old,
+            keys: old_keys,
+            polls_left: 3,
+        });
+        link.sent_since_rotate = 0;
+        link.user_rotate = false;
+        self.persist(conn_id, link)?;
         Ok(())
     }
 
-    /// 取走并解密本连接入站队列的全部消息。
+    /// 手动触发一次轮换。
+    pub async fn rotate(&self, conn_id: &str) -> Result<()> {
+        {
+            let mut links = self.links.lock().await;
+            let link = links
+                .get_mut(conn_id)
+                .ok_or_else(|| anyhow!("unknown connection {conn_id}"))?;
+            link.user_rotate = true;
+        }
+        self.maybe_rotate(conn_id).await
+    }
+
+    /// 取走并解密本连接入站队列（含轮换中的旧队列）的全部消息。
     pub async fn poll(&self, conn_id: &str) -> Result<Vec<Vec<u8>>> {
-        let (mailboxes, queue, sig) = {
+        let (mut sources, had_draining) = {
             let links = self.links.lock().await;
             let link = links
                 .get(conn_id)
                 .ok_or_else(|| anyhow!("unknown connection {conn_id}"))?;
-            (
-                link.in_mailboxes.clone(),
-                connection::hex_encode(&link.in_queue),
+            let mut src = vec![(
+                link.in_mailbox.clone(),
+                link.in_queue,
                 connection::sign_get(&link.in_queue, &link.owner_keys.owner),
-            )
+            )];
+            for d in &link.draining {
+                src.push((
+                    d.mailbox.clone(),
+                    d.queue_id,
+                    connection::sign_get(&d.queue_id, &d.keys.owner),
+                ));
+            }
+            (src, !link.draining.is_empty())
         };
+
         let mut blobs = Vec::new();
-        for mailbox in &mailboxes {
-            match self.api.get(conn_id, mailbox, &queue, &sig).await {
-                Ok(mut rows) => blobs.append(&mut rows),
+        let mut empty: Vec<[u8; 16]> = Vec::new();
+        for (mailbox, queue, sig) in sources.drain(..) {
+            match self
+                .api
+                .get(conn_id, &mailbox, &connection::hex_encode(&queue), &sig)
+                .await
+            {
+                Ok(mut rows) => {
+                    if rows.is_empty() {
+                        empty.push(queue);
+                    }
+                    blobs.append(&mut rows);
+                }
                 Err(e) => eprintln!("[links] get from {mailbox} failed: {e}"),
             }
         }
@@ -260,10 +385,55 @@ impl LinkManager {
         let link = links
             .get_mut(conn_id)
             .ok_or_else(|| anyhow!("unknown connection {conn_id}"))?;
+
+        // 旧的排空队列：连续几次没消息就删掉。
+        if had_draining {
+            for d in link.draining.iter_mut() {
+                if empty.contains(&d.queue_id) {
+                    d.polls_left = d.polls_left.saturating_sub(1);
+                } else {
+                    d.polls_left = 3;
+                }
+            }
+            let (drop, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut link.draining)
+                .into_iter()
+                .partition(|d| d.polls_left == 0);
+            link.draining = keep;
+            for d in drop {
+                let sig = connection::sign_delete(&d.queue_id, &d.keys.owner);
+                if let Err(e) = self
+                    .api
+                    .delete(
+                        conn_id,
+                        &d.mailbox,
+                        &connection::hex_encode(&d.queue_id),
+                        &sig,
+                    )
+                    .await
+                {
+                    eprintln!("[links] delete drained queue failed: {e}");
+                }
+            }
+        }
+
         for blob in blobs {
-            match link.e2e.decrypt(&blob) {
-                Ok(plain) => out.push(privchat_common::unpad_plaintext(&plain)),
-                Err(e) => eprintln!("[links] decrypt failed: {e}"),
+            let plain = match link.e2e.decrypt(&blob) {
+                Ok(p) => privchat_common::unpad_plaintext(&p),
+                Err(e) => {
+                    eprintln!("[links] decrypt failed: {e}");
+                    continue;
+                }
+            };
+            match plain.first().copied() {
+                Some(FRAME_TEXT) => out.push(plain[1..].to_vec()),
+                Some(FRAME_ROTATE) => match serde_json::from_slice::<OutQueue>(&plain[1..]) {
+                    Ok(new_out) => {
+                        link.out = Some(new_out);
+                        self.persist(conn_id, link)?;
+                    }
+                    Err(e) => eprintln!("[links] bad rotate frame: {e}"),
+                },
+                _ => eprintln!("[links] unknown frame type"),
             }
         }
         self.persist(conn_id, link)?;
@@ -305,12 +475,9 @@ impl LinkManager {
             role: "peer".to_string(),
             state: state_str(link.state).to_string(),
             in_queue: connection::hex_encode(&link.in_queue),
-            in_mailbox: serde_json::to_string(&link.in_mailboxes)?,
+            in_mailbox: link.in_mailbox.clone(),
             out_queue: out.as_ref().map(|q| connection::hex_encode(&q.queue_id)),
-            out_mailbox: out
-                .as_ref()
-                .map(|q| serde_json::to_string(&q.mailboxes))
-                .transpose()?,
+            out_mailbox: out.as_ref().map(|q| q.mailbox.clone()),
             out_sender_sk: out.as_ref().map(|q| q.sender_sk.to_vec()),
             owner_sk: owner_sk.to_vec(),
             e2e_state: link.e2e.to_bytes(),
@@ -350,7 +517,7 @@ fn row_to_link(row: &ConnRow) -> Result<Link> {
         .map_err(|_| anyhow!("bad owner_sk"))?;
     let out = match (&row.out_queue, &row.out_mailbox, &row.out_sender_sk) {
         (Some(q), Some(m), Some(sk)) => Some(OutQueue {
-            mailboxes: serde_json::from_str(m).unwrap_or_else(|_| vec![m.clone()]),
+            mailbox: m.clone(),
             queue_id: connection::hex_decode(q)?
                 .as_slice()
                 .try_into()
@@ -364,12 +531,14 @@ fn row_to_link(row: &ConnRow) -> Result<Link> {
     };
     Ok(Link {
         in_queue,
-        in_mailboxes: serde_json::from_str(&row.in_mailbox)
-            .unwrap_or_else(|_| vec![row.in_mailbox.clone()]),
+        in_mailbox: row.in_mailbox.clone(),
         owner_keys: QueueKeys::from_bytes([0u8; 32], owner_sk),
         out,
         e2e,
         state: state_from_str(&row.state),
+        sent_since_rotate: 0,
+        user_rotate: false,
+        draining: Vec::new(),
     })
 }
 
@@ -388,31 +557,20 @@ mod tests {
     #[derive(Default)]
     struct MemQueues {
         queues: StdMutex<HashMap<String, MemQueue>>,
-        /// 这些 mailbox 上的操作直接失败，用来模拟单台故障。
-        broken: StdMutex<Vec<String>>,
-    }
-
-    impl MemQueues {
-        fn key(mailbox: &str, queue: &str) -> String {
-            format!("{mailbox}|{queue}")
-        }
-
-        fn fail(&self, mailbox: &str) -> bool {
-            self.broken.lock().unwrap().iter().any(|m| m == mailbox)
-        }
     }
 
     struct MemQueue {
         sender_pub: [u8; 32],
         owner_pub: [u8; 32],
         msgs: Vec<Vec<u8>>,
+        mailbox: String,
     }
 
     impl QueueApi for MemQueues {
         fn create<'a>(
             &'a self,
             _conn_id: &'a str,
-            mailbox: &'a str,
+            _mailbox: &'a str,
             queue: &'a str,
             sender_pub: &'a str,
             owner_pub: &'a str,
@@ -426,20 +584,17 @@ mod tests {
                     .as_slice()
                     .try_into()
                     .map_err(|_| anyhow!("bad owner"))?;
-                if self.fail(mailbox) {
-                    return Err(anyhow!("mailbox unavailable"));
-                }
                 let mut q = self.queues.lock().unwrap();
-                let key = Self::key(mailbox, queue);
-                if q.contains_key(&key) {
-                    return Ok(());
+                if q.contains_key(queue) {
+                    return Err(anyhow!("queue exists"));
                 }
                 q.insert(
-                    key,
+                    queue.to_string(),
                     MemQueue {
                         sender_pub: sender,
                         owner_pub: owner,
                         msgs: Vec::new(),
+                        mailbox: _mailbox.to_string(),
                     },
                 );
                 Ok(())
@@ -449,7 +604,7 @@ mod tests {
         fn send<'a>(
             &'a self,
             _conn_id: &'a str,
-            mailbox: &'a str,
+            _mailbox: &'a str,
             queue: &'a str,
             payload: Vec<u8>,
             sig: &'a str,
@@ -459,13 +614,8 @@ mod tests {
                     .as_slice()
                     .try_into()
                     .map_err(|_| anyhow!("bad queue"))?;
-                if self.fail(mailbox) {
-                    return Err(anyhow!("mailbox unavailable"));
-                }
                 let mut q = self.queues.lock().unwrap();
-                let item = q
-                    .get_mut(&Self::key(mailbox, queue))
-                    .ok_or_else(|| anyhow!("no queue"))?;
+                let item = q.get_mut(queue).ok_or_else(|| anyhow!("no queue"))?;
                 if !connection::verify(
                     &item.sender_pub,
                     connection::DOMAIN_SEND,
@@ -480,10 +630,33 @@ mod tests {
             })
         }
 
+        fn delete<'a>(
+            &'a self,
+            _conn_id: &'a str,
+            _mailbox: &'a str,
+            queue: &'a str,
+            sig: &'a str,
+        ) -> BoxFut<'a, ()> {
+            Box::pin(async move {
+                let qid: [u8; 16] = connection::hex_decode(queue)?
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| anyhow!("bad queue"))?;
+                let mut q = self.queues.lock().unwrap();
+                let item = q.get(queue).ok_or_else(|| anyhow!("no queue"))?;
+                if !connection::verify(&item.owner_pub, connection::DOMAIN_DELETE, &qid, None, sig)
+                {
+                    return Err(anyhow!("bad signature"));
+                }
+                q.remove(queue);
+                Ok(())
+            })
+        }
+
         fn get<'a>(
             &'a self,
             _conn_id: &'a str,
-            mailbox: &'a str,
+            _mailbox: &'a str,
             queue: &'a str,
             sig: &'a str,
         ) -> BoxFut<'a, Vec<Vec<u8>>> {
@@ -492,13 +665,8 @@ mod tests {
                     .as_slice()
                     .try_into()
                     .map_err(|_| anyhow!("bad queue"))?;
-                if self.fail(mailbox) {
-                    return Err(anyhow!("mailbox unavailable"));
-                }
                 let mut q = self.queues.lock().unwrap();
-                let item = q
-                    .get_mut(&Self::key(mailbox, queue))
-                    .ok_or_else(|| anyhow!("no queue"))?;
+                let item = q.get_mut(queue).ok_or_else(|| anyhow!("no queue"))?;
                 if !connection::verify(&item.owner_pub, connection::DOMAIN_GET, &qid, None, sig) {
                     return Err(anyhow!("bad signature"));
                 }
@@ -517,32 +685,69 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn multi_mailbox_redundancy() {
+    async fn queue_rotation_switches_mailbox() {
         let api = Arc::new(MemQueues::default());
-        // 第二台一开始就挂着，验证「一台故障仍可用」。
-        api.broken.lock().unwrap().push("m2".to_string());
-        let a = manager(api.clone() as Arc<dyn QueueApi>, "ma").await;
-        let b = manager(api.clone() as Arc<dyn QueueApi>, "mb").await;
-
-        let mailboxes = vec!["m1".to_string(), "m2".to_string()];
-        let (a_id, a_invite) = a.create(&mailboxes).await.expect("a create");
-        let (b_id, b_invite) = b.create(&mailboxes).await.expect("b create");
+        let a = manager(api.clone() as Arc<dyn QueueApi>, "ra").await;
+        let b = manager(api.clone() as Arc<dyn QueueApi>, "rb").await;
+        let (a_id, a_invite) = a.create("m1").await.expect("a create");
+        let (b_id, b_invite) = b.create("m1").await.expect("b create");
         a.accept(&a_id, &b_invite).await.expect("a accept");
         b.accept(&b_id, &a_invite).await.expect("b accept");
 
-        // m2 全挂，m1 仍能收发。
-        a.send(&a_id, b"via m1").await.expect("a send");
-        assert_eq!(b.poll(&b_id).await.unwrap(), vec![b"via m1".to_vec()]);
+        // 两台 mailbox 的池子：轮换时切到第二台。
+        a.set_pool(vec!["m1".to_string(), "m2".to_string()]).await;
+        a.rotate(&a_id).await.expect("rotate");
 
-        // 恢复 m2 后，消息会同时写两台；接收端只解出一条（重放被拒）。
-        api_recover(&api, "m2");
-        a.send(&a_id, b"both").await.expect("a send");
-        let got = b.poll(&b_id).await.unwrap();
-        assert_eq!(got, vec![b"both".to_vec()]);
+        // A 的入站队列应该已经切到 m2。
+        {
+            let links = a.links.lock().await;
+            let link = links.get(&a_id).expect("link");
+            assert_eq!(link.in_mailbox, "m2");
+            assert_eq!(link.draining.len(), 1);
+        }
+
+        // B 取一次，收到轮换通知，把出站队列切到 A 的新队列。
+        let _ = b.poll(&b_id).await.expect("b poll");
+        b.send(&b_id, b"hi new queue").await.expect("b send");
+        assert_eq!(a.poll(&a_id).await.unwrap(), vec![b"hi new queue".to_vec()]);
+
+        // 旧队列连续几次没消息后应被删除。
+        let old_queue = a.links.lock().await[&a_id].draining[0].queue_id;
+        let old_hex = connection::hex_encode(&old_queue);
+        for _ in 0..4 {
+            let _ = a.poll(&a_id).await.expect("poll drain");
+        }
+        assert!(
+            !api.queues.lock().unwrap().contains_key(&old_hex),
+            "old queue must be deleted after draining"
+        );
     }
 
-    fn api_recover(api: &Arc<MemQueues>, mailbox: &str) {
-        api.broken.lock().unwrap().retain(|m| m != mailbox);
+    #[tokio::test]
+    async fn auto_rotation_after_threshold() {
+        let api = Arc::new(MemQueues::default());
+        let a = manager(api.clone() as Arc<dyn QueueApi>, "aa").await;
+        let b = manager(api as Arc<dyn QueueApi>, "ab").await;
+        let (a_id, a_invite) = a.create("m1").await.expect("a create");
+        let (b_id, b_invite) = b.create("m1").await.expect("b create");
+        a.accept(&a_id, &b_invite).await.expect("a accept");
+        b.accept(&b_id, &a_invite).await.expect("b accept");
+
+        for i in 0..=(ROTATE_EVERY as usize) {
+            a.send(&a_id, format!("m{i}").as_bytes())
+                .await
+                .expect("send");
+        }
+        // 阈值到了自动轮换：旧队列进排空列表。
+        let draining = {
+            let links = a.links.lock().await;
+            links[&a_id].draining.len()
+        };
+        assert_eq!(
+            draining, 1,
+            "expected one rotation after {} sends",
+            ROTATE_EVERY
+        );
     }
 
     #[tokio::test]
@@ -551,9 +756,8 @@ mod tests {
         let a = manager(api.clone() as Arc<dyn QueueApi>, "a").await;
         let b = manager(api as Arc<dyn QueueApi>, "b").await;
 
-        let mb = vec!["mb".to_string()];
-        let (a_id, a_invite) = a.create(&mb).await.expect("a create");
-        let (b_id, b_invite) = b.create(&mb).await.expect("b create");
+        let (a_id, a_invite) = a.create("mb").await.expect("a create");
+        let (b_id, b_invite) = b.create("mb").await.expect("b create");
         a.accept(&a_id, &b_invite).await.expect("a accept");
         b.accept(&b_id, &a_invite).await.expect("b accept");
 

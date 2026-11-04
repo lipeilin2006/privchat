@@ -475,10 +475,13 @@ struct ConnectionMessage {
 
 /// 新协议：生成邀请（同时在该 mailbox 上创建接收队列）。
 #[tauri::command]
-async fn create_connection(state: State<'_, AppState>) -> Result<(String, String), String> {
+async fn create_connection(
+    mailbox: String,
+    state: State<'_, AppState>,
+) -> Result<(String, String), String> {
     state
         .require_app()?
-        .create_connection()
+        .create_connection(&mailbox)
         .await
         .map_err(|e| e.to_string())
 }

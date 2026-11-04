@@ -10,7 +10,7 @@ export const api = {
 
 
   // 新协议：连接（没有「联系人」实体，只有连接 + 备注）
-  createConnection: () => invoke("create_connection"),
+  createConnection: (mailbox) => invoke("create_connection", { mailbox }),
   acceptConnection: (connId, invite) =>
     invoke("accept_connection", { connId, invite }),
   sendOnConnection: (connId, text) =>

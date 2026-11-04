@@ -22,8 +22,7 @@ export default function MyIdPage({ onClose, onAdded, notify }) {
         notify(t("noMailbox"), "err");
         return;
       }
-      // 在所有已配置节点上建同一队列（多副本）。
-      const [id, text] = await api.createConnection();
+      const [id, text] = await api.createConnection(mailboxes[0]);
       setConnId(id);
       setMyId(text);
       setQr(await QRCode.toDataURL(text, { width: 220, margin: 1 }));
