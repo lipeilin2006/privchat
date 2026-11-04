@@ -34,7 +34,9 @@ use iroh::endpoint::Connection;
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::SecretKey;
 
-use privchat_common::{MailboxRequest, MailboxResponse, Op, StoredMessage, ALPN, MAX_PAYLOAD};
+use privchat_common::{
+    hex_decode, MailboxRequest, MailboxResponse, Op, StoredMessage, ALPN, MAX_PAYLOAD,
+};
 use privchat_onion::{peel, ONION_ALPN};
 
 use crate::store::MailboxStore;
@@ -261,34 +263,11 @@ async fn handle_request(
 /// 队列操作的签名域分隔。
 const QUEUE_SEND_DOMAIN: &[u8] = b"privchat/queue/send/v1";
 
-fn hex_val(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
-}
-
-fn hex_decode(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
-        return None;
-    }
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len() / 2);
-    for i in (0..bytes.len()).step_by(2) {
-        out.push((hex_val(bytes[i])? << 4) | hex_val(bytes[i + 1])?);
-    }
-    Some(out)
-}
-
-/// 用 Ed25519 公钥（32B）验签；`msg` 由调用方拼好域分隔。
-/// 队列 id 必须是 32 位 hex（16 字节），签名按原始字节算。
 fn queue_bytes(q: &str) -> Option<[u8; 16]> {
     if q.len() != 32 {
         return None;
     }
-    hex_decode(q)?.as_slice().try_into().ok()
+    hex_decode(q).ok()?.as_slice().try_into().ok()
 }
 
 fn verify_sig(pubkey: &[u8], msg: &[u8], sig_hex: &str) -> bool {
@@ -298,7 +277,7 @@ fn verify_sig(pubkey: &[u8], msg: &[u8], sig_hex: &str) -> bool {
     let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(&pk) else {
         return false;
     };
-    let Some(sig_bytes) = hex_decode(sig_hex) else {
+    let Ok(sig_bytes) = hex_decode(sig_hex) else {
         return false;
     };
     let Ok(sig_arr) = <[u8; 64]>::try_from(sig_bytes.as_slice()) else {
@@ -318,7 +297,7 @@ async fn handle_queue_create(handler: &MailboxHandler, req: MailboxRequest) -> M
     if queue_bytes(&queue).is_none() || sender_auth.len() != 64 || owner_auth.len() != 64 {
         return err("queue_create: bad field length");
     }
-    let (Some(sender), Some(owner)) = (hex_decode(&sender_auth), hex_decode(&owner_auth)) else {
+    let (Ok(sender), Ok(owner)) = (hex_decode(&sender_auth), hex_decode(&owner_auth)) else {
         return err("queue_create: bad hex");
     };
     match handler
@@ -435,10 +414,6 @@ fn short_id(id: &str) -> &str {
 /// 单个洋葱包上限：内层载荷 64KB + 每层 94B 开销，留足余量。
 /// 中继按此上限读取，避免恶意客户端用 16MB 包做内存放大。
 const ONION_PACKET_MAX: usize = 128 * 1024;
-
-/// 单节点邻居表上限，防止 PEX 无限膨胀。
-
-/// 单次同步的重试次数（网络抖动时重试；逻辑拒绝不重试）。
 
 fn ok() -> MailboxResponse {
     MailboxResponse {

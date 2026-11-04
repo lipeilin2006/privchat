@@ -16,19 +16,10 @@ use super::store::{ConnMessage, Store};
 use super::transport::Transport;
 
 /// 洋葱路由配置。
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct OnionConfig {
     pub enabled: bool,
     pub relays: Vec<String>,
-}
-
-impl Default for OnionConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            relays: Vec::new(),
-        }
-    }
 }
 
 /// L4 应用门面。
@@ -56,7 +47,7 @@ impl App {
 
     async fn start_inner(data_dir: PathBuf, use_relay: bool, key: [u8; 32]) -> Result<Self> {
         let store = Arc::new(Store::open(&data_dir, key)?);
-        let (transport, _rx) = if use_relay {
+        let transport = if use_relay {
             Transport::start(store.clone()).await?
         } else {
             Transport::start_no_relay(store.clone()).await?

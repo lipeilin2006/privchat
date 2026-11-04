@@ -38,10 +38,10 @@ async fn two_clients_over_real_mailbox() {
     std::fs::create_dir_all(&dir_b).unwrap();
     let store_a = Arc::new(Store::open(&dir_a, KEY).expect("store a"));
     let store_b = Arc::new(Store::open(&dir_b, KEY).expect("store b"));
-    let (transport_a, _rx_a) = Transport::start_no_relay(store_a.clone())
+    let transport_a = Transport::start_no_relay(store_a.clone())
         .await
         .expect("transport a");
-    let (transport_b, _rx_b) = Transport::start_no_relay(store_b.clone())
+    let transport_b = Transport::start_no_relay(store_b.clone())
         .await
         .expect("transport b");
 

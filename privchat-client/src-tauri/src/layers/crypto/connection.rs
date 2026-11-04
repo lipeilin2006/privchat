@@ -576,20 +576,12 @@ mod tests {
 
     #[test]
     fn third_party_cannot_open() {
-        let (_a, mut b) = pair();
-        let (mut other, _p) = Connection::unpaired();
-        let _ = other;
-        let m = {
-            let (mut a, _p2) = Connection::unpaired();
-            let (mut x, xp) = Connection::unpaired();
-            let (mut y, yp) = Connection::unpaired();
-            a.pair_with(&yp).unwrap();
-            x.pair_with(&_p2).unwrap();
-            let _ = y;
-            let _ = b;
-            a.encrypt(b"secret").unwrap()
-        };
-        assert!(b.decrypt(&m).is_err());
+        // 一对合法连接，加一个完全无关的第三方。
+        let (mut a, mut b) = pair();
+        let (mut other, _other_pub) = Connection::unpaired();
+        let m = a.encrypt(b"secret").unwrap();
+        assert!(other.decrypt(&m).is_err());
+        assert!(b.decrypt(&m).is_ok());
     }
 
     #[test]

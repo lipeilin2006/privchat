@@ -36,6 +36,39 @@ fn pow_input(to: &str, payload: &[u8], nonce: u64) -> Vec<u8> {
 }
 
 /// 校验 nonce 是否满足 PoW 难度。
+/// 十六进制编码（小写）。
+pub fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+/// 十六进制解码；长度奇数或含非法字符时报错。
+pub fn hex_decode(s: &str) -> Result<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return Err(anyhow!("odd hex length"));
+    }
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len() / 2);
+    for pair in b.chunks(2) {
+        let hi = hex_val(pair[0]).ok_or_else(|| anyhow!("bad hex digit"))?;
+        let lo = hex_val(pair[1]).ok_or_else(|| anyhow!("bad hex digit"))?;
+        out.push((hi << 4) | lo);
+    }
+    Ok(out)
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
 pub fn verify_pow(to: &str, payload: &[u8], nonce: u64) -> bool {
     let digest = Sha256::digest(pow_input(to, payload, nonce));
     digest[..POW_DIFFICULTY].iter().all(|&b| b == 0)
@@ -374,8 +407,8 @@ mod tests {
 
     #[test]
     fn pad_hides_length() {
-        let a = pad_plaintext(&vec![1u8; 10]);
-        let b = pad_plaintext(&vec![1u8; 200]);
+        let a = pad_plaintext(&[1u8; 10]);
+        let b = pad_plaintext(&[1u8; 200]);
         assert_eq!(a.len(), b.len(), "同桶内长度应一致");
     }
 

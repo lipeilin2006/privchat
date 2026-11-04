@@ -1,9 +1,12 @@
 const A = "a".repeat(64);
 const B = "b".repeat(64);
-const contacts = [
-  { peer_id: A, name: "小鲸鱼", local_id: "l1" },
-  { peer_id: B, name: "测试联系人", local_id: "l2" },
+
+// 新协议：没有联系人实体，只有连接（conn_id + 备注）。
+const connections = [
+  { conn_id: A, name: "小鲸鱼", state: "established" },
+  { conn_id: B, name: "测试连接", state: "established" },
 ];
+
 const history = {
   [A]: [
     { id: "1", from: "peer", text: "姐姐在干嘛呀～", time: Date.now() - 600000, status: "received" },
@@ -20,10 +23,18 @@ export async function invoke(cmd, args) {
         initialized: true,
         unlocked: !new URLSearchParams(window.location.search).has("locked"),
       };
-    case "list_contacts":
-      return contacts;
-    case "get_history":
-      return history[args.peerId] || [];
+    case "list_connections":
+      return connections;
+    case "connection_history":
+      return history[args.connId] || [];
+    case "poll_connection":
+      return [];
+    case "create_connection":
+      return [A, "px1:mockinvite"];
+    case "accept_connection":
+    case "send_on_connection":
+    case "rename_connection":
+      return null;
     case "get_mailbox_peers":
       return [B];
     case "get_mailbox_write_count":
@@ -32,8 +43,6 @@ export async function invoke(cmd, args) {
       return { enabled: true, relays: [B, A] };
     case "get_auto_lock_minutes":
       return 5;
-    case "get_self_ticket":
-      return A;
     default:
       return null;
   }

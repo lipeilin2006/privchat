@@ -1,6 +1,7 @@
 use super::*;
 use crate::store::MailboxStore;
 
+#[allow(dead_code)]
 fn temp_db(name: &str) -> PathBuf {
     let dir =
         std::env::temp_dir().join(format!("privchat-mailbox-db-{name}-{}", std::process::id()));
@@ -30,7 +31,7 @@ async fn queue_create_send_get_delete() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let store = MailboxStore::open(dir.join("mb.db"), 0).expect("open");
-    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+    let _endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
         .secret_key(iroh::SecretKey::generate())
         .alpns(vec![ALPN.to_vec()])
         .bind()

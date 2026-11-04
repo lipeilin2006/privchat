@@ -11,6 +11,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 
+pub use super::crypto::hex::{hex_decode, hex_encode};
+
 /// 邀请串前缀。
 const PREFIX: &str = "px1:";
 /// 队列操作的签名域（必须与 mailbox 端一致）。
@@ -219,31 +221,6 @@ fn random_signing_key() -> SigningKey {
     let mut seed = [0u8; 32];
     rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut seed);
     SigningKey::from_bytes(&seed)
-}
-
-pub fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-pub fn hex_decode(s: &str) -> Result<Vec<u8>> {
-    if s.len() % 2 != 0 {
-        return Err(anyhow!("odd hex length"));
-    }
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len() / 2);
-    for i in (0..b.len()).step_by(2) {
-        out.push((hex_val(b[i])? << 4) | hex_val(b[i + 1])?);
-    }
-    Ok(out)
-}
-
-fn hex_val(b: u8) -> Result<u8> {
-    match b {
-        b'0'..=b'9' => Ok(b - b'0'),
-        b'a'..=b'f' => Ok(b - b'a' + 10),
-        b'A'..=b'F' => Ok(b - b'A' + 10),
-        _ => Err(anyhow!("invalid hex char")),
-    }
 }
 
 /// 轮换出去的旧入站队列：再轮询几次确认排空后删除。

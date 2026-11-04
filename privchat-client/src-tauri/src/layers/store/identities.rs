@@ -37,7 +37,7 @@ impl Store {
         }
         Ok(out)
     }
-    /// 删除一个专属身份私钥（删除联系人时调用）。
+    /// 删除一条拨号身份的私钥（连接删除后清理）。
     pub fn delete_identity(&self, local_id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
