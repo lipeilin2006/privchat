@@ -13,16 +13,13 @@ Cargo workspace 里，二进制与协议共用一份代码。
 
 | 能力 | 说明 |
 |---|---|
-| **端到端加密** | 双棘轮 + AEAD（ChaCha20-Poly1305），发送失败不推进密钥链 |
-| **每联系人独立身份** | 每个联系人一个 SecretKey / Endpoint，跨联系人不可关联 |
-| **邮箱投递** | 消息先加密再交给 mailbox 节点，节点只见密文，取回即删 |
-| **多副本冗余** | 每条消息可配置「最多成功推送节点数」（默认 3） |
+| **端到端加密** | 每连接独立 X25519 + 对称棘轮 + AEAD（ChaCha20-Poly1305），每 100 条换整条链 |
+| **没有长期身份** | 连接密钥一次一换，跨连接不可关联；联系人只是本端备注 |
+| **单向队列** | 每条队列绑定一台 mailbox，邀请即写权限，取回即删 |
+| **队列轮换** | 每 500 条消息换一条新队列（可换节点），旧队列排空后删除 |
 | **洋葱路由** | 多层加密逐跳转发，中继只知邻居，不知全貌 |
-| **网格同步** | mailbox 之间广播同步、失败重试、新节点补推 |
-| **邻居自动扩充** | PEX：节点周期性交换邻居列表，自动组网 |
 | **本地保险箱** | SQLCipher 全库加密，密码解锁，支持自动锁定 |
 | **跨平台** | Android / Windows / macOS / Linux（Tauri 2） |
-| **命令行客户端** | 文本、图片、洋葱路径，可在无 GUI 环境端到端验证 |
 
 ---
 
@@ -33,27 +30,25 @@ Cargo workspace 里，二进制与协议共用一份代码。
 │                        privchat-client                       │
 │  Tauri 2 + React 18 + @telegram-apps/telegram-ui              │
 │                                                              │
-│   L2   app      身份 / 联系人 / 历史 / 发送队列               │
-│   L2.5 crypto   双棘轮 E2EE（ChaCha20-Poly1305）             │
-│   L1.5 mailbox  mailbox 客户端：put_multi / fetch            │
+│   L2   app      连接 / 备注 / 消息历史 / 轮询                 │
+│   L2.5 crypto   每连接 DH + 对称棘轮 + 每 100 条换钥          │
+│   L1.5 mailbox  队列客户端：create / send / get / delete      │
 │   L0.5 store    SQLCipher 本地持久化                          │
-│   L1   transport iroh QUIC（生产模式只拨号，不再 P2P 收发）   │
+│   L1   transport iroh QUIC（每条连接一条临时拨号身份）        │
 └───────────────┬─────────────────────────────────────────────┘
-                │  put / fetch（密文）
+                │  队列操作（密文 + Ed25519 签名）
                 ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                      privchat-mailbox                        │
-│  按接收方 peer_id 分类的密文队列（SQLite，取回即删）          │
+│  按 queue_id 分类的密文队列（SQLite，取回即删）               │
 │  ├─ role = mailbox / relay / both                            │
-│  ├─ PEX：邻居自动扩充（默认 60s）                              │
-│  └─ 同步：Sync 广播 + 3 次重试 + 新节点补推                    │
+│  └─ 节点之间不需要同步（每条队列只属于一台节点）               │
 └───────────────┬─────────────────────────────────────────────┘
                 │  ONION_ALPN（可选）
                 ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                       privchat-onion                         │
 │  wrap(relays, payload) 倒序套层 → peel() 逐跳剥离            │
-│  每层：eph_pub(32) | nonce(12) | AEAD(next(32)|len(2)|inner) │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -76,7 +71,7 @@ privchat/
 │   └── dev/                    无浏览器 UI 测试（puppeteer + mock）
 │
 ├── privchat-common/            wire 协议 / PoW / ALPN
-├── privchat-mailbox/           离线消息节点（角色 / PEX / 同步）
+├── privchat-mailbox/           队列节点（角色 / TTL / 洋葱中继）
 ├── privchat-onion/             洋葱路由封装与剥离
 ├── scripts/                    一键构建脚本
 └── README.md
@@ -159,17 +154,16 @@ bash scripts/build-android-arm64.sh
 节点同时看到「发送方」和「收件人队列」，洋葱匿名性失效。
 
 环境变量：`PRIVCHAT_MAILBOX_DATA_DIR`、`PRIVCHAT_MAILBOX_ROLE`、
-`PRIVCHAT_MAILBOX_TTL_SECS`、`PRIVCHAT_MAILBOX_PEERS`、
-`PRIVCHAT_MAILBOX_PEX_SECS`。
+`PRIVCHAT_MAILBOX_TTL_SECS`、`PRIVCHAT_MAILBOX_ONION_PEERS`。
 
 ---
 
 ## 🔐 安全模型
 
-- **无主身份**：每个联系人独立 SecretKey + Endpoint，跨联系人不关联。
-- **前向保密**：双棘轮按条推进密钥；失败不提交，收方跳过窗口自愈乱序。
-- **最小暴露**：mailbox 只存 `(to_peer_id, msg_id, ciphertext)`，不存发送方。
-- **统一投递**：客户端不再直连对端，减少 IP 暴露面；所有消息经 mailbox。
+- **没有长期身份**：每条连接一套临时密钥，跨连接不可关联。
+- **前向保密**：链密钥按条推进，每 100 条换整条链；派生后丢弃 root。
+- **最小暴露**：mailbox 只存 `(queue_id, ciphertext)`，不存发送方。
+- **统一投递**：客户端只连 mailbox，不直连对端。
 - **可选洋葱**：多层加密逐跳转发；中继无法得知完整路径与内容。
 - **本地加密**：SQLCipher 全库加密，密钥由密码派生，明文不落盘。
 
@@ -194,16 +188,17 @@ npm run uitest
 ## ⚠️ 已知限制
 
 - 洋葱投递目前是**单向**的：没有匿名回程，终点只接受 `put`
-- 未做固定长度分片/填充，包长会泄漏跳数与大致内容长度
+- 洋葱投递未做固定长度分片，首跳仍能看到上传者的 TLS 身份
 - 未实现路径选择策略与守卫节点，恶意中继可做流量关联
-- PEX 只扩充邻居表，不做历史消息的全量反熵同步
-- GUI 尚未迁移：消息搜索、会话信息面板
+- 单队列绑一台 mailbox：节点故障期间不可达（靠 TTL 与轮换兜底）
+- 元数据：时间、大小、同一连接的两条队列仍可被节点关联
+- GUI 尚未实现：消息搜索、会话信息面板
 
 ---
 
 ## 📚 文档
 
-- [privchat-mailbox/CONFIG.md](privchat-mailbox/CONFIG.md) — 节点配置、角色、PEX
+- [privchat-mailbox/CONFIG.md](privchat-mailbox/CONFIG.md) — 节点配置、角色、TTL
 - [docs/SECURITY.md](docs/SECURITY.md) — 威胁模型、安全审查与抗追踪分析
 
 ---

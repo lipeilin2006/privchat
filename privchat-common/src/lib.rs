@@ -86,21 +86,23 @@ pub struct MailboxRequest {
     pub sender_auth: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_auth: Option<String>,
-    /// 队列操作签名（hex，Ed25519）。
+    /// 队列读/删的签名（hex）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sig: Option<String>,
 }
 
 impl MailboxRequest {
-    pub fn put(to: &str, id: &str, payload: Vec<u8>, nonce: u64) -> Self {
+    /// 创建接收队列。
+    /// 健康检查。
+    pub fn ping() -> Self {
         Self {
-            op: Op::Put,
-            to: Some(to.to_string()),
+            op: Op::Ping,
+            to: None,
             for_peer: None,
-            id: Some(id.to_string()),
+            id: None,
             ids: None,
-            payload: Some(payload),
-            nonce: Some(nonce),
+            payload: None,
+            nonce: None,
             msg: None,
             queue: None,
             sender_auth: None,
@@ -109,7 +111,6 @@ impl MailboxRequest {
         }
     }
 
-    /// 创建接收队列。
     pub fn queue_create(queue: &str, sender_auth: &str, owner_auth: &str) -> Self {
         Self {
             op: Op::QueueCreate,
@@ -145,24 +146,6 @@ impl MailboxRequest {
         }
     }
 
-    /// 取走队列消息（`sig` 覆盖 `queue`）。
-    pub fn queue_get(queue: &str, sig: &str) -> Self {
-        Self {
-            op: Op::QueueGet,
-            to: None,
-            for_peer: None,
-            id: None,
-            ids: None,
-            payload: None,
-            nonce: None,
-            msg: None,
-            queue: Some(queue.to_string()),
-            sender_auth: None,
-            owner_auth: None,
-            sig: Some(sig.to_string()),
-        }
-    }
-
     /// 删除队列（`sig` 覆盖 `queue`）。
     pub fn queue_delete(queue: &str, sig: &str) -> Self {
         Self {
@@ -181,10 +164,10 @@ impl MailboxRequest {
         }
     }
 
-    /// 邻居交换请求：索取对方已知的 mailbox 列表。
-    pub fn peers() -> Self {
+    /// 取走队列消息（`sig` 覆盖 `queue`）。
+    pub fn queue_get(queue: &str, sig: &str) -> Self {
         Self {
-            op: Op::Peers,
+            op: Op::QueueGet,
             to: None,
             for_peer: None,
             id: None,
@@ -192,27 +175,10 @@ impl MailboxRequest {
             payload: None,
             nonce: None,
             msg: None,
-            queue: None,
+            queue: Some(queue.to_string()),
             sender_auth: None,
             owner_auth: None,
-            sig: None,
-        }
-    }
-
-    pub fn fetch(for_peer: &str) -> Self {
-        Self {
-            op: Op::Fetch,
-            to: None,
-            for_peer: Some(for_peer.to_string()),
-            id: None,
-            ids: None,
-            payload: None,
-            nonce: None,
-            msg: None,
-            queue: None,
-            sender_auth: None,
-            owner_auth: None,
-            sig: None,
+            sig: Some(sig.to_string()),
         }
     }
 }
@@ -220,13 +186,7 @@ impl MailboxRequest {
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum Op {
-    Put,
-    Fetch,
     Ping,
-    /// 邻居交换：请求方询问节点已知的 mailbox 列表（PEX）。
-    Peers,
-    Sync,
-    SyncAck,
     /// 创建单向接收队列（邀请创建方调用）。
     QueueCreate,
     /// 向队列投递一条密文（发送方需用 sender key 签名）。
@@ -246,9 +206,6 @@ pub struct MailboxResponse {
     /// fetch 命中的待收密文。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub messages: Option<Vec<StoredMessage>>,
-    /// `peers` 操作返回的已知 mailbox 列表（PEX）。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub peers: Option<Vec<String>>,
 }
 
 /// 存储在邮箱里的密文消息。`to_peer_id` 是接收方的专属身份（各联系人
@@ -424,13 +381,12 @@ mod tests {
 
     #[test]
     fn request_roundtrip_serde() {
-        let req = MailboxRequest::put("to-peer", "msg-1", vec![1, 2, 3], 42);
+        let req =
+            MailboxRequest::queue_send("00112233445566778899aabbccddeeff", vec![1, 2, 3], "sig");
         let bytes = serde_json::to_vec(&req).unwrap();
         let back: MailboxRequest = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(back.op, Op::Put);
-        assert_eq!(back.to.as_deref(), Some("to-peer"));
-        assert_eq!(back.id.as_deref(), Some("msg-1"));
+        assert_eq!(back.op, Op::QueueSend);
         assert_eq!(back.payload.as_deref(), Some(&[1u8, 2, 3][..]));
-        assert_eq!(back.nonce, Some(42));
+        assert_eq!(back.sig.as_deref(), Some("sig"));
     }
 }

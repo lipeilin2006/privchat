@@ -43,9 +43,6 @@ use crate::store::MailboxStore;
 #[derive(Debug, Clone)]
 struct MailboxHandler {
     store: MailboxStore,
-    endpoint: iroh::Endpoint,
-    /// 其他 mailbox 节点的 peer_id（全连通/链式/环状均可）。
-    peers: Arc<tokio::sync::Mutex<Vec<String>>>,
 }
 
 impl ProtocolHandler for MailboxHandler {
@@ -111,7 +108,6 @@ impl ProtocolHandler for OnionHandler {
                         ok: false,
                         error: Some("this node is mailbox-only: refusing to relay".into()),
                         messages: None,
-                        peers: None,
                     };
                     let _ = send
                         .write_all(&serde_json::to_vec(&response).unwrap_or_default())
@@ -126,7 +122,6 @@ impl ProtocolHandler for OnionHandler {
                             ok: false,
                             error: Some("next hop is not in the onion allowlist".into()),
                             messages: None,
-                            peers: None,
                         };
                         let _ = send
                             .write_all(&serde_json::to_vec(&response).unwrap_or_default())
@@ -156,7 +151,6 @@ impl ProtocolHandler for OnionHandler {
                         ok: true,
                         error: None,
                         messages: None,
-                        peers: None,
                     },
                     Ok(resp) => MailboxResponse {
                         ok: false,
@@ -165,13 +159,11 @@ impl ProtocolHandler for OnionHandler {
                             resp.error.unwrap_or_default()
                         )),
                         messages: None,
-                        peers: None,
                     },
                     Err(error) => MailboxResponse {
                         ok: false,
                         error: Some(format!("relay to {next} failed: {error:#}")),
                         messages: None,
-                        peers: None,
                     },
                 };
                 let wrote = send
@@ -186,7 +178,6 @@ impl ProtocolHandler for OnionHandler {
                         ok: false,
                         error: Some("this node is relay-only: refusing terminal delivery".into()),
                         messages: None,
-                        peers: None,
                     };
                     let _ = send
                         .write_all(&serde_json::to_vec(&response).unwrap_or_default())
@@ -208,7 +199,6 @@ impl ProtocolHandler for OnionHandler {
                     ok: false,
                     error: Some(format!("onion peel failed: {error:#}")),
                     messages: None,
-                    peers: None,
                 };
                 let _ = send
                     .write_all(&serde_json::to_vec(&response).unwrap_or_default())
@@ -258,17 +248,9 @@ async fn handle_request(
         Ok(r) => r,
         Err(e) => return err(&format!("bad request: {e}")),
     };
-    if matches!(req.op, Op::Sync | Op::SyncAck) && !is_trusted_peer(handler, remote_id).await {
-        return err("mailbox sync forbidden: sender is not a configured peer");
-    }
-
+    let _ = remote_id;
     match req.op {
         Op::Ping => ok(),
-        Op::Peers => peers_response(handler).await,
-        Op::Put => handle_put(handler, req).await,
-        Op::Fetch => handle_fetch(handler, remote_id, req).await,
-        Op::Sync => handle_sync(handler, req).await,
-        Op::SyncAck => handle_sync_ack(handler, req).await,
         Op::QueueCreate => handle_queue_create(handler, req).await,
         Op::QueueSend => handle_queue_send(handler, req).await,
         Op::QueueGet => handle_queue_get(handler, req).await,
@@ -402,7 +384,6 @@ async fn handle_queue_get(handler: &MailboxHandler, req: MailboxRequest) -> Mail
                     })
                     .collect(),
             ),
-            peers: None,
         },
         Err(e) => err(&format!("queue_get failed: {e}")),
     }
@@ -428,143 +409,6 @@ async fn handle_queue_delete(handler: &MailboxHandler, req: MailboxRequest) -> M
         Ok(_) => ok(),
         Err(e) => err(&format!("queue_delete failed: {e}")),
     }
-}
-
-/// 只有配置过的 peer 才能发网格同步（防止任意客户端伪造删除/注入）。
-async fn is_trusted_peer(handler: &MailboxHandler, remote_id: &str) -> bool {
-    handler
-        .peers
-        .lock()
-        .await
-        .iter()
-        .any(|peer| peer == remote_id)
-}
-
-/// PEX：把已知 mailbox 列表回给请求方。
-async fn peers_response(handler: &MailboxHandler) -> MailboxResponse {
-    let known: Vec<String> = handler.peers.lock().await.clone();
-    MailboxResponse {
-        ok: true,
-        error: None,
-        messages: None,
-        peers: Some(known),
-    }
-}
-
-/// `put`：验 PoW → 落库 → 后台广播同步（不阻塞响应，避免客户端超时回滚棘轮）。
-async fn handle_put(handler: &MailboxHandler, req: MailboxRequest) -> MailboxResponse {
-    let msg = match StoredMessage::from_request(&req) {
-        Ok(msg) => msg,
-        Err(e) => return err(&e.to_string()),
-    };
-    if msg.msg.len() > MAX_PAYLOAD {
-        return err("payload too large");
-    }
-    let nonce = req.nonce.unwrap_or(0);
-    if !privchat_common::verify_pow(&msg.to_peer_id, &msg.msg, nonce) {
-        return err("pow verification failed");
-    }
-    match handler.store.put(msg.clone(), now_ms()).await {
-        Ok(_) => {
-            // true = 新增；false = msg_id 已存在，幂等。两种都广播一次，
-            // 多跳链路由「已存在不再广播」自然截断。
-            broadcast(handler, Op::Sync, Some(msg), None, None).await;
-            ok()
-        }
-        Err(e) => err(&format!("store failed: {e}")),
-    }
-}
-
-/// `fetch`：只能拉自己身份的队列（防「取回即删」式 DoS），取回后广播删除。
-async fn handle_fetch(
-    handler: &MailboxHandler,
-    remote_id: &str,
-    req: MailboxRequest,
-) -> MailboxResponse {
-    let recipient = match req.for_peer {
-        Some(r) => r,
-        None => return err("fetch missing for"),
-    };
-    if recipient != remote_id {
-        return err("fetch forbidden: queue belongs to another identity");
-    }
-    match handler.store.fetch(&recipient).await {
-        Ok(messages) => {
-            if !messages.is_empty() {
-                let ids: Vec<String> = messages.iter().map(|m| m.msg_id.clone()).collect();
-                broadcast(handler, Op::SyncAck, None, Some(recipient), Some(ids)).await;
-            }
-            MailboxResponse {
-                ok: true,
-                error: None,
-                messages: Some(messages),
-                peers: None,
-            }
-        }
-        Err(e) => err(&format!("fetch failed: {e}")),
-    }
-}
-
-/// `sync`：节点间补副本。只有真正新增才继续转发（主键幂等 → 环路截断）。
-async fn handle_sync(handler: &MailboxHandler, req: MailboxRequest) -> MailboxResponse {
-    let msg = match req.msg {
-        Some(msg) => msg,
-        None => return err("sync missing msg"),
-    };
-    match handler.store.put(msg.clone(), now_ms()).await {
-        Ok(true) => {
-            broadcast(handler, Op::Sync, Some(msg), None, None).await;
-            ok()
-        }
-        Ok(false) => ok(),
-        Err(e) => err(&format!("store failed: {e}")),
-    }
-}
-
-/// `sync_ack`：删除同步。确实删掉了才继续转发，否则说明处理过，切断环路。
-async fn handle_sync_ack(handler: &MailboxHandler, req: MailboxRequest) -> MailboxResponse {
-    let recipient = match req.to {
-        Some(t) => t,
-        None => return err("sync_ack missing to"),
-    };
-    let ids = req.ids.unwrap_or_default();
-    match handler.store.ack(&recipient, &ids).await {
-        Ok(deleted) => {
-            if deleted > 0 {
-                broadcast(handler, Op::SyncAck, None, Some(recipient), Some(ids)).await;
-            }
-            ok()
-        }
-        Err(e) => err(&format!("ack failed: {e}")),
-    }
-}
-
-/// 后台向所有 peer 广播一条同步请求（不等待结果）。
-async fn broadcast(
-    handler: &MailboxHandler,
-    op: Op,
-    msg: Option<StoredMessage>,
-    to: Option<String>,
-    ids: Option<Vec<String>>,
-) {
-    spawn_broadcast(
-        handler.endpoint.clone(),
-        handler.peers.lock().await.clone(),
-        MailboxRequest {
-            op,
-            msg,
-            to,
-            for_peer: None,
-            id: None,
-            ids,
-            payload: None,
-            nonce: None,
-            queue: None,
-            sender_auth: None,
-            owner_auth: None,
-            sig: None,
-        },
-    );
 }
 
 /// 本地操作完成后在后台向所有 peer mailbox 并发广播，避免阻塞客户端响应。
@@ -593,157 +437,14 @@ fn short_id(id: &str) -> &str {
 const ONION_PACKET_MAX: usize = 128 * 1024;
 
 /// 单节点邻居表上限，防止 PEX 无限膨胀。
-const MAX_PEERS: usize = 64;
-
-/// 邻居交换（PEX）：定期向已知 mailbox 询问它们认识谁，自动扩充列表并落盘。
-///
-/// - 只向**当前已知**的节点询问，不接受陌生人主动推送 → 信任沿已有边扩散
-/// - 只接受 64 位十六进制、非自身、未重复的 id
-/// - 有新节点才重写 `mailboxes.json`
-fn spawn_peer_exchange(
-    endpoint: iroh::Endpoint,
-    peers: Arc<tokio::sync::Mutex<Vec<String>>>,
-    data_dir: PathBuf,
-    store: MailboxStore,
-) {
-    let interval_secs: u64 = std::env::var("PRIVCHAT_MAILBOX_PEX_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|v| *v >= 5)
-        .unwrap_or(60);
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
-        loop {
-            ticker.tick().await;
-            let current = peers.lock().await.clone();
-            if current.is_empty() {
-                continue;
-            }
-            let self_id = endpoint.id().to_string();
-            let mut added: Vec<String> = Vec::new();
-            for peer in current {
-                let request = MailboxRequest::peers();
-                let Ok(response) = privchat_common::send_request(&endpoint, &peer, &request).await
-                else {
-                    continue;
-                };
-                if !response.ok {
-                    continue;
-                }
-                let Some(known) = response.peers else {
-                    continue;
-                };
-                let mut list = peers.lock().await;
-                for id in known {
-                    if id == self_id {
-                        continue;
-                    }
-                    if id.len() != 64 || !id.chars().all(|c| c.is_ascii_hexdigit()) {
-                        continue;
-                    }
-                    if list.iter().any(|existing| existing == &id) {
-                        continue;
-                    }
-                    if list.len() >= MAX_PEERS {
-                        break;
-                    }
-                    list.push(id.clone());
-                    added.push(id);
-                }
-            }
-            if !added.is_empty() {
-                let snapshot = peers.lock().await.clone();
-                if let Ok(json) = serde_json::to_string_pretty(&snapshot) {
-                    if let Err(error) = std::fs::write(data_dir.join("mailboxes.json"), json) {
-                        eprintln!("[mailbox] failed to persist peers: {error}");
-                    }
-                }
-                eprintln!("[mailbox] PEX learned {} peer(s): {added:?}", added.len());
-                // 给新邻居补推本节点已有的消息，避免它空着（限量，后台执行）。
-                let messages = store.list_all(200).await.unwrap_or_default();
-                for peer in &added {
-                    for msg in &messages {
-                        let request = MailboxRequest {
-                            op: Op::Sync,
-                            to: None,
-                            for_peer: None,
-                            id: None,
-                            ids: None,
-                            payload: None,
-                            nonce: None,
-                            msg: Some(msg.clone()),
-                            queue: None,
-                            sender_auth: None,
-                            owner_auth: None,
-                            sig: None,
-                        };
-                        let _ = sync_with_retry(&endpoint, peer, &request).await;
-                    }
-                }
-            }
-        }
-    });
-}
 
 /// 单次同步的重试次数（网络抖动时重试；逻辑拒绝不重试）。
-const SYNC_ATTEMPTS: usize = 3;
-
-fn spawn_broadcast(endpoint: iroh::Endpoint, peers: Vec<String>, req: MailboxRequest) {
-    tokio::spawn(async move {
-        let mut requests = tokio::task::JoinSet::new();
-        let req = Arc::new(req);
-        for peer in peers {
-            let endpoint = endpoint.clone();
-            let req = Arc::clone(&req);
-            requests.spawn(async move {
-                let result = sync_with_retry(&endpoint, &peer, req.as_ref()).await;
-                (peer, result)
-            });
-        }
-        while let Some(result) = requests.join_next().await {
-            match result {
-                Ok((peer, Err(e))) => eprintln!("[mailbox] sync to {peer} failed: {e:#}"),
-                Err(e) => eprintln!("[mailbox] sync task failed: {e}"),
-                Ok((_, Ok(()))) => {}
-            }
-        }
-    });
-}
-
-/// 带指数退避的同步：网络错误重试，逻辑拒绝（resp.ok=false）直接放弃。
-async fn sync_with_retry(
-    endpoint: &iroh::Endpoint,
-    peer: &str,
-    req: &MailboxRequest,
-) -> Result<()> {
-    let mut last_error = None;
-    for attempt in 1..=SYNC_ATTEMPTS {
-        match privchat_common::send_request(endpoint, peer, req).await {
-            Ok(response) if response.ok => return Ok(()),
-            Ok(response) => {
-                return Err(anyhow!(
-                    "sync rejected by {peer}: {}",
-                    response.error.unwrap_or_default()
-                ))
-            }
-            Err(error) => {
-                last_error = Some(error);
-                if attempt < SYNC_ATTEMPTS {
-                    tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64))
-                        .await;
-                }
-            }
-        }
-    }
-    Err(last_error.unwrap_or_else(|| anyhow!("sync failed")))
-}
 
 fn ok() -> MailboxResponse {
     MailboxResponse {
         ok: true,
         error: None,
         messages: None,
-        peers: None,
     }
 }
 
@@ -752,7 +453,6 @@ fn err(e: &str) -> MailboxResponse {
         ok: false,
         error: Some(e.to_string()),
         messages: None,
-        peers: None,
     }
 }
 
@@ -897,8 +597,6 @@ pub async fn run() -> Result<()> {
 
     let mailbox_handler = MailboxHandler {
         store: store.clone(),
-        endpoint: endpoint.clone(),
-        peers: peers.clone(),
     };
 
     // P2：角色分离。relay 只转发洋葱、不落库；mailbox 只存取、不参与中继；
@@ -923,14 +621,6 @@ pub async fn run() -> Result<()> {
         },
     );
     let router = router_builder.spawn();
-
-    // 邻居自动扩充：周期向已知节点询问它们的邻居列表。
-    spawn_peer_exchange(
-        endpoint.clone(),
-        peers.clone(),
-        data_dir.clone(),
-        store.clone(),
-    );
 
     // 到期消息清理任务：按 TTL/4 频率（夹在 1 分钟 ~ 1 小时）周期清除。
     if ttl_secs > 0 {
@@ -1010,11 +700,7 @@ pub async fn spawn_test_node(dir: &std::path::Path, ttl_secs: u64) -> Result<Tes
         .alpns(vec![ALPN.to_vec()])
         .bind()
         .await?;
-    let handler = MailboxHandler {
-        store,
-        endpoint: endpoint.clone(),
-        peers: Arc::new(tokio::sync::Mutex::new(Vec::new())),
-    };
+    let handler = MailboxHandler { store };
     let router = Router::builder(endpoint.clone())
         .accept(ALPN, handler)
         .spawn();
