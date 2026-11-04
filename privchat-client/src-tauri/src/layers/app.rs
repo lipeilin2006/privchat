@@ -292,9 +292,8 @@ impl App {
         let session_map = session::load_map(&store, &store.load_identities()?);
         let sessions = Arc::new(Mutex::new(session_map));
         let queue_api = Arc::new(crate::layers::links::IrohQueues::new(transport.clone()));
-        let links = Arc::new(
-            crate::layers::links::LinkManager::load(store.clone(), queue_api).await?,
-        );
+        let links =
+            Arc::new(crate::layers::links::LinkManager::load(store.clone(), queue_api).await?);
         let send_queues = Arc::new(Mutex::new(HashMap::new()));
         let mailbox_poll_started = Arc::new(AtomicBool::new(false));
         let mailbox_poll_task = Arc::new(Mutex::new(None));

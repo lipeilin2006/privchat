@@ -450,14 +450,6 @@ mod tests {
         LinkManager::load(store, api).await.expect("load links")
     }
 
-    fn futures_block_on<F: Future>(f: F) -> F::Output {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(f)
-    }
-
     #[tokio::test]
     async fn mutual_scan_end_to_end() {
         let api = Arc::new(MemQueues::default());

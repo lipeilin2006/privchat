@@ -288,15 +288,18 @@ pub async fn send_request(
     peer_id: &str,
     req: &MailboxRequest,
 ) -> Result<MailboxResponse> {
-    let addr_id: iroh::EndpointId = peer_id
-        .parse()
-        .map_err(|_| anyhow!("invalid peer id: {peer_id}"))?;
-    let conn = tokio::time::timeout(
-        REQUEST_TIMEOUT,
-        endpoint.connect(iroh::EndpointAddr::new(addr_id), ALPN),
-    )
-    .await
-    .map_err(|_| anyhow!("connect to {peer_id} timed out"))??;
+    // 允许传 EndpointTicket（带地址，无 DNS 环境用）或纯 peer_id。
+    let addr = if let Ok(ticket) = peer_id.parse::<iroh_tickets::endpoint::EndpointTicket>() {
+        ticket.endpoint_addr().clone()
+    } else {
+        let addr_id: iroh::EndpointId = peer_id
+            .parse()
+            .map_err(|_| anyhow!("invalid peer id or ticket: {peer_id}"))?;
+        iroh::EndpointAddr::new(addr_id)
+    };
+    let conn = tokio::time::timeout(REQUEST_TIMEOUT, endpoint.connect(addr, ALPN))
+        .await
+        .map_err(|_| anyhow!("connect to {peer_id} timed out"))??;
     let (mut send, mut recv) = conn.open_bi().await?;
     send.write_all(&serde_json::to_vec(req)?).await?;
     send.finish()?;

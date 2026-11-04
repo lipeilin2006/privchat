@@ -38,13 +38,26 @@ pub struct Invite {
 
 impl Invite {
     /// 编码为 `px1:` + base64url。
+    ///
+    /// `mailbox` 既可以是 64 位 hex 的 peer_id，也可以是一整张 EndpointTicket
+    /// （无 DNS 环境）；用 1 字节 tag 区分。
     pub fn encode(&self) -> String {
-        let mut body = Vec::with_capacity(112 + self.ticket.as_ref().map_or(0, |t| t.len() + 2));
+        let mut body = Vec::with_capacity(200);
         body.extend_from_slice(&self.queue_id);
         body.extend_from_slice(&self.ek);
         body.extend_from_slice(&self.sender_sk);
-        let mailbox = hex_decode(&self.mailbox).unwrap_or_else(|_| vec![0u8; 32]);
-        body.extend_from_slice(&mailbox);
+        match hex_decode(&self.mailbox) {
+            Ok(bytes) if bytes.len() == 32 => {
+                body.push(0);
+                body.extend_from_slice(&bytes);
+            }
+            _ => {
+                body.push(1);
+                let raw = self.mailbox.as_bytes();
+                body.extend_from_slice(&(raw.len() as u16).to_be_bytes());
+                body.extend_from_slice(raw);
+            }
+        }
         let ticket = self.ticket.as_deref().unwrap_or_default().as_bytes();
         body.extend_from_slice(&(ticket.len() as u16).to_be_bytes());
         body.extend_from_slice(ticket);
@@ -60,27 +73,57 @@ impl Invite {
         let bytes = URL_SAFE_NO_PAD
             .decode(raw)
             .map_err(|_| anyhow!("invite is not valid base64"))?;
-        if bytes.len() < 112 + 2 {
+        if bytes.len() < 81 + 1 {
             return Err(anyhow!("invite too short: {}", bytes.len()));
         }
         let queue_id: [u8; 16] = bytes[..16].try_into().unwrap();
         let ek: [u8; 32] = bytes[16..48].try_into().unwrap();
         let sender_sk: [u8; 32] = bytes[48..80].try_into().unwrap();
-        let mailbox_bytes: [u8; 32] = bytes[80..112].try_into().unwrap();
-        let ticket_len = u16::from_be_bytes([bytes[112], bytes[113]]) as usize;
-        if bytes.len() != 114 + ticket_len {
+        let mut pos = 80;
+        let tag = bytes[pos];
+        pos += 1;
+        let mailbox = match tag {
+            0 => {
+                let raw = bytes
+                    .get(pos..pos + 32)
+                    .ok_or_else(|| anyhow!("truncated mailbox id"))?;
+                pos += 32;
+                hex_encode(raw)
+            }
+            1 => {
+                let len = u16::from_be_bytes([
+                    *bytes.get(pos).ok_or_else(|| anyhow!("truncated mailbox"))?,
+                    *bytes
+                        .get(pos + 1)
+                        .ok_or_else(|| anyhow!("truncated mailbox"))?,
+                ]) as usize;
+                pos += 2;
+                let raw = bytes
+                    .get(pos..pos + len)
+                    .ok_or_else(|| anyhow!("truncated mailbox"))?;
+                pos += len;
+                String::from_utf8(raw.to_vec()).map_err(|_| anyhow!("mailbox not utf8"))?
+            }
+            _ => return Err(anyhow!("bad mailbox tag")),
+        };
+        if bytes.len() < pos + 2 {
+            return Err(anyhow!("truncated ticket length"));
+        }
+        let ticket_len = u16::from_be_bytes([bytes[pos], bytes[pos + 1]]) as usize;
+        pos += 2;
+        if bytes.len() != pos + ticket_len {
             return Err(anyhow!("invite ticket length mismatch"));
         }
         let ticket = if ticket_len == 0 {
             None
         } else {
             Some(
-                String::from_utf8(bytes[114..].to_vec())
+                String::from_utf8(bytes[pos..].to_vec())
                     .map_err(|_| anyhow!("invite ticket is not utf8"))?,
             )
         };
         Ok(Self {
-            mailbox: hex_encode(&mailbox_bytes),
+            mailbox,
             queue_id,
             ek,
             sender_sk,

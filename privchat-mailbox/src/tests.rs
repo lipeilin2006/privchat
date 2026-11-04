@@ -179,7 +179,7 @@ async fn sync_ack_forbidden_for_non_mailbox_peer() {
         )
         .await
         .expect("put");
-    let endpoint = privchat_mailbox::make_endpoint(iroh::SecretKey::generate())
+    let endpoint = privchat_common::make_endpoint(iroh::SecretKey::generate())
         .await
         .expect("endpoint");
     let handler = MailboxHandler {
@@ -411,8 +411,9 @@ async fn queue_create_send_get_delete() {
 
     // 投递：签名覆盖 domain || queue || payload。
     let payload = b"queue-ciphertext".to_vec();
+    let qid: [u8; 16] = hex_decode(queue).unwrap().as_slice().try_into().unwrap();
     let mut msg = b"privchat/queue/send/v1".to_vec();
-    msg.extend_from_slice(queue.as_bytes());
+    msg.extend_from_slice(&qid);
     msg.extend_from_slice(&payload);
     let sig = hex_of(&sender.sign(&msg).to_bytes());
     let resp = handle_request(
@@ -441,7 +442,7 @@ async fn queue_create_send_get_delete() {
     // 用 sender 身份取走：拒绝（只有 owner 能取）。
     let get_msg = {
         let mut m = b"privchat/queue/get/v1".to_vec();
-        m.extend_from_slice(queue.as_bytes());
+        m.extend_from_slice(&qid);
         m
     };
     let wrong = hex_of(&sender.sign(&get_msg).to_bytes());
@@ -478,7 +479,7 @@ async fn queue_create_send_get_delete() {
     // 删除后队列不存在。
     let del_msg = {
         let mut m = b"privchat/queue/delete/v1".to_vec();
-        m.extend_from_slice(queue.as_bytes());
+        m.extend_from_slice(&qid);
         m
     };
     let del_sig = hex_of(&owner.sign(&del_msg).to_bytes());

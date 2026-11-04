@@ -4214,6 +4214,7 @@ dependencies = [
  "ndk-context",
  "pbkdf2",
  "privchat-common",
+ "privchat-mailbox",
  "privchat-onion",
  "rand_core 0.6.4",
  "rusqlite",
@@ -4235,6 +4236,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "iroh",
+ "iroh-tickets",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -4248,6 +4250,7 @@ dependencies = [
  "anyhow",
  "ed25519-dalek",
  "iroh",
+ "iroh-tickets",
  "privchat-common",
  "privchat-onion",
  "rusqlite",
