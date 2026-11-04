@@ -5,8 +5,8 @@
 //!
 //! 协议：每条 QUIC bi-stream 一次请求。客户端写入 JSON 的
 //! [`MailboxRequest`]，节点写回 JSON 的 [`MailboxResponse`]。
-//! 可选操作码见 [`Op`]：`put`/`fetch` 由客户端使用；
-//! `sync`/`sync_ack` 由节点间组网同步使用，`ping` 用于健康检查。
+//! 操作码见 [`Op`]：`ping` 健康检查，其余四个是单向队列的
+//! 建/写/取/删。节点之间没有同步协议。
 
 use anyhow::{anyhow, Result};
 use iroh::endpoint::presets;
@@ -23,7 +23,7 @@ pub const MAX_PAYLOAD: usize = 16 * 1024 * 1024;
 /// PoW 难度：`SHA-256(to || payload || nonce)` 摘要的前导零**字节**数。
 ///
 /// 平均约 `256^1 = 256` 次尝试，秒级完成，但足以把灌垃圾的成本抬高一个
-/// 数量级。仅客户端 → 节点 `put` 需要；节点间 `sync` 走内部通道，不验证。
+/// 数量级。当前队列协议用签名鉴权，尚未在 `QueueSend` 上强制执行 PoW。
 pub const POW_DIFFICULTY: usize = 1;
 
 /// 计算一次 PoW 挑战的摘要输入：`to || payload || nonce`（nonce 小端 8 字节）。
@@ -86,35 +86,17 @@ pub fn find_pow(to: &str, payload: &[u8]) -> u64 {
 }
 
 /// 请求方 → 节点请求。
+///
+/// 只带当前 op 需要的字段；其余留 `None`，serde 不序列化。
+/// `Default` 给的是 Ping 的空请求。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MailboxRequest {
     #[serde(rename = "op")]
     pub op: Op,
-    /// put 的接收方 peer_id / sync_ack 的目标接收方。
-    #[serde(rename = "to", default, skip_serializing_if = "Option::is_none")]
-    pub to: Option<String>,
-    /// fetch 的目标接收方 peer_id。
-    #[serde(rename = "for", default, skip_serializing_if = "Option::is_none")]
-    pub for_peer: Option<String>,
-    /// put 的消息 ID（发送方从加密头 (gen,n) 派生的逻辑发送序）。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
-    /// fetch 返回后广播删除 / sync_ack 的消息 ID 列表。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ids: Option<Vec<String>>,
-    /// put 的密文消息体。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub payload: Option<Vec<u8>>,
-    /// put 的工作量证明 nonce。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub nonce: Option<u64>,
-    /// sync 广播的完整消息。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub msg: Option<StoredMessage>,
-    /// 单向队列 id（16 字节，hex）。
+    /// 队列 id（16 字节，hex）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue: Option<String>,
-    /// 队列创建时登记的 sender 公钥 / owner 公钥（hex）。
+    /// 队列创建时登记的 sender / owner 公钥（hex）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender_auth: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -122,42 +104,38 @@ pub struct MailboxRequest {
     /// 队列读/删的签名（hex）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sig: Option<String>,
+    /// `QueueSend` 的密文消息体。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<Vec<u8>>,
 }
 
-impl MailboxRequest {
-    /// 创建接收队列。
-    /// 健康检查。
-    pub fn ping() -> Self {
+impl Default for MailboxRequest {
+    fn default() -> Self {
         Self {
             op: Op::Ping,
-            to: None,
-            for_peer: None,
-            id: None,
-            ids: None,
-            payload: None,
-            nonce: None,
-            msg: None,
             queue: None,
             sender_auth: None,
             owner_auth: None,
             sig: None,
+            payload: None,
         }
     }
+}
 
+impl MailboxRequest {
+    /// 健康检查。
+    pub fn ping() -> Self {
+        Self::default()
+    }
+
+    /// 创建接收队列。
     pub fn queue_create(queue: &str, sender_auth: &str, owner_auth: &str) -> Self {
         Self {
             op: Op::QueueCreate,
-            to: None,
-            for_peer: None,
-            id: None,
-            ids: None,
-            payload: None,
-            nonce: None,
-            msg: None,
             queue: Some(queue.to_string()),
             sender_auth: Some(sender_auth.to_string()),
             owner_auth: Some(owner_auth.to_string()),
-            sig: None,
+            ..Self::default()
         }
     }
 
@@ -165,17 +143,10 @@ impl MailboxRequest {
     pub fn queue_send(queue: &str, payload: Vec<u8>, sig: &str) -> Self {
         Self {
             op: Op::QueueSend,
-            to: None,
-            for_peer: None,
-            id: None,
-            ids: None,
-            payload: Some(payload),
-            nonce: None,
-            msg: None,
             queue: Some(queue.to_string()),
-            sender_auth: None,
-            owner_auth: None,
             sig: Some(sig.to_string()),
+            payload: Some(payload),
+            ..Self::default()
         }
     }
 
@@ -183,17 +154,9 @@ impl MailboxRequest {
     pub fn queue_delete(queue: &str, sig: &str) -> Self {
         Self {
             op: Op::QueueDelete,
-            to: None,
-            for_peer: None,
-            id: None,
-            ids: None,
-            payload: None,
-            nonce: None,
-            msg: None,
             queue: Some(queue.to_string()),
-            sender_auth: None,
-            owner_auth: None,
             sig: Some(sig.to_string()),
+            ..Self::default()
         }
     }
 
@@ -201,17 +164,9 @@ impl MailboxRequest {
     pub fn queue_get(queue: &str, sig: &str) -> Self {
         Self {
             op: Op::QueueGet,
-            to: None,
-            for_peer: None,
-            id: None,
-            ids: None,
-            payload: None,
-            nonce: None,
-            msg: None,
             queue: Some(queue.to_string()),
-            sender_auth: None,
-            owner_auth: None,
             sig: Some(sig.to_string()),
+            ..Self::default()
         }
     }
 }
@@ -236,14 +191,13 @@ pub struct MailboxResponse {
     pub ok: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// fetch 命中的待收密文。
+    /// `QueueGet` 命中的待收密文。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub messages: Option<Vec<StoredMessage>>,
 }
 
-/// 存储在邮箱里的密文消息。`to_peer_id` 是接收方的专属身份（各联系人
-/// 身份互不相同），节点按它分类队列；`from` 可省——队列只属于唯一一个
-/// 发送方，接收方由自己的 `local_id` 在联系人表唯一推出对方 peer_id。
+/// 存储在邮箱里的密文消息。`to_peer_id` 是历史字段名，现在装的是
+/// 队列 id（`msg_id` + 队列 id 才是存储主键）；客户端按队列取，不按人取。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredMessage {
     /// 消息 ID（客户端从加密头 (gen,n) 派生，全局唯一）。
@@ -252,20 +206,6 @@ pub struct StoredMessage {
     pub to_peer_id: String,
     /// 应用层加密后的消息内容（含文本与时间）。
     pub msg: Vec<u8>,
-}
-
-impl StoredMessage {
-    /// 从 put 请求解析出完整消息。
-    pub fn from_request(r: &MailboxRequest) -> Result<Self> {
-        Ok(Self {
-            msg_id: r.id.clone().ok_or_else(|| anyhow!("put missing id"))?,
-            to_peer_id: r.to.clone().ok_or_else(|| anyhow!("put missing to"))?,
-            msg: r
-                .payload
-                .clone()
-                .ok_or_else(|| anyhow!("put missing payload"))?,
-        })
-    }
 }
 
 /// 单次请求的总体超时（拨号 + 写入 + 读响应）。节点失联/无响应时

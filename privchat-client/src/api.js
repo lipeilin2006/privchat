@@ -25,8 +25,6 @@ export const api = {
   addMailbox: (peerId) => invoke("add_mailbox_peer", { peerId }),
   removeMailbox: (peerId) => invoke("remove_mailbox_peer", { peerId }),
   pingMailbox: (peerId) => invoke("ping_mailbox", { peerId }),
-  getWriteCount: () => invoke("get_mailbox_write_count"),
-  setWriteCount: (count) => invoke("set_mailbox_write_count", { count }),
 
   getOnion: () => invoke("get_onion_config"),
   setOnion: (config) => invoke("set_onion_config", { config }),

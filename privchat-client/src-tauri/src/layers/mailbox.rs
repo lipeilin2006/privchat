@@ -19,25 +19,7 @@ pub struct MailboxClient;
 impl MailboxClient {
     /// 检查 mailbox 是否可达，不读取也不删除任何消息。
     pub async fn ping(endpoint: &Endpoint, mailbox: &str) -> Result<()> {
-        let response = Self::call(
-            endpoint,
-            mailbox,
-            &MailboxRequest {
-                op: privchat_common::Op::Ping,
-                to: None,
-                for_peer: None,
-                id: None,
-                ids: None,
-                payload: None,
-                nonce: None,
-                msg: None,
-                queue: None,
-                sender_auth: None,
-                owner_auth: None,
-                sig: None,
-            },
-        )
-        .await?;
+        let response = Self::call(endpoint, mailbox, &MailboxRequest::ping()).await?;
         if response.ok {
             Ok(())
         } else {

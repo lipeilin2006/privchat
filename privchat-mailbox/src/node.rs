@@ -43,9 +43,6 @@ struct MailboxHandler {
 
 impl ProtocolHandler for MailboxHandler {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
-        // 拨号方的 TLS 身份：fetch 必须用自己身份拉自己的队列（防他人
-        // 取回即删式 DoS）；put/sync 不校验（任意发送方 + PoW 防垃圾）。
-        let remote_id = connection.remote_id().to_string();
         loop {
             let (mut send, mut recv) = match connection.accept_bi().await {
                 Ok(bi) => bi,
@@ -60,7 +57,7 @@ impl ProtocolHandler for MailboxHandler {
                 }
             };
 
-            let response = handle_request(self, &remote_id, &payload).await;
+            let response = handle_request(self, &payload).await;
             let bytes = serde_json::to_vec(&response).unwrap_or_else(|_| b"{}".to_vec());
             let _ = send.write_all(&bytes).await;
             let _ = send.finish();
@@ -182,8 +179,8 @@ impl ProtocolHandler for OnionHandler {
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                     return Ok(());
                 }
-                // 终点：只允许匿名投递（put），fetch 需要真实身份队列认证。
-                let response = handle_request(&self.mailbox, &remote, &inner).await;
+                // 终点：把最内层请求交给 mailbox 处理（队列鉴权在请求体内）。
+                let response = handle_request(&self.mailbox, &inner).await;
                 let _ = send
                     .write_all(&serde_json::to_vec(&response).unwrap_or_default())
                     .await;
@@ -235,16 +232,11 @@ async fn forward_onion(
     Ok(response)
 }
 
-async fn handle_request(
-    handler: &MailboxHandler,
-    remote_id: &str,
-    payload: &[u8],
-) -> MailboxResponse {
+async fn handle_request(handler: &MailboxHandler, payload: &[u8]) -> MailboxResponse {
     let req: MailboxRequest = match serde_json::from_slice(payload) {
         Ok(r) => r,
         Err(e) => return err(&format!("bad request: {e}")),
     };
-    let _ = remote_id;
     match req.op {
         Op::Ping => ok(),
         Op::QueueCreate => handle_queue_create(handler, req).await,
@@ -384,7 +376,6 @@ async fn handle_queue_delete(handler: &MailboxHandler, req: MailboxRequest) -> M
     }
 }
 
-/// 本地操作完成后在后台向所有 peer mailbox 并发广播，避免阻塞客户端响应。
 /// 洋葱转发白名单：`PRIVCHAT_MAILBOX_ONION_PEERS="id1,id2"`，未设置则不限制。
 fn load_onion_allowlist() -> Option<Arc<Vec<String>>> {
     let raw = std::env::var("PRIVCHAT_MAILBOX_ONION_PEERS").ok()?;

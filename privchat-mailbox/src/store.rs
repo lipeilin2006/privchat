@@ -7,16 +7,15 @@ use anyhow::{anyhow, Result};
 use rusqlite::{params, Connection as SqlConn, OptionalExtension};
 use tokio::sync::Mutex;
 
-/// 内存邮箱 + SQLite 持久化。
+/// 队列存储 + SQLite 持久化。
 ///
-/// 单表 `messages`：
-/// - `msg_id`      TEXT —— 发送方派生 ID，与 to_peer_id 组成主键，去重 + 排序
-/// - `to_peer_id`  TEXT NOT NULL —— 接收方身份（按此分类队列）
-/// - `msg`         BLOB NOT NULL —— 应用层密文
-/// - `time`        INTEGER NOT NULL —— 入库时间（毫秒），TTL 到期清除依据
+/// 两张表：
+/// - `queues`：队列 id → `sender_auth` / `owner_auth`（写权限与读权限公钥）、
+///   创建时间；取回即删时连队列一起删。
+/// - `queue_msgs`：`(queue_id, seq)` 主键，`seq` 由节点按写入顺序递增，
+///   `payload` 是应用层密文，`time` 用于 TTL 清理。
 ///
-/// 另建 `idx_messages_to` 索引加速按接收方拉取。仅存密文与路由元数据，
-/// 节点不接触明文。
+/// 只存密文、队列 id 与公钥，节点不接触明文。
 #[derive(Clone)]
 pub(crate) struct MailboxStore {
     pub(crate) conn: Arc<Mutex<SqlConn>>,

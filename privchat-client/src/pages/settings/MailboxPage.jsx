@@ -24,7 +24,6 @@ import {
   FileDown,
   Check,
 } from "lucide-react";
-import Group from "../../components/Group";
 import { api } from "../../api";
 import { t, locale } from "../../i18n";
 
@@ -34,13 +33,11 @@ const RELAY_RE = /^[0-9a-fA-F]{64}$/;
 export default function MailboxPage({ notify, onClose }) {
   const [peers, setPeers] = useState([]);
   const [input, setInput] = useState("");
-  const [count, setCount] = useState(0);
   const [health, setHealth] = useState({});
 
   const load = async () => {
     try {
       setPeers(await api.mailboxPeers());
-      setCount(await api.getWriteCount());
     } catch (e) {
       notify(String(e), "err");
     }
@@ -125,32 +122,6 @@ export default function MailboxPage({ notify, onClose }) {
           ))}
         </div>
 
-        <Group title={t("writeCount")}>
-          <Cell
-            after={
-              <select
-                className="tg-select"
-                value={count}
-                onChange={async (e) => {
-                  const v = Number(e.target.value);
-                  setCount(v);
-                  try {
-                    await api.setWriteCount(v);
-                  } catch (err) {
-                    notify(String(err), "err");
-                  }
-                }}
-              >
-                <option value={0}>{t("copiesAll")}</option>
-                {[1, 2, 3, 4, 5, 6, 8].map((n) => (
-                  <option key={n} value={n}>{n}</option>
-                ))}
-              </select>
-            }
-          >
-            {t("copies")}
-          </Cell>
-        </Group>
       </div>
     </div>
   );

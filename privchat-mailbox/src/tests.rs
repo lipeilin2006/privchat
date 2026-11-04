@@ -1,25 +1,6 @@
 use super::*;
 use crate::store::MailboxStore;
 
-#[allow(dead_code)]
-fn temp_db(name: &str) -> PathBuf {
-    let dir =
-        std::env::temp_dir().join(format!("privchat-mailbox-db-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir.join("mailbox.db")
-}
-
-/// 队列归属认证：fetch 只能拉取自己身份的队列，他人拉取被拒（防
-/// 「取回即删」式 DoS）；本人正常拉取。
-/// 链式拓扑下的转发不变量：`put` 只有「真正新增」返回 true（触发转发），
-/// 重复插入返回 false（切断环路）。沿 mb0→mb1→mb2 依次放入同一条消息，
-/// 必须恰好各节点新增一次；环回（mb2 再发回 mb0）必须返回 false。
-/// 网格删除（sync_ack）转发不变量：首次删除返回行数 1（触发转发），
-/// 重复删除返回 0（不再转发），切断环路。
-/// 取回即删 + 排序：fetch 按 msg_id（发送方 (gen,n) 派生前缀）升序返回，
-/// 返回后立即从本节点删除。
-/// TTL：到期消息被清除，未过期保留；ttl=0 关闭。
 fn hex_of(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -50,7 +31,6 @@ async fn queue_create_send_get_delete() {
     // 创建。
     let resp = handle_request(
         &handler,
-        "someone",
         &serde_json::to_vec(&MailboxRequest::queue_create(
             queue,
             &sender_pub,
@@ -63,7 +43,6 @@ async fn queue_create_send_get_delete() {
     // 重复创建被拒（先到先得）。
     let resp = handle_request(
         &handler,
-        "someone",
         &serde_json::to_vec(&MailboxRequest::queue_create(
             queue,
             &sender_pub,
@@ -83,7 +62,6 @@ async fn queue_create_send_get_delete() {
     let sig = hex_of(&sender.sign(&msg).to_bytes());
     let resp = handle_request(
         &handler,
-        "someone",
         &serde_json::to_vec(&MailboxRequest::queue_send(queue, payload.clone(), &sig)).unwrap(),
     )
     .await;
@@ -93,7 +71,6 @@ async fn queue_create_send_get_delete() {
     let bad_sig = hex_of(&owner.sign(&msg).to_bytes());
     let resp = handle_request(
         &handler,
-        "someone",
         &serde_json::to_vec(&MailboxRequest::queue_send(
             queue,
             payload.clone(),
@@ -113,7 +90,6 @@ async fn queue_create_send_get_delete() {
     let wrong = hex_of(&sender.sign(&get_msg).to_bytes());
     let resp = handle_request(
         &handler,
-        "someone",
         &serde_json::to_vec(&MailboxRequest::queue_get(queue, &wrong)).unwrap(),
     )
     .await;
@@ -123,7 +99,6 @@ async fn queue_create_send_get_delete() {
     let ok_sig = hex_of(&owner.sign(&get_msg).to_bytes());
     let resp = handle_request(
         &handler,
-        "someone",
         &serde_json::to_vec(&MailboxRequest::queue_get(queue, &ok_sig)).unwrap(),
     )
     .await;
@@ -134,7 +109,6 @@ async fn queue_create_send_get_delete() {
 
     let resp = handle_request(
         &handler,
-        "someone",
         &serde_json::to_vec(&MailboxRequest::queue_get(queue, &ok_sig)).unwrap(),
     )
     .await;
@@ -150,7 +124,6 @@ async fn queue_create_send_get_delete() {
     let del_sig = hex_of(&owner.sign(&del_msg).to_bytes());
     let resp = handle_request(
         &handler,
-        "someone",
         &serde_json::to_vec(&MailboxRequest::queue_delete(queue, &del_sig)).unwrap(),
     )
     .await;

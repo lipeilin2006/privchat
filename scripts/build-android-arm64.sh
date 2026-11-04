@@ -87,6 +87,40 @@ export NDK_HOME="$NDK"
 echo "[build] SDK: $SDK"
 echo "[build] NDK: $NDK"
 
+# —— 交叉编译工具链（openssl-sys 等 C 依赖需要显式给编译器）——
+# 不设这些时 vendored OpenSSL 会去调 aarch64-linux-android-ranlib，
+# 那是 NDK 里并不存在的名字，构建直接 127。
+TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64"
+[ -d "$TOOLCHAIN" ] || TOOLCHAIN="$(find "$NDK/toolchains/llvm/prebuilt" -mindepth 1 -maxdepth 1 -type d | head -1)"
+if [ ! -d "$TOOLCHAIN" ]; then
+  echo "[build] ERROR: NDK llvm toolchain not found under $NDK" >&2
+  exit 1
+fi
+ANDROID_API=24   # 与 app/build.gradle.kts 的 minSdk 对齐
+TC_CLANG="$TOOLCHAIN/bin/aarch64-linux-android${ANDROID_API}-clang"
+[ -x "$TC_CLANG" ] || TC_CLANG="$TOOLCHAIN/bin/aarch64-linux-android-clang"
+TC_AR="$TOOLCHAIN/bin/llvm-ar"
+TC_RANLIB="$TOOLCHAIN/bin/llvm-ranlib"
+for f in "$TC_CLANG" "$TC_AR" "$TC_RANLIB"; do
+  [ -x "$f" ] || { echo "[build] ERROR: missing NDK tool: $f" >&2; exit 1; }
+done
+# cc crate 认下划线写法，可以直接 export；
+# 带横线的写法（openssl-sys 的旧式查找）不是合法 shell 标识符，
+# 只能在真正编译时用 env 前缀注入。
+export CC_aarch64_linux_android="$TC_CLANG"
+export AR_aarch64_linux_android="$TC_AR"
+export RANLIB_aarch64_linux_android="$TC_RANLIB"
+export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$TC_CLANG"
+CROSS_ENV=(
+  "CC_aarch64-linux-android=$TC_CLANG"
+  "AR_aarch64-linux-android=$TC_AR"
+  "RANLIB_aarch64-linux-android=$TC_RANLIB"
+  "CC_aarch64_linux_android=$TC_CLANG"
+  "AR_aarch64_linux_android=$TC_AR"
+  "RANLIB_aarch64_linux_android=$TC_RANLIB"
+)
+echo "[build] CC: $TC_CLANG"
+
 # —— 前端依赖 ——
 if [ ! -d "$CLIENT_DIR/node_modules" ]; then
   echo "[build] installing frontend deps"
@@ -101,7 +135,7 @@ fi
 
 # —— Tauri Android 构建（arm64 单架构 APK）——
 echo "[build] building tauri android apk (this may take a while)"
-(cd "$CLIENT_DIR" && npm run tauri android build -- --target aarch64 --apk --ci)
+(cd "$CLIENT_DIR" && env "${CROSS_ENV[@]}" npm run tauri android build -- --target aarch64 --apk --ci)
 
 # —— 定位产物并复制到 target/android-arm64/ ——
 UNSIGNED="$(find "$CLIENT_DIR/src-tauri/gen/android/app/build/outputs/apk" -name '*-unsigned.apk' -path '*aarch64*' 2>/dev/null | head -1)"
