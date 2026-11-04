@@ -4,7 +4,6 @@
 //! 备注名只是本端显示用的别名。
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -30,8 +29,6 @@ pub struct App {
     links: Arc<LinkManager>,
     /// 配置的 mailbox 节点（建连接时用第一个）。
     mailbox_peers: Arc<Mutex<Vec<String>>>,
-    /// 每条离线消息写入的 mailbox 节点数（保留设置项）。
-    mailbox_write_count: Arc<AtomicUsize>,
     onion: Arc<Mutex<OnionConfig>>,
     stop_tx: watch::Sender<bool>,
 }
@@ -58,9 +55,6 @@ impl App {
         let queue_api = Arc::new(IrohQueues::new(transport.clone()));
         let links = Arc::new(LinkManager::load(store.clone(), queue_api).await?);
         links.set_pool(mailbox_peers.lock().await.clone()).await;
-        let mailbox_write_count = Arc::new(AtomicUsize::new(
-            store.load_mailbox_write_count().unwrap_or(0),
-        ));
         let onion = Arc::new(Mutex::new(
             store
                 .load_onion_config()
@@ -74,7 +68,6 @@ impl App {
             store,
             links,
             mailbox_peers,
-            mailbox_write_count,
             onion,
             stop_tx,
         })
@@ -198,15 +191,6 @@ impl App {
         let started = std::time::Instant::now();
         super::mailbox::MailboxClient::ping(&endpoint, peer_id).await?;
         Ok(started.elapsed().as_millis() as u64)
-    }
-
-    pub async fn get_mailbox_write_count(&self) -> usize {
-        self.mailbox_write_count.load(Ordering::Relaxed)
-    }
-
-    pub async fn set_mailbox_write_count(&self, count: usize) -> Result<()> {
-        self.mailbox_write_count.store(count, Ordering::Relaxed);
-        self.store.save_mailbox_write_count(count)
     }
 
     pub fn get_auto_lock_minutes(&self) -> Result<u64> {

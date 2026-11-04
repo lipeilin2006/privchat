@@ -1,30 +1,24 @@
-//! PrivChat Mailbox —— 离线消息缓存节点（可组网同步）
+//! PrivChat Mailbox —— 离线消息缓存节点
 //!
 //! 纯存储节点：不参与任何会话加密。客户端先做应用层加密（双棘轮，见
 //! client 的 `crypto::Ratchet`），再把密文 `payload` 交给本节点暂存。
-//! 本节点只按「接收方 peer_id」分类存取、按消息 ID 排序与删除，永不接触明文。
+//! 本节点只按「队列 id」存取、按消息 ID 排序与删除，永不接触明文。
 //!
 //! ## 取回即删 + TTL
-//! `fetch` 按 `msg_id` 升序返回该接收方队列的全部密文，返回后立即从本节点
-//! 删除，并向 peer 广播 `sync_ack` 让网格同步删除其他副本。msg_id 由发送方
-//! 从加密头的 `(gen, n)`（逻辑发送序）派生，故按 msg_id 排序即等于棘轮
-//! 消息顺序；不含时间戳，不泄露收发时间。
+//! `QueueGet` 按 `msg_id` 升序返回该队列的全部密文，返回后立即从本节点
+//! 删除。msg_id 由发送方从加密头的 `(gen, n)`（逻辑发送序）派生，故按
+//! msg_id 排序即等于棘轮消息顺序；不含时间戳，不泄露收发时间。
 //! 消息最长保留时间（TTL）可配置，到期由后台任务清除：
 //! - 环境变量 `PRIVCHAT_MAILBOX_TTL_SECS`（秒，0 = 永不过期），或
 //! - `data_dir/config.json` 的 `{"ttl_secs": <秒>}`；缺省 7 天。
 //!
-//! ## 组网同步（多跳、无环路）
-//! 每个 mailbox 通过配置知道若干其他 mailbox 节点（可全连通、可链式/环状）。
-//! 收到客户端消息后向所有 peer 广播 `sync`；收到 `ack`/`fetch` 删除后广播
-//! `sync_ack`。广播消息携带完整消息，接收方按 msg_id 幂等去重，**仅在真正
-//! 新增/删除时继续转发**（`INSERT OR IGNORE` 主键幂等保证每条消息每节点
-//! 至多处理一次），因此多跳链路（client0→mb0→mb1→mb2→client1）可传播到底，
-//! 而环状拓扑中节点第二次收到同一条消息时不再转发，环路/风暴从结构上被截断。
-//! 客户端连任意一个 mailbox 节点都能 fetch 到全部待收消息。
+//! ## 节点之间不通信
+//! 每条队列只属于一台 mailbox：客户端直接连这台节点读写，不存在副本，
+//! 因此没有消息同步 / 补推 / 反熵，也没有邻居表与 PEX。跨节点流量只剩
+//! 可选的洋葱中继（`ONION_ALPN` 逐层转发）。
 //!
-//! peer 配置（二选一，环境变量优先）：
-//! - `PRIVCHAT_MAILBOX_PEERS="<peer_id>,<peer_id>,..."`，或
-//! - `data_dir/mailboxes.json` = `["<peer_id>", ...]`
+//! 队列轮换时由客户端新建一条队列（可以落在另一台节点），旧队列排空后
+//! 再删除，数据不搬迁。
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -431,26 +425,6 @@ fn err(e: &str) -> MailboxResponse {
     }
 }
 
-/// 读取 peer 配置：环境变量优先，其次 data_dir/mailboxes.json。
-fn load_peers(data_dir: &std::path::Path) -> Vec<String> {
-    if let Ok(v) = std::env::var("PRIVCHAT_MAILBOX_PEERS") {
-        let peers: Vec<String> = v
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        if !peers.is_empty() {
-            return peers;
-        }
-    }
-    if let Ok(bytes) = std::fs::read(data_dir.join("mailboxes.json")) {
-        if let Ok(peers) = serde_json::from_slice::<Vec<String>>(&bytes) {
-            return peers;
-        }
-    }
-    Vec::new()
-}
-
 /// 当前 UTC 毫秒时间戳。
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -481,8 +455,8 @@ fn load_ttl(data_dir: &std::path::Path) -> u64 {
     7 * 24 * 3600
 }
 
-/// 首次启动兜底：若 `config.json` / `mailboxes.json` 不存在则按当前生效值
-/// 落盘生成，便于用户直接编辑。已存在的文件绝不覆盖。
+/// 首次启动兜底：若 `config.json` 不存在则按当前生效值落盘生成，
+/// 便于用户直接编辑。已存在的文件绝不覆盖。
 /// 读取节点角色：环境变量 > `config.json` 的 `role` > `both`。
 fn load_role(data_dir: &std::path::Path) -> Result<String> {
     if let Ok(role) = std::env::var("PRIVCHAT_MAILBOX_ROLE") {
@@ -509,12 +483,7 @@ fn validate_role(role: String) -> Result<String> {
     }
 }
 
-fn ensure_config_files(
-    data_dir: &std::path::Path,
-    ttl_secs: u64,
-    peers: &[String],
-    role: &str,
-) -> Result<()> {
+fn ensure_config_files(data_dir: &std::path::Path, ttl_secs: u64, role: &str) -> Result<()> {
     let cfg_path = data_dir.join("config.json");
     if !cfg_path.exists() {
         std::fs::write(
@@ -525,11 +494,6 @@ fn ensure_config_files(
             }))?,
         )?;
         eprintln!("[mailbox] wrote {}", cfg_path.display());
-    }
-    let peers_path = data_dir.join("mailboxes.json");
-    if !peers_path.exists() {
-        std::fs::write(&peers_path, serde_json::to_string_pretty(&peers)?)?;
-        eprintln!("[mailbox] wrote {}", peers_path.display());
     }
     Ok(())
 }
@@ -558,11 +522,8 @@ pub async fn run() -> Result<()> {
     let ttl_secs = load_ttl(&data_dir);
     let role = load_role(&data_dir)?;
     let store = MailboxStore::open(data_dir.join("mailbox.db"), ttl_secs)?;
-    let peers = Arc::new(tokio::sync::Mutex::new(load_peers(&data_dir)));
-    let peers_snapshot = peers.lock().await.clone();
-
     // 首次启动兜底：缺失的配置文件落盘，方便用户后续编辑。
-    ensure_config_files(&data_dir, ttl_secs, &peers_snapshot, &role)?;
+    ensure_config_files(&data_dir, ttl_secs, &role)?;
 
     let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
         .secret_key(secret_key.clone())
@@ -626,11 +587,6 @@ pub async fn run() -> Result<()> {
     println!("  ttl     : {} secs (0 = never expire)", ttl_secs);
     println!("  data_dir: {}", data_dir.display());
     println!("  role    : {role} (mailbox={serve_mailbox}, onion_relay={serve_onion})");
-    if peers_snapshot.is_empty() {
-        println!("  peers   : (none) — 单节点模式（PEX 会自动扩充）");
-    } else {
-        println!("  peers   : {}", peers_snapshot.join(", "));
-    }
 
     // 保持进程常驻。
     std::future::pending::<()>().await;

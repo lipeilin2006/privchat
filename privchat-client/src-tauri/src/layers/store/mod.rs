@@ -32,9 +32,7 @@ mod settings;
 
 pub use connections::{ConnMessage, ConnRow};
 
-/// 每条离线消息写入的 mailbox 节点数（0 = 全部已配置节点）。
 pub const UNBOUND_IDENTITY_TTL_MS: u64 = 24 * 60 * 60 * 1000;
-pub const MAX_MAILBOX_WRITE_COUNT: usize = 64;
 
 /// SQLite 持久化门面。连接用 `Mutex` 包裹以保证线程安全，且所有操作
 /// 都很小（几十到几百行），同步执行即可。
@@ -210,12 +208,8 @@ mod tests {
         let dir = temp_dir("settings");
         let store = Store::open(&dir, KEY).expect("open");
 
-        // 未设置时缺省 3（PEX 会扩充邻居表，默认全量写代价过高）。
-        assert_eq!(store.load_mailbox_write_count().unwrap(), 3);
         assert!(store.load_setting("nope").unwrap().is_none());
 
-        store.save_mailbox_write_count(2).expect("save count");
-        assert_eq!(store.load_mailbox_write_count().unwrap(), 2);
         store.save_setting("theme", "dark").expect("save setting");
         assert_eq!(
             store.load_setting("theme").unwrap().as_deref(),
@@ -223,16 +217,18 @@ mod tests {
         );
 
         // UPSERT：同一键覆盖。
-        store.save_mailbox_write_count(3).expect("save count 3");
-        assert_eq!(store.load_mailbox_write_count().unwrap(), 3);
+        store.save_setting("theme", "light").expect("save setting");
+        assert_eq!(
+            store.load_setting("theme").unwrap().as_deref(),
+            Some("light")
+        );
 
         // 重开后持久化仍在。
         drop(store);
         let store2 = Store::open(&dir, KEY).expect("reopen");
-        assert_eq!(store2.load_mailbox_write_count().unwrap(), 3);
         assert_eq!(
             store2.load_setting("theme").unwrap().as_deref(),
-            Some("dark")
+            Some("light")
         );
 
         let _ = std::fs::remove_dir_all(&dir);

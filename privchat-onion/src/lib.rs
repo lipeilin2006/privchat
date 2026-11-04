@@ -121,7 +121,13 @@ pub fn wrap(relays: &[String], payload: &[u8]) -> Result<Vec<u8>> {
         OsRng.fill_bytes(&mut nonce_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);
         let ct = cipher
-            .encrypt(nonce, Payload { msg: &plain, aad: AAD })
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: &plain,
+                    aad: AAD,
+                },
+            )
             .map_err(|_| anyhow!("洋葱加密失败"))?;
 
         let mut layer = Vec::with_capacity(44 + ct.len());

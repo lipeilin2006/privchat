@@ -1,8 +1,7 @@
-//! 设置项：mailbox 节点、写入副本数、洋葱配置、自动锁定。
+//! 设置项：mailbox 节点、洋葱配置、自动锁定。
 
 use super::*;
 
-const MAILBOX_WRITE_COUNT_KEY: &str = "mailbox_write_count";
 const AUTO_LOCK_MINUTES_KEY: &str = "auto_lock_minutes";
 const ONION_CONFIG_KEY: &str = "onion_config";
 
@@ -26,24 +25,6 @@ impl Store {
             params![key, value],
         )?;
         Ok(())
-    }
-    /// 读取「每条消息最多成功推送节点数」（0 = 全部已配置节点）。
-    /// 默认 3：PEX 会把邻居表自动扩到 64，默认全量写会放大网络开销。
-    pub fn load_mailbox_write_count(&self) -> Result<usize> {
-        Ok(self
-            .load_setting(MAILBOX_WRITE_COUNT_KEY)?
-            .and_then(|v| v.parse().ok())
-            .filter(|count| *count <= MAX_MAILBOX_WRITE_COUNT)
-            .unwrap_or(3))
-    }
-    /// 保存 mailbox 投放数量（0 = 全部已配置节点）。
-    pub fn save_mailbox_write_count(&self, count: usize) -> Result<()> {
-        if count > MAX_MAILBOX_WRITE_COUNT {
-            return Err(anyhow!(
-                "mailbox write count must be <= {MAX_MAILBOX_WRITE_COUNT}"
-            ));
-        }
-        self.save_setting(MAILBOX_WRITE_COUNT_KEY, &count.to_string())
     }
     /// 洋葱路由配置（JSON：`{"enabled":bool,"relays":[peer_id,...]}`）。
     pub fn load_onion_config(&self) -> Result<String> {

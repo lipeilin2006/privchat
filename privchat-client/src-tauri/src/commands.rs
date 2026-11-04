@@ -205,11 +205,6 @@ pub(crate) async fn remove_mailbox_peer(
 }
 
 #[tauri::command]
-pub(crate) async fn get_mailbox_write_count(state: State<'_, AppState>) -> Result<usize, String> {
-    Ok(state.require_app()?.get_mailbox_write_count().await)
-}
-
-#[tauri::command]
 pub(crate) async fn get_auto_lock_minutes(state: State<'_, AppState>) -> Result<u64, String> {
     state
         .require_app()?
@@ -226,18 +221,6 @@ pub(crate) async fn set_auto_lock_minutes(
         .require_app()?
         .set_auto_lock_minutes(minutes)
         .map_err(user_error)
-}
-
-#[tauri::command]
-pub(crate) async fn set_mailbox_write_count(
-    count: usize,
-    state: State<'_, AppState>,
-) -> Result<(), String> {
-    state
-        .require_app()?
-        .set_mailbox_write_count(count)
-        .await
-        .map_err(|e| e.to_string())
 }
 
 /// 前端用的连接摘要。

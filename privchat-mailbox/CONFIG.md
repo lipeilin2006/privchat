@@ -47,8 +47,8 @@ P2 设计意图：**首跳中继与终点 mailbox 应由不同运营者部署**�
 - **洋葱中继**：`ONION_ALPN` 把剥离一层后的包转给下一跳（可选功能）；
 - 无需 PEX：客户端按邀请里的 peer_id/票据直连，不依赖邻居表发现。
 
-旧的 `sync` / `sync_ack` / `put` / `fetch` / `peers` 操作与邻居自动扩充已删除，
-`mailboxes.json` 只剩历史兼容（不再读取用于同步）。
+旧的 `sync` / `sync_ack` / `put` / `fetch` / `peers` 操作、邻居表与 PEX、
+以及 `mailboxes.json` 配置都已删除（老目录里残留的文件不再读取，可安全删除）。
 
 ## 环境变量
 
@@ -73,7 +73,6 @@ PrivChat Mailbox online
   ttl     : 604800 secs (0 = never expire)
   data_dir: /tmp/pmb3
   role    : mailbox (mailbox=true, onion_relay=false)
-  peers   : (none) — 单节点模式
 ```
 
 把 `peer_id` 填到客户端设置里的「Mailbox」或「洋葱路由」即可使用。
