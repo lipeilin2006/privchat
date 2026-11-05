@@ -364,6 +364,11 @@ impl App {
         self.links.create(&mailbox).await
     }
 
+    /// 数据库句柄（导出附件等只读用途）。
+    pub fn store(&self) -> &Arc<Store> {
+        &self.store
+    }
+
     /// 删除连接。
     pub async fn delete_connection(&self, conn_id: &str) -> Result<()> {
         self.links.delete(conn_id).await

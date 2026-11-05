@@ -145,6 +145,111 @@ pub(crate) mod android_ctx {
         Some(std::path::PathBuf::from(text))
     }
 
+    /// 用系统查看器打开一个文件（FileProvider 给临时读权限）。
+    #[cfg(target_os = "android")]
+    pub fn open_file(path: &str, mime: &str) -> bool {
+        let jvm_ptr = JAVA_VM.load(Ordering::SeqCst);
+        let ctx_ptr = APP_CTX.load(Ordering::SeqCst);
+        if jvm_ptr.is_null() || ctx_ptr.is_null() {
+            return false;
+        }
+        let Ok(vm) = (unsafe { jni::JavaVM::from_raw(jvm_ptr.cast()) }) else {
+            return false;
+        };
+        let Ok(mut env) = vm.attach_current_thread() else {
+            return false;
+        };
+        let ctx = unsafe { jni::objects::JObject::from_raw(ctx_ptr.cast()) };
+
+        let Ok(package) = env
+            .call_method(&ctx, "getPackageName", "()Ljava/lang/String;", &[])
+            .and_then(|value| value.l())
+        else {
+            return false;
+        };
+        let package_jstring = jni::objects::JString::from(package);
+        let Ok(package) = env.get_string(&package_jstring) else {
+            return false;
+        };
+        let package = package.to_string_lossy().into_owned();
+        let authority = format!("{package}.fileprovider");
+        let (Ok(authority_j), Ok(path_j), Ok(mime_j)) = (
+            env.new_string(authority),
+            env.new_string(path),
+            env.new_string(mime),
+        ) else {
+            return false;
+        };
+
+        let Ok(file_class) = env.find_class("java/io/File") else {
+            return false;
+        };
+        let Ok(file) = env.new_object(
+            file_class,
+            "(Ljava/lang/String;)V",
+            &[jni::objects::JValue::Object(&path_j)],
+        ) else {
+            return false;
+        };
+        let Ok(provider) = env.find_class("androidx/core/content/FileProvider") else {
+            return false;
+        };
+        let uri = env
+            .call_static_method(
+                provider,
+                "getUriForFile",
+                "(Landroid/content/Context;Ljava/lang/String;Ljava/io/File;)Landroid/net/Uri;",
+                &[
+                    jni::objects::JValue::Object(&ctx),
+                    jni::objects::JValue::Object(&authority_j),
+                    jni::objects::JValue::Object(&file),
+                ],
+            )
+            .ok()
+            .and_then(|value| value.l().ok());
+        let Some(uri) = uri else {
+            return false;
+        };
+
+        let Ok(intent_class) = env.find_class("android/content/Intent") else {
+            return false;
+        };
+        let Ok(action) = env.new_string("android.intent.action.VIEW") else {
+            return false;
+        };
+        let Ok(intent) = env.new_object(
+            intent_class,
+            "(Ljava/lang/String;)V",
+            &[jni::objects::JValue::Object(&action)],
+        ) else {
+            return false;
+        };
+        let _ = env.call_method(
+            &intent,
+            "setDataAndType",
+            "(Landroid/net/Uri;Ljava/lang/String;)Landroid/content/Intent;",
+            &[
+                jni::objects::JValue::Object(&uri),
+                jni::objects::JValue::Object(&mime_j),
+            ],
+        );
+        // FLAG_GRANT_READ_URI_PERMISSION | FLAG_ACTIVITY_NEW_TASK
+        let flags = 0x1 | 0x1000_0000;
+        let _ = env.call_method(
+            &intent,
+            "addFlags",
+            "(I)Landroid/content/Intent;",
+            &[jni::objects::JValue::Int(flags)],
+        );
+        env.call_method(
+            &ctx,
+            "startActivity",
+            "(Landroid/content/Intent;)V",
+            &[jni::objects::JValue::Object(&intent)],
+        )
+        .is_ok()
+    }
+
     /// 用系统 Toast 把一句话显示到屏幕上——启动失败时这是唯一能看见的出口。
     pub fn toast(msg: &str) {
         let jvm_ptr = JAVA_VM.load(Ordering::SeqCst);
@@ -307,6 +412,8 @@ fn build_and_run() {
             accept_connection,
             delete_connection,
             rotate_connection,
+            export_attachment,
+            search_messages,
             send_file,
             send_on_connection,
             list_connections,

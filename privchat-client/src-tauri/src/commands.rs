@@ -373,6 +373,74 @@ pub(crate) async fn rotate_connection(
         .map_err(|e| e.to_string())
 }
 
+/// 搜索消息正文。
+#[tauri::command]
+pub(crate) async fn search_messages(
+    query: String,
+    limit: Option<usize>,
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::layers::store::SearchHit>, String> {
+    if query.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    state
+        .require_app()?
+        .store()
+        .search_messages(query.trim(), limit.unwrap_or(50).clamp(1, 200))
+        .map_err(|e| e.to_string())
+}
+
+/// 把附件写到缓存目录并用系统查看器打开；返回落盘路径。
+#[tauri::command]
+pub(crate) async fn export_attachment(
+    conn_id: String,
+    msg_id: String,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    use tauri::Manager;
+    let store = state.require_app()?.store().clone();
+    let message = store
+        .message(&conn_id, &msg_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "消息不存在".to_string())?;
+    let data = message.data.ok_or_else(|| "这条消息没有附件".to_string())?;
+    let name = message.name.unwrap_or_else(|| "attachment".to_string());
+    #[cfg(target_os = "android")]
+    let mime = message
+        .mime
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+    let safe: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || ".-_".contains(c) {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(64)
+        .collect();
+    let dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|e| e.to_string())?
+        .join("attachments");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join(format!("{msg_id}-{safe}"));
+    std::fs::write(&path, &data).map_err(|e| e.to_string())?;
+    let path_str = path.to_string_lossy().into_owned();
+    #[cfg(target_os = "android")]
+    {
+        if !crate::android_ctx::open_file(&path_str, &mime) {
+            return Err("没有能打开这个文件的 App".to_string());
+        }
+        return Ok(String::new());
+    }
+    #[cfg(not(target_os = "android"))]
+    Ok(path_str)
+}
+
 /// 发附件（base64 传入，≤2MB）。
 #[tauri::command]
 pub(crate) async fn send_file(

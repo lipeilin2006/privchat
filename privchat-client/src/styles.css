@@ -2568,3 +2568,80 @@ body {
   font-size: 11px;
   color: var(--tg-sub);
 }
+
+/* 图片全屏查看 */
+.image-viewer {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  background: rgba(0, 0, 0, 0.92);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.image-viewer img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+}
+
+.file-open {
+  align-self: flex-start;
+  margin-top: 4px;
+  border: 0;
+  border-radius: 8px;
+  padding: 5px 12px;
+  font-size: 12px;
+  background: rgba(127, 127, 127, 0.16);
+  color: var(--tg-text);
+  cursor: pointer;
+}
+
+.file-open:disabled {
+  opacity: 0.6;
+}
+
+/* 消息搜索结果 */
+.search-hits {
+  padding: 4px 12px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.search-hits-title {
+  font-size: 12px;
+  color: var(--tg-sub);
+  padding: 6px 4px;
+}
+
+.hit-row {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.hit-row:active {
+  background: rgba(127, 127, 127, 0.1);
+}
+
+.hit-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--tg-text);
+}
+
+.hit-text {
+  font-size: 12px;
+  color: var(--tg-sub);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

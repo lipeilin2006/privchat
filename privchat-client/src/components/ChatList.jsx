@@ -1,15 +1,34 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Avatar, Placeholder } from "@telegram-apps/telegram-ui";
 import { SendHorizontal } from "lucide-react";
 import SearchBox from "./SearchBox";
+import { api } from "../api";
 import { t } from "../i18n";
 import { avatarColor, fmtTime, initials } from "../utils/format";
 
 export default function ChatList({ conversations, onOpen }) {
   const [query, setQuery] = useState("");
+  const [hits, setHits] = useState([]);
   const filtered = conversations.filter((c) =>
     (c.title || "").toLowerCase().includes(query.trim().toLowerCase())
   );
+
+  // 搜消息正文（防抖 250ms）
+  useEffect(() => {
+    const q = query.trim();
+    if (!q) {
+      setHits([]);
+      return;
+    }
+    const timer = setTimeout(async () => {
+      try {
+        setHits(await api.searchMessages(q, 30));
+      } catch {
+        setHits([]);
+      }
+    }, 250);
+    return () => clearTimeout(timer);
+  }, [query]);
 
   return (
     <div className="page page-chats">
@@ -46,6 +65,22 @@ export default function ChatList({ conversations, onOpen }) {
                 </div>
                 <div className="chat-preview">{c.lastText || t("noMessages")}</div>
               </div>
+            </button>
+          ))}
+        </div>
+      )}
+
+      {hits.length > 0 && (
+        <div className="search-hits">
+          <div className="search-hits-title">{t("messageResults")}</div>
+          {hits.map((hit) => (
+            <button
+              key={`${hit.conn_id}-${hit.msg_id}`}
+              className="hit-row"
+              onClick={() => onOpen(hit.conn_id)}
+            >
+              <span className="hit-name">{hit.name || hit.conn_id.slice(0, 10)}</span>
+              <span className="hit-text">{hit.text}</span>
             </button>
           ))}
         </div>

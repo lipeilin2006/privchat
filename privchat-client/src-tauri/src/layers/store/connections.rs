@@ -140,6 +140,18 @@ impl Store {
     }
 }
 
+/// 搜索命中。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SearchHit {
+    pub conn_id: String,
+    pub name: Option<String>,
+    pub msg_id: String,
+    pub sender: String,
+    pub text: String,
+    pub time: u64,
+    pub kind: String,
+}
+
 /// 连接里的一条消息。
 #[derive(Debug, Clone)]
 pub struct ConnMessage {
@@ -177,6 +189,64 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    /// 取一条消息。
+    pub fn message(&self, conn_id: &str, msg_id: &str) -> Result<Option<ConnMessage>> {
+        let conn = self.conn.lock().unwrap();
+        let row = conn
+            .query_row(
+                "SELECT conn_id, msg_id, sender, text, time, kind, name, mime, data
+                 FROM conn_messages WHERE conn_id = ?1 AND msg_id = ?2",
+                params![conn_id, msg_id],
+                |row| {
+                    Ok(ConnMessage {
+                        conn_id: row.get(0)?,
+                        msg_id: row.get(1)?,
+                        sender: row.get(2)?,
+                        text: row.get(3)?,
+                        time: row.get::<_, i64>(4)? as u64,
+                        kind: row.get(5)?,
+                        name: row.get(6)?,
+                        mime: row.get(7)?,
+                        data: row.get(8)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// 全局搜索消息正文（LIKE，转义通配符）。
+    pub fn search_messages(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
+        let escaped = query
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("%{escaped}%");
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT m.conn_id, c.name, m.msg_id, m.sender, m.text, m.time, m.kind
+             FROM conn_messages m LEFT JOIN connections c ON c.conn_id = m.conn_id
+             WHERE m.text LIKE ?1 ESCAPE '\\'
+             ORDER BY m.time DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![pattern, limit as i64], |row| {
+            Ok(SearchHit {
+                conn_id: row.get(0)?,
+                name: row.get(1)?,
+                msg_id: row.get(2)?,
+                sender: row.get(3)?,
+                text: row.get(4)?,
+                time: row.get::<_, i64>(5)? as u64,
+                kind: row.get(6)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
     }
 
     /// 读某连接的消息（按时间升序）。

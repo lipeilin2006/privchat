@@ -4,6 +4,7 @@ import { ArrowLeft, CheckCheck, MoreHorizontal, Paperclip, SendHorizontal } from
 import wallpaper from "../assets/wallpaper.png";
 import { t } from "../i18n";
 import { api } from "../api";
+import { openPath } from "@tauri-apps/plugin-opener";
 import ActionSheet from "./ActionSheet";
 import { avatarColor, fmtTime, initials } from "../utils/format";
 
@@ -21,6 +22,8 @@ export default function ChatWindow({
   const [sheetOpen, setSheetOpen] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [sendingFile, setSendingFile] = useState(false);
+  const [preview, setPreview] = useState(null);
+  const [opening, setOpening] = useState(false);
   const fileRef = useRef(null);
   const bodyRef = useRef(null);
 
@@ -154,6 +157,12 @@ export default function ChatWindow({
         </div>
       )}
 
+      {preview && (
+        <div className="image-viewer" onClick={() => setPreview(null)}>
+          <img src={preview} alt="preview" />
+        </div>
+      )}
+
       <div className="chat-body" ref={bodyRef}>
         {messages.length > 0 && <div className="date-sep">{t("today")}</div>}
         {messages.length === 0 && <Placeholder description={t("noMessages")} />}
@@ -170,11 +179,31 @@ export default function ChatWindow({
                     className="msg-image"
                     src={`data:${m.mime};base64,${m.data}`}
                     alt={m.name || "image"}
+                    onClick={() => setPreview(`data:${m.mime};base64,${m.data}`)}
                   />
                 ) : (
                   <div className="file-card">
                     <span className="file-name">{m.name || m.text}</span>
-                    <span className="file-size">{t("fileMessage")}</span>
+                    <button
+                      className="file-open"
+                      disabled={opening}
+                      onClick={async () => {
+                        setOpening(true);
+                        try {
+                          const path = await api.exportAttachment(conversation.peer_id, m.id);
+                          // 安卓在命令里已经调起查看器了，桌面这边再交给系统打开
+                          if (path && !/Android/i.test(navigator.userAgent)) {
+                            await openPath(path);
+                          }
+                        } catch (err) {
+                          notify?.(String(err), "err");
+                        } finally {
+                          setOpening(false);
+                        }
+                      }}
+                    >
+                      {t("openFile")}
+                    </button>
                   </div>
                 )
               ) : (

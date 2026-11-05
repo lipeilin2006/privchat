@@ -28,7 +28,7 @@ use rusqlite::{params, Connection};
 mod connections;
 mod settings;
 
-pub use connections::{ConnMessage, ConnRow};
+pub use connections::{ConnMessage, ConnRow, SearchHit};
 pub use settings::MailboxPeer;
 
 /// SQLite 持久化门面。连接用 `Mutex` 包裹以保证线程安全，且所有操作
@@ -258,6 +258,55 @@ mod tests {
     }
 
     /// 老库里的 role / last_used 会在打开时被重建掉，数据要照搬过来。
+    #[test]
+    fn search_messages_matches_text_and_escapes_wildcards() {
+        let dir = temp_dir("search");
+        let store = Store::open(&dir, KEY).expect("open");
+        store
+            .save_connection(&ConnRow {
+                conn_id: "c1".into(),
+                name: Some("Alice".into()),
+                state: "established".into(),
+                in_queue: "00112233445566778899aabbccddeeff".into(),
+                in_mailbox: "mb".into(),
+                out_queue: None,
+                out_mailbox: None,
+                out_sender_sk: None,
+                owner_sk: vec![1u8; 32],
+                e2e_state: vec![2u8; 8],
+                created: 1,
+                draining: "[]".into(),
+            })
+            .expect("save connection");
+        for (id, text) in [("m1", "hello world"), ("m2", "50% off")] {
+            store
+                .append_conn_message(&ConnMessage {
+                    conn_id: "c1".into(),
+                    msg_id: id.into(),
+                    sender: "peer".into(),
+                    text: text.into(),
+                    time: 10,
+                    kind: "text".into(),
+                    name: None,
+                    mime: None,
+                    data: None,
+                })
+                .expect("append");
+        }
+
+        let hits = store.search_messages("hello", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].text, "hello world");
+        assert_eq!(hits[0].name.as_deref(), Some("Alice"));
+
+        // 通配符要被当成普通字符：搜 % 只命中含 % 的那条
+        let pct = store.search_messages("%", 10).unwrap();
+        assert_eq!(pct.len(), 1, "wildcard must be escaped: {pct:?}");
+        assert_eq!(pct[0].text, "50% off");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn legacy_columns_are_dropped_on_open() {
         let dir = temp_dir("legacy-cols");
