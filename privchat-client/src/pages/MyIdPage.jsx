@@ -9,6 +9,7 @@ import {
   requestPermissions,
   cancel as cancelScan,
 } from "@tauri-apps/plugin-barcode-scanner";
+import { listen } from "@tauri-apps/api/event";
 import { api } from "../api";
 import { t } from "../i18n";
 
@@ -24,6 +25,7 @@ export default function MyIdPage({ onClose, onAdded, notify, onScanStateChange }
   const [name, setName] = useState("");
   const [busy, setBusy] = useState(false);
   const [expiresAt, setExpiresAt] = useState(0);
+  const [connected, setConnected] = useState(false);
   const [now, setNow] = useState(Date.now());
 
   useEffect(() => {
@@ -49,6 +51,7 @@ export default function MyIdPage({ onClose, onAdded, notify, onScanStateChange }
       // 不指定信箱：后端按优先级 + 实测延迟自己挑一台。
       const [id, text] = await api.createConnection(null);
       setConnId(id);
+      setConnected(false);
       setMyId(text);
       setExpiresAt(Date.now() + 10 * 60 * 1000);
       setQr(await QRCode.toDataURL(text, { width: 220, margin: 1 }));
@@ -62,6 +65,21 @@ export default function MyIdPage({ onClose, onAdded, notify, onScanStateChange }
   useEffect(() => {
     refresh();
   }, []);
+
+  // 对方扫完我的码：后端会推送一个空文本事件，直接进聊天页。
+  useEffect(() => {
+    if (!connId) return;
+    let off;
+    listen("connection://message", (event) => {
+      if (event.payload?.conn_id !== connId) return;
+      if (event.payload?.text === "") onAdded?.();
+    }).then((unlisten) => {
+      off = unlisten;
+    });
+    return () => {
+      if (off) off();
+    };
+  }, [connId, onAdded]);
 
   const copy = async () => {
     try {
@@ -83,8 +101,9 @@ export default function MyIdPage({ onClose, onAdded, notify, onScanStateChange }
     try {
       await api.acceptConnection(connId, text);
       if (name.trim()) await api.renameConnection(connId, name.trim());
-      notify(t("saveOk"));
-      onAdded?.();
+      // 先别走：对方还得扫我的码。两边都扫到，会收到一个空事件自动进聊天。
+      setConnected(true);
+      notify(t("pairWaiting"));
       return true;
     } catch (e) {
       notify(String(e), "err");
@@ -158,6 +177,15 @@ export default function MyIdPage({ onClose, onAdded, notify, onScanStateChange }
       <header className="page-head">
         <div className="page-title">{t("profile")}</div>
       </header>
+
+      {connected && (
+        <div className="pair-banner">
+          <div className="pair-banner-text">{t("pairWaiting")}</div>
+          <Button stretched mode="filled" onClick={() => onAdded?.()}>
+            {t("enterChat")}
+          </Button>
+        </div>
+      )}
 
       <div className="id-card">
         {qr ? (

@@ -433,6 +433,10 @@ impl App {
         for (i, frame) in frames.into_iter().enumerate() {
             let time = now_ms() + i as u64;
             match frame {
+                crate::layers::links::ReceivedFrame::Paired => {
+                    // 对方配好了：用空字符串通知上层（前端据此自动进聊天页）
+                    out.push(String::new());
+                }
                 crate::layers::links::ReceivedFrame::Text(text) => {
                     let _ = self.store.append_conn_message(&ConnMessage {
                         conn_id: conn_id.to_string(),

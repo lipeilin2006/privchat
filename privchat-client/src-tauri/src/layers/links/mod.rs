@@ -261,6 +261,8 @@ const ROTATE_EVERY: u32 = 500;
 const FRAME_TEXT: u8 = 0;
 const FRAME_ROTATE: u8 = 1;
 const FRAME_FILE: u8 = 2;
+/// 配对完成通知：对方扫完我的码后，我发一个空帧告诉它「两边都齐了」。
+const FRAME_PAIRED: u8 = 3;
 
 /// 附件上限 2MB。
 pub const MAX_FILE_BYTES: usize = 2 * 1024 * 1024;
@@ -279,6 +281,8 @@ const FILE_MAX_PARTIALS: usize = 4;
 #[derive(Debug)]
 pub enum ReceivedFrame {
     Text(String),
+    /// 对方完成了配对（空控制帧）。
+    Paired,
     File {
         name: String,
         mime: String,
@@ -384,13 +388,49 @@ impl LinkManager {
     /// 互扫到对方邀请后配对。
     pub async fn accept(&self, conn_id: &str, invite_text: &str) -> Result<()> {
         let their = Invite::decode(invite_text)?;
-        let mut links = self.links.lock().await;
-        let link = links
-            .get_mut(conn_id)
-            .ok_or_else(|| anyhow!("unknown connection {conn_id}"))?;
-        link.accept(&their)?;
-        self.persist(conn_id, link)?;
+        {
+            let mut links = self.links.lock().await;
+            let link = links
+                .get_mut(conn_id)
+                .ok_or_else(|| anyhow!("unknown connection {conn_id}"))?;
+            link.accept(&their)?;
+            self.persist(conn_id, link)?;
+        }
+        // 配对成功：发一个空控制帧，对方收到就知道两边都齐了。
+        self.send_paired_frame(conn_id).await;
         Ok(())
+    }
+
+    /// 通知对方「我这边配好了」；失败就算了，不影响配对本身。
+    async fn send_paired_frame(&self, conn_id: &str) {
+        let frame = vec![FRAME_PAIRED];
+        let mut links = self.links.lock().await;
+        let Some(link) = links.get_mut(conn_id) else {
+            return;
+        };
+        let Some(out) = link.out.clone() else {
+            return;
+        };
+        let Ok(blob) = link.e2e.encrypt(&privchat_common::pad_plaintext(&frame)) else {
+            return;
+        };
+        let _ = self.persist(conn_id, link);
+        drop(links);
+        let sig = connection::sign_send(
+            &out.queue_id,
+            &blob,
+            &SigningKey::from_bytes(&out.sender_sk),
+        );
+        let _ = self
+            .api
+            .send(
+                conn_id,
+                &out.mailbox,
+                &connection::hex_encode(&out.queue_id),
+                blob,
+                &sig,
+            )
+            .await;
     }
 
     /// 发一条消息（必须先配对）；到阈值先轮换入站队列。
@@ -756,6 +796,7 @@ impl LinkManager {
                     }
                     Err(e) => eprintln!("[links] bad rotate frame: {e}"),
                 },
+                Some(FRAME_PAIRED) => out.push(ReceivedFrame::Paired),
                 Some(FRAME_FILE) => {
                     if let Some(frame) = parse_file_chunk(&plain[1..]) {
                         if let Some(done) = accept_file_chunk(link, frame) {

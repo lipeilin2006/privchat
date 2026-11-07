@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import { Placeholder } from "@telegram-apps/telegram-ui";
 import { ArrowLeft, CheckCheck, MoreHorizontal, Paperclip, SendHorizontal } from "lucide-react";
 import wallpaper from "../assets/wallpaper.png";
@@ -7,6 +7,29 @@ import { api } from "../api";
 import { openPath } from "@tauri-apps/plugin-opener";
 import ActionSheet from "./ActionSheet";
 import { avatarColor, fmtTime, initials } from "../utils/format";
+
+/** 同一天分组用：YYYY-M-D。 */
+function dayKey(time) {
+  const d = new Date(time);
+  return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+}
+
+/** 今天 / 昨天 / 2024-05-03。 */
+function dayLabel(time) {
+  const d = new Date(time);
+  const today = new Date();
+  const sameDay = (a, b) =>
+    a.getFullYear() === b.getFullYear() &&
+    a.getMonth() === b.getMonth() &&
+    a.getDate() === b.getDate();
+  if (sameDay(d, today)) return t("today");
+  const yesterday = new Date(today);
+  yesterday.setDate(today.getDate() - 1);
+  if (sameDay(d, yesterday)) return t("yesterday");
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(
+    d.getDate()
+  ).padStart(2, "0")}`;
+}
 
 export default function ChatWindow({
   conversation,
@@ -61,7 +84,7 @@ export default function ChatWindow({
         </span>
         <div className="chat-head-text">
           <div className="chat-head-name">{conversation.title}</div>
-          <div className="chat-head-sub">{t("online")}</div>
+          <div className="chat-head-sub">{t("e2eHint")}</div>
         </div>
         <button
           className="round-btn"
@@ -164,10 +187,20 @@ export default function ChatWindow({
       )}
 
       <div className="chat-body" ref={bodyRef}>
-        {messages.length > 0 && <div className="date-sep">{t("today")}</div>}
-        {messages.length === 0 && <Placeholder description={t("noMessages")} />}
-        {messages.map((m) => (
-          <div key={m.id} className={`msg-row ${m.from === "me" ? "me" : ""}`}>
+        {messages.length === 0 && (
+          <div className="chat-empty">
+            <div className="chat-empty-icon">🔒</div>
+            <div className="chat-empty-title">{t("noMessages")}</div>
+            <div className="chat-empty-hint">{t("emptyHint")}</div>
+          </div>
+        )}
+        {messages.map((m, index) => {
+          const day = dayKey(m.time);
+          const prevDay = index > 0 ? dayKey(messages[index - 1].time) : null;
+          return (
+            <Fragment key={m.id}>
+              {day !== prevDay && <div className="date-sep">{dayLabel(m.time)}</div>}
+              <div className={`msg-row ${m.from === "me" ? "me" : ""}`}>
             <div
               className={`msg ${m.from === "me" ? "out" : "in"} ${
                 m.status === "failed" ? "failed" : ""
@@ -218,17 +251,29 @@ export default function ChatWindow({
               </div>
             </div>
           </div>
-        ))}
+            </Fragment>
+          );
+        })}
       </div>
 
       <div className="composer">
-        <input
+        <textarea
           className="composer-input"
+          rows={1}
           placeholder={t("messagePlaceholder")}
           value={text}
-          onChange={(e) => setText(e.target.value)}
+          onChange={(e) => {
+            setText(e.target.value);
+            e.target.style.height = "auto";
+            e.target.style.height = `${Math.min(e.target.scrollHeight, 120)}px`;
+          }}
           onKeyDown={(e) => {
-            if (e.key === "Enter") submit();
+            // 桌面：回车发送、Shift+回车换行；移动端回车换行
+            const mobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+            if (e.key === "Enter" && !e.shiftKey && !mobile) {
+              e.preventDefault();
+              submit();
+            }
           }}
         />
         <button

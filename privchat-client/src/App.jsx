@@ -170,11 +170,11 @@ export default function App() {
       } catch {
         // 下一轮事件会再来
       }
-      // App 不在前台时弹本地通知
-      if (document.visibilityState === "hidden") {
+      // 空文本是「对方配对完成」的控制帧，不弹通知
+      const text = event.payload?.text;
+      if (text && document.visibilityState === "hidden") {
         const name = contactsRef.current.find((c) => c.peer_id === connId)?.name;
-        const preview = String(event.payload?.text || t("newMessage")).slice(0, 80);
-        notifyMessage(name || t("newMessage"), preview);
+        notifyMessage(name || t("newMessage"), String(text).slice(0, 80));
       }
     }).then((unlisten) => {
       off = unlisten;

@@ -65,6 +65,11 @@ const zh = {
   scanQr: "扫一扫",
   inviteValidFor: "邀请有效期",
   inviteExpired: "邀请已失效，点刷新重新生成",
+  pairWaiting: "已扫到对方 ✓ 现在让对方扫上面的码，两边都扫到会自动进聊天",
+  enterChat: "进入聊天",
+  e2eHint: "端到端加密",
+  yesterday: "昨天",
+  emptyHint: "消息只存在你们两台设备上",
   inviteHint: "粘贴对方邀请，或扫对方的二维码",
   cameraDenied: "没有相机权限，去系统设置里打开再试",
   scanFailed: "没扫到内容",
@@ -82,7 +87,6 @@ const zh = {
   saveOk: "已保存",
   invalidId: "节点 ID 必须是 64 位十六进制",
   remove: "移除",
-  online: "在线",
   offline: "离线",
 };
 
@@ -153,6 +157,11 @@ const en = {
   scanQr: "Scan QR",
   inviteValidFor: "Invite valid for",
   inviteExpired: "Invite expired — refresh to regenerate",
+  pairWaiting: "Peer scanned ✓ Now let them scan your code — you'll both jump into chat automatically.",
+  enterChat: "Open chat",
+  e2eHint: "End-to-end encrypted",
+  yesterday: "Yesterday",
+  emptyHint: "Messages live only on your two devices",
   inviteHint: "Paste their invite, or scan their QR code",
   cameraDenied: "Camera permission denied",
   scanFailed: "Nothing scanned",
@@ -170,7 +179,6 @@ const en = {
   saveOk: "Saved",
   invalidId: "Node ID must be 64 hex chars",
   remove: "Remove",
-  online: "Online",
   offline: "Offline",
 };
 

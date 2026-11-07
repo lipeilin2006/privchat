@@ -441,7 +441,13 @@ async fn file_transfer_roundtrip() {
         .await
         .expect("send file");
 
-    let frames = b.poll(&b_id).await.expect("b poll");
+    let frames: Vec<_> = b
+        .poll(&b_id)
+        .await
+        .expect("b poll")
+        .into_iter()
+        .filter(|frame| matches!(frame, ReceivedFrame::File { .. }))
+        .collect();
     assert_eq!(frames.len(), 1, "one file should be assembled");
     match &frames[0] {
         ReceivedFrame::File { name, mime, data } => {
@@ -510,4 +516,28 @@ async fn send_file_rejects_oversized() {
         .send_file("whatever", "big.bin", "application/octet-stream", &too_big)
         .await
         .is_err());
+}
+
+/// 配对成功后对方会收到一个空控制帧（用来自动进聊天页）。
+#[tokio::test]
+async fn accept_notifies_peer_with_paired_frame() {
+    let api = Arc::new(MemQueues::default());
+    let a = manager(api.clone() as Arc<dyn QueueApi>, "pair-a").await;
+    let b = manager(api.clone() as Arc<dyn QueueApi>, "pair-b").await;
+
+    let (a_id, a_invite) = a.create("m1").await.expect("a create");
+    let (b_id, b_invite) = b.create("m1").await.expect("b create");
+
+    a.accept(&a_id, &b_invite).await.expect("a accept");
+    b.accept(&b_id, &a_invite).await.expect("b accept");
+
+    let frames = a.poll(&a_id).await.expect("a poll");
+    assert!(
+        matches!(frames.as_slice(), [ReceivedFrame::Paired]),
+        "peer should get exactly one paired frame, got {frames:?}"
+    );
+
+    // 控制帧不应该变成一条消息
+    let texts: Vec<_> = texts(frames);
+    assert!(texts.is_empty());
 }
