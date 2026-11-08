@@ -18,6 +18,7 @@ export const api = {
   sendOnConnection: (connId, text) =>
     invoke("send_on_connection", { connId, text }),
   searchMessages: (query, limit = 30) => invoke("search_messages", { query, limit }),
+  attachmentData: (connId, msgId) => invoke("attachment_data", { connId, msgId }),
   exportAttachment: (connId, msgId) => invoke("export_attachment", { connId, msgId }),
   sendFile: (connId, name, mime, data) =>
     invoke("send_file", { connId, name, mime, data }),

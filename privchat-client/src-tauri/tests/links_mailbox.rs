@@ -85,3 +85,50 @@ async fn two_clients_over_real_mailbox() {
 
     node.shutdown().await;
 }
+
+/// 图片/附件走真实 mailbox：分片 → 取回 → 拼装，字节要一致。
+#[tokio::test]
+async fn image_over_real_mailbox() {
+    let node_dir = std::env::temp_dir().join(format!("privchat-node-file-{}", std::process::id()));
+    let node = privchat_mailbox::node::spawn_test_node(&node_dir, 0)
+        .await
+        .expect("spawn node");
+    let mailbox = EndpointTicket::new(node.endpoint.addr()).encode_string();
+
+    let dir_a = std::env::temp_dir().join(format!("privchat-file-a-{}", std::process::id()));
+    let dir_b = std::env::temp_dir().join(format!("privchat-file-b-{}", std::process::id()));
+    for dir in [&dir_a, &dir_b] {
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let store_a = Arc::new(Store::open(&dir_a, KEY).expect("store a"));
+    let store_b = Arc::new(Store::open(&dir_b, KEY).expect("store b"));
+    let transport_a = Transport::start_no_relay(store_a.clone()).await.unwrap();
+    let transport_b = Transport::start_no_relay(store_b.clone()).await.unwrap();
+    let (a, _) = manager("file-a", transport_a).await;
+    let (b, _) = manager("file-b", transport_b).await;
+
+    let (a_id, a_invite) = a.create(&mailbox).await.expect("a create");
+    let (b_id, b_invite) = b.create(&mailbox).await.expect("b create");
+    a.accept(&a_id, &b_invite).await.expect("a accept");
+    b.accept(&b_id, &a_invite).await.expect("b accept");
+
+    // 200KB 假图片：足以跨多个 24KB 分片
+    let payload: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+    a.send_file(&a_id, "pic.png", "image/png", &payload)
+        .await
+        .expect("send file");
+
+    let frames = b.poll(&b_id).await.expect("b poll");
+    let file = frames.into_iter().find_map(|frame| match frame {
+        ReceivedFrame::File { name, mime, data } => Some((name, mime, data)),
+        _ => None,
+    });
+    let (name, mime, data) = file.expect("file frame");
+    assert_eq!(name, "pic.png");
+    assert_eq!(mime, "image/png");
+    assert_eq!(data.len(), payload.len());
+    assert_eq!(data, payload, "image bytes must survive the roundtrip");
+
+    node.shutdown().await;
+}

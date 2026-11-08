@@ -390,6 +390,23 @@ pub(crate) async fn search_messages(
         .map_err(|e| e.to_string())
 }
 
+/// 按需取一条附件的 base64（历史接口不再返回附件内容）。
+#[tauri::command]
+pub(crate) async fn attachment_data(
+    conn_id: String,
+    msg_id: String,
+    state: State<'_, AppState>,
+) -> Result<Option<String>, String> {
+    use base64::Engine;
+    let store = state.require_app()?.store().clone();
+    let message = store
+        .message(&conn_id, &msg_id)
+        .map_err(|e| e.to_string())?;
+    Ok(message
+        .and_then(|m| m.data)
+        .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes)))
+}
+
 /// 把附件写到缓存目录并用系统查看器打开；返回落盘路径。
 #[tauri::command]
 pub(crate) async fn export_attachment(
@@ -505,7 +522,6 @@ pub(crate) async fn connection_history(
         .map_err(|e| e.to_string())?
         .into_iter()
         .map(|m| {
-            use base64::Engine;
             ConnectionMessage {
                 id: m.msg_id,
                 from: m.sender,
@@ -514,9 +530,9 @@ pub(crate) async fn connection_history(
                 kind: m.kind,
                 name: m.name,
                 mime: m.mime,
-                data: m
-                    .data
-                    .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes)),
+                // 历史里不带附件内容：图片按需用 attachment_data 单独取，
+                // 否则一次历史请求可能几百 MB。
+                data: None,
             }
         })
         .collect())

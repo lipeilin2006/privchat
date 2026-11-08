@@ -412,6 +412,7 @@ fn build_and_run() {
             accept_connection,
             delete_connection,
             rotate_connection,
+            attachment_data,
             export_attachment,
             search_messages,
             send_file,

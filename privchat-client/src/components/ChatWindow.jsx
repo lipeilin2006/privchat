@@ -7,6 +7,40 @@ import { openPath } from "@tauri-apps/plugin-opener";
 import ActionSheet from "./ActionSheet";
 import { avatarColor, fmtTime, initials } from "../utils/format";
 
+/** 图片消息：历史里没有内容，挂载时单独取一次。 */
+function AttachmentImage({ connId, msgId, mime, name, onOpen }) {
+  const [src, setSrc] = useState(null);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    api
+      .attachmentData(connId, msgId)
+      .then((base64) => {
+        if (!alive) return;
+        if (base64) setSrc(`data:${mime};base64,${base64}`);
+        else setFailed(true);
+      })
+      .catch(() => {
+        if (alive) setFailed(true);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [connId, msgId, mime]);
+
+  if (failed) {
+    return (
+      <div className="file-card">
+        <span className="file-name">{name}</span>
+        <span className="file-size">{t("imageFailed")}</span>
+      </div>
+    );
+  }
+  if (!src) return <div className="msg-image placeholder" />;
+  return <img className="msg-image" src={src} alt={name} onClick={() => onOpen(src)} />;
+}
+
 /** 同一天分组用：YYYY-M-D。 */
 function dayKey(time) {
   const d = new Date(time);
@@ -206,12 +240,13 @@ export default function ChatWindow({
               }`}
             >
               {m.kind === "file" ? (
-                String(m.mime || "").startsWith("image/") && m.data ? (
-                  <img
-                    className="msg-image"
-                    src={`data:${m.mime};base64,${m.data}`}
-                    alt={m.name || "image"}
-                    onClick={() => setPreview(`data:${m.mime};base64,${m.data}`)}
+                String(m.mime || "").startsWith("image/") ? (
+                  <AttachmentImage
+                    connId={conversation.peer_id}
+                    msgId={m.id}
+                    mime={m.mime}
+                    name={m.name || m.text}
+                    onOpen={setPreview}
                   />
                 ) : (
                   <div className="file-card">
