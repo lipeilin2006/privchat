@@ -57,7 +57,11 @@ rust {
     rootDirRel = "../../../"
 }
 
+// 扫码用内置模型的 ML Kit：模型随 APK 一起打进 assets，
+// 不依赖 Google Play 服务在运行时下载。GMS 那层只提供 API 类，
+// 真正的识别实现用这里的 bundled 版本。
 dependencies {
+    implementation("com.google.mlkit:barcode-scanning:17.3.0")
     implementation("androidx.webkit:webkit:1.14.0")
     implementation("androidx.appcompat:appcompat:1.7.1")
     implementation("androidx.activity:activity-ktx:1.10.1")

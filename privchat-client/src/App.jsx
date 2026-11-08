@@ -268,7 +268,7 @@ export default function App() {
 
   if (vaultState === "loading") {
     return (
-      <AppRoot appearance="light">
+      <AppRoot appearance="dark">
         <div className="center-screen">
           <Spinner size="l" />
         </div>
@@ -278,7 +278,7 @@ export default function App() {
 
   if (vaultState === "locked") {
     return (
-      <AppRoot appearance="light">
+      <AppRoot appearance="dark">
         <VaultGate
           initialized={initialized}
           onUnlocked={() => setVaultState("unlocked")}
@@ -291,7 +291,7 @@ export default function App() {
   const active = conversations.find((c) => c.peer_id === activePeer);
 
   return (
-    <AppRoot appearance="light" className="tg-root">
+    <AppRoot appearance="dark" className="tg-root">
       <div className="app-shell">
         <main className="app-screen">
           <ErrorBoundary>

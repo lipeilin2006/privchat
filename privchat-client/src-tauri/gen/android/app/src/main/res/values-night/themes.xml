@@ -1,6 +1,10 @@
 <resources xmlns:tools="http://schemas.android.com/tools">
-    <!-- Base application theme. -->
+    <!-- 应用是常暗色：窗口底色和状态栏一开始就是深的，避免启动闪白。 -->
     <style name="Theme.privchat_client" parent="Theme.MaterialComponents.DayNight.NoActionBar">
-        <!-- Customize your theme here. -->
+        <item name="android:windowBackground">@color/privchat_bg</item>
+        <item name="android:statusBarColor">@color/privchat_bg</item>
+        <item name="android:navigationBarColor">@color/privchat_bg</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
     </style>
 </resources>

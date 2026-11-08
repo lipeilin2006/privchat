@@ -1,7 +1,6 @@
 import { Fragment, useEffect, useRef, useState } from "react";
 import { Placeholder } from "@telegram-apps/telegram-ui";
 import { ArrowLeft, CheckCheck, MoreHorizontal, Paperclip, SendHorizontal } from "lucide-react";
-import wallpaper from "../assets/wallpaper.png";
 import { t } from "../i18n";
 import { api } from "../api";
 import { openPath } from "@tauri-apps/plugin-opener";
@@ -74,7 +73,7 @@ export default function ChatWindow({
   }
 
   return (
-    <div className="chat-screen" style={{ backgroundImage: `url(${wallpaper})` }}>
+    <div className="chat-screen">
       <header className="chat-head">
         <button className="round-btn" onClick={onBack} aria-label={t("back")}>
           <ArrowLeft size={20} />
